@@ -27,17 +27,24 @@ name = "raspberry-pi-pico"
 arch = "rp2040"
 ```
 
-`board.toml` owns physical pin assignments for the RP2040 backend and reserves logical roles for later capabilities such as I2C, SPI, PWM, ADC, device detect, and emergency stop. This keeps robot-body capabilities separate from the board used to host the brainstem.
+`board.toml` owns physical pin assignments for the RP2040 backend and reserves logical roles for later capabilities such as I2C, SPI, PWM, ADC, and emergency stop. This keeps robot-body capabilities separate from the board used to host the brainstem.
 
-BRC is optional and disabled by default for 57600 baud bring-up. On Create 1,
-this is the same robot-side Mini-DIN signal as Device Detect / Baud Rate Change:
+The r23 carrier uses separate logical names for the Create power signal and the
+level translator enable:
 
 ```toml
-[pins.create_brc]
-enabled = false
+[pins.power_toggle]
+pin = "GP18"
+gpio = 18
+physical_pin = 24
+
+[pins.txs_oe]
 pin = "GP19"
 gpio = 19
+physical_pin = 25
 ```
+
+Create BRC is unconnected on r23 and is not used for power control.
 
 ## Wiring
 
@@ -45,8 +52,8 @@ gpio = 19
 | --- | ---: | ---: | --- |
 | Create OI UART TX | GP0 | 1 | Pico TX to Create RX |
 | Create OI UART RX | GP1 | 2 | Create TX to Pico RX |
-| Create Power Toggle | GP18 | 24 | Pico output to external power-toggle interface |
-| Create BRC/DD | GP19 | 25 | Pico open-drain output to Create BRC / Device Detect, optional |
+| `POWER_TOGGLE` | GP18 | 24 | Pico output through TXS0108E channel 7 to Create DB-25 pin 3 |
+| `TXS_OE` | GP19 | 25 | Pico output to TXS0108E OE; external 10 kΩ pull-down |
 | Create charging indicator | GP17 | 22 | Level-shifted Create DB-25 pin 13 to Pico input |
 | External status LED | GP20 | 26 | Pico output, optional |
 | Onboard LED | GP25 | onboard | Pico output |
@@ -94,9 +101,18 @@ While docked, verify the Create side of the interface reaches 5V and the GP17
 side reaches a valid 3.3V high before treating `charging_indicator: off` as a
 firmware polarity result.
 
-The Power Toggle output assumes external wiring that is electrically safe for both the Pico and the Create. The firmware treats BRC/DD as open-drain: asserted pulls low, released does not drive high. Use an external pull-up or level interface appropriate for the Create's 0-5V input, and do not connect any 5V Create output directly to an RP2040 pin.
+On r23, Create DB-25 pin 3 toggles robot power on a low-to-high transition.
+Pico GP18 drives that input through TXS0108E channel 7. Firmware first
+constructs GP18 as a driven-low output; only after that succeeds does it
+construct GP19 high to enable the translator. GP19 stays high in normal
+operation. Each explicit power request writes GP18 low, then high for the
+configured pulse interval, then low again. Ordinary startup does not request a
+power toggle. If firmware panics, it clears GP18 and GP19 before halting so the
+translator is disabled and the toggle signal is low.
 
-For initial 57600 baud Open Interface bring-up, wire Power Toggle, UART TX/RX, and GND first. Leave BRC disabled unless the board configuration explicitly enables it.
+The board's 10 kΩ OE pull-down keeps the translator disabled during reset and
+early boot. It is a hardware backstop, not a substitute for the firmware's
+ordered output initialization. BRC remains unconnected.
 
 ## Architecture
 
@@ -125,7 +141,7 @@ Hardware details stay inside `arch/` and `drivers/`. Body-owned capability facts
 
 On Pico W, concurrency is split by ownership:
 
-- The safety/runtime lane owns Create UART writes, motor stop, Power Toggle, BRC, and robot LEDs.
+- The safety/runtime lane owns Create UART writes, motor stop, `POWER_TOGGLE`, and robot LEDs.
 - The Wi-Fi/HTTP lane owns CYW43, AP setup, bounded local ICMP echo, TCP, UDP, HTTP, and mDNS only.
 - Wi-Fi never receives robot GPIO/UART handles and cannot directly move motors or toggle Create power.
 - HTTP `/status.json` serializes a copied `BrainstemStatus` snapshot and does not hold shared state while writing TCP responses.
@@ -155,7 +171,7 @@ failure matrix are documented in `docs/026-brainstem-transit-failover.md`.
 
 ## Public Surface
 
-The public brainstem surface is body-neutral. The forebrain/motherbrain asks for motion, safety, feedback, telemetry, capabilities, and events; the active body driver maps those requests to Create OI opcodes, packet ids, BRC, songs, LEDs, dock seeking, UART behavior, and sensor decoding.
+The public brainstem surface is body-neutral. The forebrain/motherbrain asks for motion, safety, feedback, telemetry, capabilities, and events; the active body driver maps those requests to Create OI opcodes, packet ids, power toggles, songs, LEDs, dock seeking, UART behavior, and sensor decoding.
 
 The checked source of truth is `verb-classification.toml`; `build.rs` fails if
 an advertised verb lacks an exposed classification. The production vocabulary
@@ -277,7 +293,7 @@ the motors. Brainstem reflex and invariant events terminate the owning skill as
 
 Odometry is currently a lightweight accumulator over decoded Create distance/angle deltas. Packets `0`, `19`, and `20` update odometry: complete packet `0` carries both distance and angle deltas, packet `19` carries distance, and packet `20` carries angle. Other decoded sensor packets update status and events but do not integrate into odometry. `reset_odometry` clears accumulated distance and heading and increments a reset count. Full pose integration, set/calibrate verbs, and body-specific odometry calibration are still future work.
 
-Create OI power, BRC, Open Interface start, continuous Full mode, status-light
+Create OI power, Open Interface start, continuous Full mode, status-light
 animation, watchdog stop, and recovery remain owned by the brainstem runtime
 and Create body driver. Hardware watchdog support is plumbed through the
 `BrainstemHardware::feed_watchdog` hook and called from the runtime safety lane.
@@ -294,7 +310,7 @@ Generic public surface:
 
 Create-specific by design:
 
-- The Create OI body/driver path owns opcodes, packet ids, BRC, Create UART behavior, OI modes, songs, LEDs, dock seeking, and Create sensor decoding.
+- The Create OI body/driver path owns opcodes, packet ids, Create UART behavior, OI modes, songs, LEDs, dock seeking, power-toggle requests, and Create sensor decoding.
 - `/status.json` still exposes some Create diagnostic fields because they are useful during bring-up.
 - `power_state`, `song_define`, and `song_play` are generic-ish surface names backed by Create-specific implementation details today.
 
@@ -646,7 +662,13 @@ BOOTSEL seq
 
 `GET_CAPABILITIES` replies with one compact `CAPABILITIES` line. `GET_EVENTS` replies with one compact `EVENTS` line containing records newer than `since_seq`.
 
-`ARM` expands internally to body wake, optional BRC pulse for the Create body, interface start, and safe mode. `CMD_VEL` replaces the latest velocity mailbox instead of waiting behind ordinary commands, and the runtime stops the drive when its `ttl_ms` expires. `STOP` and `ESTOP` preempt immediately. Parse errors, line timeout, UART errors, runtime errors, and the estop latch all drive the runtime toward stop.
+`ARM` expands internally to body wake, the legacy optional BRC step, interface
+start, and safe mode. BRC is not advertised and that step is a no-op on r23;
+the legacy `pulse_brc` request remains accepted for host compatibility.
+`CMD_VEL` replaces the latest velocity mailbox instead of waiting behind
+ordinary commands, and the runtime stops the drive when its `ttl_ms` expires.
+`STOP` and `ESTOP` preempt immediately. Parse errors, line timeout, UART errors,
+runtime errors, and the estop latch all drive the runtime toward stop.
 
 `/status.json` includes `forebrain_uart` with `rx_bytes`, `rx_lines`, `last_seq`, `last_error`, `link_alive_ms`, and `last_command_age_ms`.
 
