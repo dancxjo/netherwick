@@ -43,9 +43,10 @@ All notable changes are grouped by date.
 ### Added
 
 - Add an optional Pico W SSD1306 status OLED on the shared MPU I2C bus, with
-  large state/health/fault icons, real battery and charging pages, bounded
-  display writes, and failure isolation from boot, control, safety, and IMU
-  sampling.
+  large state/health/fault icons, self-sustaining battery telemetry, a dynamic
+  SSID/IP/AP/client page, explicit Create bring-up and runtime errors, complete
+  safety-latch alert coverage, exact framebuffer snapshots, bounded display
+  writes, and failure isolation from boot, control, safety, and IMU sampling.
 - Add an RPi 5 Brainstem backend that owns the Create 1 side-port serial cable,
   reuses the bounded Brainstem runtime and Cockpit session/lease contract over
   loopback, advertises the cable's reduced hardware capabilities, sends a final

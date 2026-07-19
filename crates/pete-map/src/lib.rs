@@ -2827,7 +2827,6 @@ impl DepthProjection {
             frame: PointCloudFrame::KinectCamera,
         })
     }
-
 }
 
 fn positive_or(value: f32, fallback: f32) -> f32 {

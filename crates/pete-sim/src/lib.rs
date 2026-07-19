@@ -861,13 +861,19 @@ fn project_face_sense(body: &BodySense, objects: &[SimObject]) -> FaceSense {
         .enumerate()
         .filter_map(|(index, (object, distance, angle))| {
             if let SimObjectKind::Person { identity } = &object.kind {
-                Some(VectorArtifact::new(
-                    FACE_VECTOR_COLLECTION,
-                    format!("sim-face-{}-{index}", object.id),
-                    sim_embedding(identity.as_deref().unwrap_or(&object.label), distance, angle),
+                Some(
+                    VectorArtifact::new(
+                        FACE_VECTOR_COLLECTION,
+                        format!("sim-face-{}-{index}", object.id),
+                        sim_embedding(
+                            identity.as_deref().unwrap_or(&object.label),
+                            distance,
+                            angle,
+                        ),
+                    )
+                    .with_model("sim-face-embedding-v0")
+                    .with_source_id(format!("entity:person:{}", stable_slug(&object.label))),
                 )
-                .with_model("sim-face-embedding-v0")
-                .with_source_id(format!("entity:person:{}", stable_slug(&object.label))))
             } else {
                 None
             }
@@ -890,7 +896,10 @@ fn project_voice_sense(body: &BodySense, objects: &[SimObject]) -> VoiceSense {
                 sim_embedding(&object.label, distance, 0.0),
             )
             .with_model("sim-voice-embedding-v0")
-            .with_source_id(format!("entity:sound_source:{}", stable_slug(&object.label)))
+            .with_source_id(format!(
+                "entity:sound_source:{}",
+                stable_slug(&object.label)
+            ))
         })
         .collect();
     VoiceSense {

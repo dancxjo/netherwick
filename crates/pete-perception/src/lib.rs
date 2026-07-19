@@ -242,7 +242,6 @@ impl DepthProjection {
             source: "kinect_intrinsics",
         })
     }
-
 }
 
 struct RgbImageView<'a> {

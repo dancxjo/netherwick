@@ -1229,7 +1229,11 @@ mod tests {
             }],
             ..ObjectSense::default()
         };
-        now.face.vectors = vec![pete_now::VectorArtifact::new("faces", "test-face", vec![0.1, 0.2, 0.3])];
+        now.face.vectors = vec![pete_now::VectorArtifact::new(
+            "faces",
+            "test-face",
+            vec![0.1, 0.2, 0.3],
+        )];
         now.memory.face_familiarity = 0.9;
 
         let events = extractor.events_from_now(&now, None);

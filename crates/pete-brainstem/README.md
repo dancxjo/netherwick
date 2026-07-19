@@ -72,15 +72,24 @@ For visibility while standing over the robot, the normal page is a
 high-contrast four-cell icon dashboard: robot state, OI link, IMU health, and
 battery. The state cell uses distinct boot, ready, run, stop, and warning
 symbols; the health cells use checks or an unknown mark, with small labels as a
-secondary close-range aid. Existing E-stop, tilt/impact, stale OI link,
-low-battery, and offline-IMU conditions replace the dashboard with a large
-condition icon and short double-height reason text. The underlying semantic
-lines remain `PETE <state>` plus concise OI/IMU health.
+secondary close-range aid. A network page shows the exact `pete-xxxx` SSID,
+`192.168.4.1`, AP startup/readiness, and the number of active DHCP clients.
+After bring-up it rotates with the dashboard and battery page every three
+seconds.
 
-When fresh, plausible Create charge/capacity telemetry exists, the normal
-display alternates every three seconds with a large battery gauge and percent;
-a lightning glyph and `CHG YES/NO` report the actual charging state. It does
-not substitute a guessed battery value when telemetry is missing or invalid.
+Firmware requests complete Create packet 0 every 750 ms independently of any
+client-requested sensor stream, so plausible charge/capacity telemetry remains
+fresh during ordinary operation. The large battery page includes a gauge,
+percent, lightning glyph, and `CHG YES/NO`; it still does not substitute a
+guessed value when telemetry is missing or invalid.
+
+Faults suspend page rotation. Each safety latch has a specific full-screen icon
+and large reason: bump, cliff, wheel drop, E-stop, heartbeat expiry, tilt,
+impact, or charging. Stale OI, low battery, and offline IMU have dedicated
+alerts too. Startup diagnostics explicitly distinguish `WAIT CREATE`, `POWER
+OFF`, and `OI NO RX`, while runtime errors name Create no-response, UART
+framing, timeout, or invalid-packet failures instead of showing a generic
+warning.
 
 The OLED is indicator-only and optional. A missing display, either supported
 address failing to acknowledge, initialization failure, or a later write

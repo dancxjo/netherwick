@@ -543,10 +543,9 @@ mod tests {
 
     #[test]
     fn legacy_software_info_without_version_still_decodes() {
-        let software: SoftwareInfo = serde_json::from_str(
-            r#"{"software_name":"pete-brainstem","build_id":"legacy-build"}"#,
-        )
-        .unwrap();
+        let software: SoftwareInfo =
+            serde_json::from_str(r#"{"software_name":"pete-brainstem","build_id":"legacy-build"}"#)
+                .unwrap();
 
         assert_eq!(software.software_name, "pete-brainstem");
         assert_eq!(software.software_version, "");
