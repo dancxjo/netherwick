@@ -7,6 +7,8 @@ mod capabilities;
 mod commands;
 #[cfg(any(feature = "pico-w", test))]
 mod dhcp;
+#[cfg(any(feature = "pico-w", test))]
+mod display;
 mod drivers;
 mod events;
 mod hardware;

@@ -42,6 +42,7 @@ use crate::commands::{
     MAX_SONG_TONES,
 };
 use crate::dhcp::{DhcpClient, DhcpGrant, DhcpLeaseState, DhcpRequest, DHCP_LEASE_SECONDS};
+use crate::display::{self, DisplaySafety, DisplayStatus};
 use crate::drivers::imu::{decode_mpu6050_sample, ImuHealth};
 use crate::hardware::{BrainstemHardware, SerialRead, UartReadError};
 use crate::icmp::{
@@ -77,8 +78,8 @@ const FOREBRAIN_UART_BAUD: u32 = 115_200;
 const FOREBRAIN_LINE_MAX: usize = 1024;
 const FOREBRAIN_POLL_MS: u64 = 2;
 const FOREBRAIN_LINE_TIMEOUT_MS: u32 = 100;
-const IMU_I2C_FREQUENCY_HZ: u32 = 100_000;
-const IMU_I2C_TIMEOUT_MS: u64 = 25;
+const SENSOR_I2C_FREQUENCY_HZ: u32 = 100_000;
+const SENSOR_I2C_TIMEOUT_MS: u64 = 25;
 const IMU_RETRY_MS: u64 = 250;
 const MPU6050_ADDRESS_LOW: u8 = 0x68;
 const MPU6050_ADDRESS_HIGH: u8 = 0x69;
@@ -87,6 +88,15 @@ const MPU6050_PWR_MGMT_1: u8 = 0x6b;
 const MPU6050_GYRO_CONFIG: u8 = 0x1b;
 const MPU6050_ACCEL_CONFIG: u8 = 0x1c;
 const MPU6050_ACCEL_XOUT_H: u8 = 0x3b;
+const OLED_ADDRESSES: [u8; 2] = [0x3c, 0x3d];
+const OLED_RETRY_MS: u32 = 5_000;
+const OLED_IO_INTERVAL_MS: u32 = 4;
+const OLED_I2C_TIMEOUT_MS: u64 = 8;
+const OLED_CHUNK_BYTES: usize = 32;
+const OLED_INIT_COMMANDS: [u8; 26] = [
+    0x00, 0xae, 0xd5, 0x80, 0xa8, 0x1f, 0xd3, 0x00, 0x40, 0x8d, 0x14, 0x20, 0x02, 0xa1, 0xc8, 0xda,
+    0x02, 0x81, 0x8f, 0xd9, 0xf1, 0xdb, 0x40, 0xa4, 0xa6, 0xaf,
+];
 
 static mut CORE1_STACK: CoreStack<8192> = CoreStack::new();
 static BRAINSTEM_INSTANCE_ID: AtomicU32 = AtomicU32::new(0);
@@ -417,7 +427,7 @@ fn spawn_wifi_lane(
             forebrain_uart_task(forebrain_uart, forebrain_tx, forebrain_rx)
                 .expect("spawn forebrain uart task"),
         );
-        spawner.spawn(imu_task(i2c1, i2c_sda, i2c_scl).expect("spawn imu task"));
+        spawner.spawn(i2c_sensor_task(i2c1, i2c_sda, i2c_scl).expect("spawn I2C task"));
         spawn_usb_cdc_tasks(&spawner, usb);
     })
 }
@@ -578,58 +588,69 @@ async fn net_runner_task(mut runner: embassy_net::Runner<'static, IcmpEchoDevice
 }
 
 #[embassy_executor::task]
-async fn imu_task(
+async fn i2c_sensor_task(
     i2c1: Peri<'static, I2C1>,
     sda: Peri<'static, PIN_2>,
     scl: Peri<'static, PIN_3>,
 ) -> ! {
+    let mut config = I2cConfig::default();
+    config.frequency = SENSOR_I2C_FREQUENCY_HZ;
+    let mut i2c = I2c::new_async(i2c1, scl, sda, Irqs, config);
+    let mut imu_address = None;
+    let mut next_imu_poll_ms = 0u32;
+    let mut next_imu_retry_ms = 0u32;
+    let mut oled = OledService::new();
+
     if !body::IMU_ENABLED {
         status::mark_imu_health(ImuHealth::Absent);
-        core::future::pending().await
     }
 
-    let mut config = I2cConfig::default();
-    config.frequency = IMU_I2C_FREQUENCY_HZ;
-    let mut i2c = I2c::new_async(i2c1, scl, sda, Irqs, config);
-    let mut address = None;
-
     loop {
-        let active_address = match address {
-            Some(address) => address,
-            None => match initialize_imu(&mut i2c).await {
-                Ok(found_address) => {
-                    address = Some(found_address);
-                    found_address
-                }
-                Err(health) => {
-                    status::mark_imu_health(health);
-                    Timer::after_millis(IMU_RETRY_MS).await;
-                    continue;
-                }
-            },
-        };
+        let now_ms = Instant::now().as_millis() as u32;
 
-        let mut bytes = [0u8; 14];
-        if imu_write_read_with_timeout(&mut i2c, active_address, MPU6050_ACCEL_XOUT_H, &mut bytes)
-            .await
-        {
-            status::mark_imu_sample(decode_mpu6050_sample(
-                Instant::now().as_millis() as u32,
-                &bytes,
-            ));
-        } else {
-            status::mark_imu_health(ImuHealth::Fault);
-            address = None;
+        if body::IMU_ENABLED {
+            if let Some(active_address) = imu_address {
+                if deadline_reached(now_ms, next_imu_poll_ms) {
+                    let mut bytes = [0u8; 14];
+                    if i2c_write_read_with_timeout(
+                        &mut i2c,
+                        active_address,
+                        MPU6050_ACCEL_XOUT_H,
+                        &mut bytes,
+                    )
+                    .await
+                    {
+                        status::mark_imu_sample(decode_mpu6050_sample(now_ms, &bytes));
+                    } else {
+                        status::mark_imu_health(ImuHealth::Fault);
+                        imu_address = None;
+                        next_imu_retry_ms = now_ms.wrapping_add(IMU_RETRY_MS as u32);
+                    }
+                    next_imu_poll_ms = now_ms.wrapping_add(body::IMU_POLL_PERIOD_MS.max(1));
+                }
+            } else if deadline_reached(now_ms, next_imu_retry_ms) {
+                match initialize_imu(&mut i2c).await {
+                    Ok(found_address) => {
+                        imu_address = Some(found_address);
+                        next_imu_poll_ms = now_ms;
+                    }
+                    Err(health) => {
+                        status::mark_imu_health(health);
+                        next_imu_retry_ms = now_ms.wrapping_add(IMU_RETRY_MS as u32);
+                    }
+                }
+            }
         }
 
-        Timer::after_millis(body::IMU_POLL_PERIOD_MS.max(1) as u64).await;
+        oled.poll(&mut i2c, now_ms).await;
+        Timer::after_millis(1).await;
     }
 }
 
 async fn initialize_imu(i2c: &mut I2c<'static, I2C1, I2cAsync>) -> Result<u8, ImuHealth> {
     for address in [MPU6050_ADDRESS_LOW, MPU6050_ADDRESS_HIGH] {
         let mut who_am_i = [0u8; 1];
-        if !imu_write_read_with_timeout(i2c, address, MPU6050_WHO_AM_I, &mut who_am_i).await
+        if !i2c_write_read_with_timeout(i2c, address, MPU6050_WHO_AM_I, &mut who_am_i).await
             || (who_am_i[0] != 0x68 && who_am_i[0] != 0x70)
         {
             continue;
@@ -640,7 +661,7 @@ async fn initialize_imu(i2c: &mut I2c<'static, I2C1, I2cAsync>) -> Result<u8, Im
             [MPU6050_GYRO_CONFIG, 0x00],
             [MPU6050_ACCEL_CONFIG, 0x00],
         ] {
-            if !imu_write_with_timeout(i2c, address, command).await {
+            if !i2c_write_with_timeout(i2c, address, &command).await {
                 return Err(ImuHealth::Fault);
             }
         }
@@ -649,14 +670,14 @@ async fn initialize_imu(i2c: &mut I2c<'static, I2C1, I2cAsync>) -> Result<u8, Im
     Err(ImuHealth::Absent)
 }
 
-async fn imu_write_with_timeout(
+async fn i2c_write_with_timeout(
     i2c: &mut I2c<'static, I2C1, I2cAsync>,
     address: u8,
-    bytes: [u8; 2],
+    bytes: &[u8],
 ) -> bool {
     match select(
-        i2c.write_async(address, bytes),
-        Timer::after_millis(IMU_I2C_TIMEOUT_MS),
+        i2c.write_async(address, bytes.iter().copied()),
+        Timer::after_millis(SENSOR_I2C_TIMEOUT_MS),
     )
     .await
     {
@@ -665,7 +686,7 @@ async fn imu_write_with_timeout(
     }
 }
 
-async fn imu_write_read_with_timeout(
+async fn i2c_write_read_with_timeout(
     i2c: &mut I2c<'static, I2C1, I2cAsync>,
     address: u8,
     register: u8,
@@ -673,13 +694,120 @@ async fn imu_write_read_with_timeout(
 ) -> bool {
     match select(
         i2c.write_read_async(address, [register], bytes),
-        Timer::after_millis(IMU_I2C_TIMEOUT_MS),
+        Timer::after_millis(SENSOR_I2C_TIMEOUT_MS),
     )
     .await
     {
         Either::First(Ok(())) => true,
         Either::First(Err(_)) | Either::Second(()) => false,
     }
+}
+
+struct OledService {
+    address: Option<u8>,
+    next_probe_index: usize,
+    next_action_ms: u32,
+    next_refresh_ms: u32,
+    transfer_offset: Option<usize>,
+    desired_frame: [u8; display::FRAMEBUFFER_BYTES],
+    sent_frame: [u8; display::FRAMEBUFFER_BYTES],
+}
+
+impl OledService {
+    const fn new() -> Self {
+        Self {
+            address: None,
+            next_probe_index: 0,
+            next_action_ms: 0,
+            next_refresh_ms: 0,
+            transfer_offset: None,
+            desired_frame: [0; display::FRAMEBUFFER_BYTES],
+            sent_frame: [0xff; display::FRAMEBUFFER_BYTES],
+        }
+    }
+
+    async fn poll(&mut self, i2c: &mut I2c<'static, I2C1, I2cAsync>, now_ms: u32) {
+        if !deadline_reached(now_ms, self.next_action_ms) {
+            return;
+        }
+
+        let Some(address) = self.address else {
+            let candidate = OLED_ADDRESSES[self.next_probe_index];
+            if oled_write_with_timeout(i2c, candidate, &OLED_INIT_COMMANDS).await {
+                self.address = Some(candidate);
+                self.next_probe_index = 0;
+                self.next_refresh_ms = now_ms;
+                self.next_action_ms = now_ms;
+            } else if self.next_probe_index + 1 < OLED_ADDRESSES.len() {
+                self.next_probe_index += 1;
+                self.next_action_ms = now_ms.wrapping_add(OLED_IO_INTERVAL_MS);
+            } else {
+                self.next_probe_index = 0;
+                self.next_action_ms = now_ms.wrapping_add(OLED_RETRY_MS);
+            }
+            return;
+        };
+
+        if self.transfer_offset.is_none() && deadline_reached(now_ms, self.next_refresh_ms) {
+            let snapshot = status::snapshot(now_ms);
+            let page =
+                DisplayStatus::from_snapshot(&snapshot).page(DisplaySafety::current(), now_ms);
+            self.desired_frame = display::render(&page);
+            self.next_refresh_ms = now_ms.wrapping_add(display::REFRESH_PERIOD_MS);
+            if self.desired_frame != self.sent_frame {
+                self.transfer_offset = Some(0);
+            }
+        }
+
+        let Some(offset) = self.transfer_offset else {
+            self.next_action_ms = self.next_refresh_ms;
+            return;
+        };
+        let end = (offset + OLED_CHUNK_BYTES).min(display::FRAMEBUFFER_BYTES);
+        let page = offset / display::WIDTH;
+        let column = offset % display::WIDTH;
+        let mut bytes = [0u8; OLED_CHUNK_BYTES + 7];
+        bytes[0] = 0x80;
+        bytes[1] = 0xb0 | page as u8;
+        bytes[2] = 0x80;
+        bytes[3] = (column & 0x0f) as u8;
+        bytes[4] = 0x80;
+        bytes[5] = 0x10 | ((column >> 4) & 0x0f) as u8;
+        bytes[6] = 0x40;
+        bytes[7..7 + end - offset].copy_from_slice(&self.desired_frame[offset..end]);
+
+        if oled_write_with_timeout(i2c, address, &bytes[..7 + end - offset]).await {
+            self.sent_frame[offset..end].copy_from_slice(&self.desired_frame[offset..end]);
+            self.transfer_offset = (end < display::FRAMEBUFFER_BYTES).then_some(end);
+            self.next_action_ms = now_ms.wrapping_add(OLED_IO_INTERVAL_MS);
+        } else {
+            self.address = None;
+            self.next_probe_index = 0;
+            self.transfer_offset = None;
+            self.sent_frame = [0xff; display::FRAMEBUFFER_BYTES];
+            self.next_action_ms = now_ms.wrapping_add(OLED_RETRY_MS);
+        }
+    }
+}
+
+async fn oled_write_with_timeout(
+    i2c: &mut I2c<'static, I2C1, I2cAsync>,
+    address: u8,
+    bytes: &[u8],
+) -> bool {
+    match select(
+        i2c.write_async(address, bytes.iter().copied()),
+        Timer::after_millis(OLED_I2C_TIMEOUT_MS),
+    )
+    .await
+    {
+        Either::First(Ok(())) => true,
+        Either::First(Err(_)) | Either::Second(()) => false,
+    }
+}
+
+fn deadline_reached(now_ms: u32, deadline_ms: u32) -> bool {
+    now_ms.wrapping_sub(deadline_ms) < u32::MAX / 2
 }
 
 #[embassy_executor::task]
