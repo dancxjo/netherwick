@@ -42,6 +42,10 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Add a runtime-owned asynchronous cognition supervisor that submits bounded
+  immutable-snapshot requests in the background, polls without delaying control,
+  and rejects cancelled, expired, or obsolete responses; route live scene
+  enrichment through the shared boundary.
 - Add an optional Pico W SSD1306 status OLED on the shared MPU I2C bus, with
   large state/health/fault icons, self-sustaining battery telemetry, a dynamic
   SSID/IP/AP/client page, explicit Create bring-up and runtime errors, complete

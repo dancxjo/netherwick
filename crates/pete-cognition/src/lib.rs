@@ -11,6 +11,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 macro_rules! string_id {
@@ -606,6 +607,130 @@ pub struct CognitiveRouter {
     cancelled: BTreeSet<CancellationTokenId>,
 }
 
+/// Runtime-owned, single-flight boundary for optional cognitive I/O.
+///
+/// `submit` only moves an immutable, bounded request into a background task;
+/// [`poll`](Self::poll) never waits for provider I/O. A response is useful only
+/// when it still refers to the caller's current snapshot and arrives before its
+/// deadline. This deliberately keeps providers outside the control-loop
+/// authority boundary: their only output is evidence or advice.
+pub struct AsyncCognitionSupervisor {
+    router: Option<CognitiveRouter>,
+    pending: Option<PendingCognition>,
+    cancelled: BTreeSet<CancellationTokenId>,
+    last_registry: ProviderRegistrySnapshot,
+}
+
+struct PendingCognition {
+    request: CognitiveRequest,
+    task: JoinHandle<(CognitiveRouter, RoutedResponse)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubmissionDisposition {
+    Submitted,
+    Busy,
+    Invalid,
+}
+
+impl AsyncCognitionSupervisor {
+    pub fn new(router: CognitiveRouter, now_ms: u64) -> Self {
+        let last_registry = router.registry_snapshot(now_ms);
+        Self {
+            router: Some(router),
+            pending: None,
+            cancelled: BTreeSet::new(),
+            last_registry,
+        }
+    }
+
+    pub fn registry_snapshot(&self) -> &ProviderRegistrySnapshot {
+        &self.last_registry
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Enqueue one bounded request without performing provider I/O inline.
+    pub fn submit(&mut self, request: CognitiveRequest, now_ms: u64) -> SubmissionDisposition {
+        if request.validate().is_err() || request.deadline_ms <= now_ms {
+            return SubmissionDisposition::Invalid;
+        }
+        if self.pending.is_some() {
+            return SubmissionDisposition::Busy;
+        }
+        let Some(mut router) = self.router.take() else {
+            return SubmissionDisposition::Busy;
+        };
+        self.last_registry = router.registry_snapshot(now_ms);
+        let dispatched = request.clone();
+        let task = tokio::spawn(async move {
+            let response = router.dispatch(dispatched, now_ms).await;
+            (router, response)
+        });
+        self.pending = Some(PendingCognition { request, task });
+        SubmissionDisposition::Submitted
+    }
+
+    /// Mark a request as cancelled. Its provider task may finish normally, but
+    /// its result can no longer cross back into the organism model.
+    pub fn cancel(&mut self, token: CancellationTokenId) {
+        self.cancelled.insert(token);
+    }
+
+    /// Poll once for a finished response, returning immediately when I/O is
+    /// still pending. `current_snapshot` must come from the current immutable
+    /// `Now` view, not from provider-controlled state.
+    pub async fn poll(
+        &mut self,
+        current_snapshot: &SnapshotRef,
+        now_ms: u64,
+    ) -> Option<RoutedResponse> {
+        if !self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.task.is_finished())
+        {
+            return None;
+        }
+        let pending = self.pending.take().expect("finished task exists");
+        let cancelled = self.cancelled.remove(&pending.request.cancellation_token);
+        let (router, mut routed) = match pending.task.await {
+            Ok(result) => result,
+            Err(_) => {
+                // A panicking provider task cannot safely return its provider
+                // registry. Keep a truthful empty/degraded boundary rather than
+                // ever blocking the caller while attempting recovery.
+                self.router = Some(CognitiveRouter::default());
+                self.last_registry = ProviderRegistrySnapshot {
+                    schema_version: 1,
+                    observed_at_ms: now_ms,
+                    ..ProviderRegistrySnapshot::default()
+                };
+                return None;
+            }
+        };
+        self.last_registry = router.registry_snapshot(now_ms);
+        self.router = Some(router);
+
+        if cancelled {
+            routed.disposition = ResponseDisposition::Rejected;
+            routed.response.status = CognitiveResponseStatus::Cancelled;
+            routed.response.failure = Some("request was cancelled".to_string());
+        } else if now_ms > pending.request.deadline_ms {
+            routed.disposition = ResponseDisposition::Stale;
+            routed.response.status = CognitiveResponseStatus::Stale;
+            routed.response.failure = Some("response expired before polling".to_string());
+        } else if routed.response.input_snapshot != *current_snapshot {
+            routed.disposition = ResponseDisposition::Stale;
+            routed.response.status = CognitiveResponseStatus::Stale;
+            routed.response.failure = Some("response belongs to an obsolete snapshot".to_string());
+        }
+        Some(routed)
+    }
+}
+
 impl CognitiveRouter {
     pub fn register(&mut self, provider: Box<dyn CognitiveProvider>) {
         let descriptor = provider.descriptor();
@@ -771,6 +896,8 @@ fn failed_routed_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Notify;
 
     fn provider(id: &str, locality: Locality, latency: u64) -> CognitiveProviderDescriptor {
         CognitiveProviderDescriptor {
@@ -899,5 +1026,107 @@ mod tests {
         assert!(!serialized.contains("motor"));
         assert!(!serialized.contains("authority"));
         assert!(!serialized.contains("wheel"));
+    }
+
+    struct StalledProvider {
+        descriptor: CognitiveProviderDescriptor,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl CognitiveProvider for StalledProvider {
+        fn descriptor(&self) -> CognitiveProviderDescriptor {
+            self.descriptor.clone()
+        }
+
+        async fn execute(&mut self, request: &CognitiveRequest) -> Result<CognitiveResponse> {
+            self.release.notified().await;
+            Ok(CognitiveResponse {
+                schema_version: 1,
+                request_id: request.request_id.clone(),
+                provider_id: self.descriptor.provider_id.clone(),
+                provider_role: self.descriptor.role,
+                implementation: self.descriptor.implementation.clone(),
+                implementation_version: "1".to_string(),
+                model_version: None,
+                status: CognitiveResponseStatus::Completed,
+                confidence: 0.9,
+                uncertainty: 0.1,
+                input_snapshot: request.input_snapshot.clone(),
+                completed_at_ms: 20,
+                resource_cost: ResourceCost::default(),
+                provenance: vec!["stalled-provider-fixture".to_string()],
+                payload: CognitiveResponsePayload::SceneDescription {
+                    text: "a clear path".to_string(),
+                    embedding: Vec::new(),
+                },
+                failure: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_provider_never_delays_poll_and_obsolete_answer_is_rejected() {
+        let release = Arc::new(Notify::new());
+        let mut router = CognitiveRouter::default();
+        router.register(Box::new(StalledProvider {
+            descriptor: provider("forebrain", Locality::LocalNetwork, 10),
+            release: release.clone(),
+        }));
+        let mut supervisor = AsyncCognitionSupervisor::new(router, 10);
+        let submitted = request();
+        assert_eq!(
+            supervisor.submit(submitted.clone(), 10),
+            SubmissionDisposition::Submitted
+        );
+
+        // This is the control-loop guarantee: polling pending network/model
+        // work completes locally, without awaiting the provider.
+        tokio::time::timeout(
+            Duration::from_millis(10),
+            supervisor.poll(&submitted.input_snapshot, 20),
+        )
+        .await
+        .expect("poll must not delay the control tick");
+
+        release.notify_one();
+        tokio::task::yield_now().await;
+        let mut newer = submitted.input_snapshot.clone();
+        newer.revision += 1;
+        let response = loop {
+            if let Some(response) = supervisor.poll(&newer, 30).await {
+                break response;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(response.disposition, ResponseDisposition::Stale);
+        assert_eq!(response.response.status, CognitiveResponseStatus::Stale);
+        assert_eq!(
+            response.response.failure.as_deref(),
+            Some("response belongs to an obsolete snapshot")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_answer_cannot_reenter_the_runtime() {
+        let release = Arc::new(Notify::new());
+        let mut router = CognitiveRouter::default();
+        router.register(Box::new(StalledProvider {
+            descriptor: provider("forebrain", Locality::LocalNetwork, 10),
+            release: release.clone(),
+        }));
+        let mut supervisor = AsyncCognitionSupervisor::new(router, 10);
+        let submitted = request();
+        supervisor.submit(submitted.clone(), 10);
+        supervisor.cancel(submitted.cancellation_token.clone());
+        release.notify_one();
+        let response = loop {
+            if let Some(response) = supervisor.poll(&submitted.input_snapshot, 30).await {
+                break response;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(response.disposition, ResponseDisposition::Rejected);
+        assert_eq!(response.response.status, CognitiveResponseStatus::Cancelled);
     }
 }
