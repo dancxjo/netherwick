@@ -31,10 +31,6 @@ pub trait BrainstemHardware {
     /// Ends a Create power-toggle pulse and leaves POWER_TOGGLE low so the
     /// circuit is armed for the next request.
     fn end_power_toggle_pulse(&mut self);
-    /// Create 1 BRC/DD is a 0-5V input to the robot. `false` asserts it by
-    /// pulling low; `true` releases the line so the robot/external pull-up can
-    /// read high. Implementations must not drive this signal high push-pull.
-    fn set_brc(&mut self, released: bool);
     fn set_indicators(&mut self, on: bool);
     #[allow(dead_code)]
     fn set_primary_indicator(&mut self, on: bool);
@@ -95,7 +91,7 @@ pub(crate) fn initialize_power_control<
 #[cfg(test)]
 mod tests {
     use super::initialize_power_control;
-    use core::cell::Cell;
+    use core::cell::{Cell, RefCell};
 
     #[test]
     fn power_toggle_is_established_low_before_txs_oe_is_enabled() {
@@ -136,5 +132,36 @@ mod tests {
 
         assert_eq!(initialized, Err("POWER_TOGGLE initialization failed"));
         assert_eq!(oe_enable_attempts.get(), 0);
+    }
+
+    #[test]
+    fn txs_oe_is_enabled_once_and_retained_while_power_toggle_pulses() {
+        let power_toggle_levels = RefCell::new(std::vec::Vec::new());
+        let txs_oe_high = Cell::new(false);
+        let txs_oe_high_writes = Cell::new(0);
+
+        let (power_toggle, txs_oe) = initialize_power_control(
+            (),
+            (),
+            |_| {
+                power_toggle_levels.borrow_mut().push(false);
+                Ok::<_, ()>(&power_toggle_levels)
+            },
+            |_| {
+                txs_oe_high.set(true);
+                txs_oe_high_writes.set(txs_oe_high_writes.get() + 1);
+                Ok::<_, ()>(&txs_oe_high)
+            },
+        )
+        .unwrap();
+
+        power_toggle.borrow_mut().extend([false, true, false]);
+
+        assert!(txs_oe.get());
+        assert_eq!(txs_oe_high_writes.get(), 1);
+        assert_eq!(
+            power_toggle.borrow().as_slice(),
+            &[false, false, true, false]
+        );
     }
 }

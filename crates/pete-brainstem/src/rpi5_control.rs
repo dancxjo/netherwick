@@ -654,7 +654,6 @@ fn parse_power_request(request: &str) -> Option<PowerStateRequest> {
     match request {
         "wake" | "WAKE" => Some(PowerStateRequest::Wake),
         "sleep" | "SLEEP" => Some(PowerStateRequest::Sleep),
-        "pulse_brc" | "PULSE_BRC" => Some(PowerStateRequest::PulseBrc),
         "start_oi" | "START_OI" => Some(PowerStateRequest::StartOi),
         "debug_baud_19200" | "DEBUG_BAUD_19200" => Some(PowerStateRequest::DebugBaud19200),
         "debug_baud_57600" | "DEBUG_BAUD_57600" => Some(PowerStateRequest::DebugBaud57600),
@@ -835,7 +834,6 @@ mod tests {
         assert!(!caps.verbs.contains(&"power_state"));
         assert!(!caps.verbs.contains(&"orientation_probe"));
         assert!(!caps.outputs.contains(&"power_toggle"));
-        assert!(!caps.outputs.contains(&"brc"));
         assert!(!caps.sensors.contains(&"imu"));
         assert!(!caps.safety.contains(&"tilt"));
     }

@@ -86,22 +86,15 @@ enum ActiveAction {
         wake_wait_until_ms: Option<u32>,
         power_on: bool,
     },
-    BrcLow {
-        release_at_ms: u32,
-    },
-    BrcSettle {
-        until_ms: u32,
-    },
     WakeSettle {
         until_ms: u32,
-        power_toggled: bool,
     },
     WaitForCreate {
         deadline_ms: u32,
         next_probe_ms: u32,
         response_bytes: u8,
         oi_started: bool,
-        power_toggled: bool,
+        allow_power_toggle_on_timeout: bool,
     },
     Settle {
         until_ms: u32,
@@ -242,7 +235,6 @@ where
     motherbrain_reset_history: [Option<MotherbrainResetRecord>; MOTHERBRAIN_RESET_HISTORY_CAPACITY],
     motherbrain_reset_history_next: usize,
     safety_recovery_motion: bool,
-    create_no_response_restart_queued: bool,
     active_contact_withdrawal: Option<ActiveContactWithdrawal>,
     last_contact_withdrawal_at_ms: Option<u32>,
     repeated_contact_count: u8,
@@ -308,7 +300,6 @@ where
             motherbrain_reset_history: [None; MOTHERBRAIN_RESET_HISTORY_CAPACITY],
             motherbrain_reset_history_next: 0,
             safety_recovery_motion: false,
-            create_no_response_restart_queued: false,
             active_contact_withdrawal: None,
             last_contact_withdrawal_at_ms: None,
             repeated_contact_count: 0,
@@ -429,7 +420,6 @@ where
         });
         if matches!(snapshot.oi_mode, 1..=3) && create_link_fresh {
             self.create_responsive = true;
-            self.create_no_response_restart_queued = false;
             status::set_create_power_on(true);
         } else if self.last_create_packet_at_ms.is_some() && !create_link_fresh {
             // OI mode and power state are observations, not durable promises.
@@ -478,18 +468,6 @@ where
             let _ = self
                 .commands
                 .push_back(QueuedCommand::new(command_id, *command));
-        }
-        self.mode = RuntimeMode::Running;
-    }
-
-    fn queue_create_restart_front(&mut self, command_id: u32) {
-        while self.commands.len() + RESTART_CREATE_SCRIPT.len() > COMMAND_QUEUE_CAPACITY {
-            let _ = self.commands.pop_back();
-        }
-        for command in RESTART_CREATE_SCRIPT.iter().rev() {
-            let _ = self
-                .commands
-                .push_front(QueuedCommand::new(command_id, *command));
         }
         self.mode = RuntimeMode::Running;
     }
@@ -971,45 +949,62 @@ where
                 self.create_responsive = false;
                 status::set_oi_mode_unknown();
                 status::set_body_state(BodyState::WaitingForCreate);
-                if status::create_power_state_is_off(status::snapshot(now_ms).create_power_state) {
-                    self.push_event(BrainstemEvent::CreatePowerOnRequested);
-                    self.hardware.begin_power_toggle_pulse();
-                    self.active = ActiveAction::PowerPulse {
-                        release_at_ms: now_ms.wrapping_add(body::POWER_TOGGLE_PULSE_MS),
-                        wake_wait_until_ms: Some(now_ms.wrapping_add(body::CREATE_WAKE_WAIT_MS)),
-                        power_on: true,
-                    };
-                } else {
-                    status::set_create_power_unknown();
-                    self.active = ActiveAction::WaitForCreate {
-                        deadline_ms: now_ms.wrapping_add(body::CREATE_RESPONSIVE_TIMEOUT_MS),
-                        next_probe_ms: now_ms,
-                        response_bytes: 0,
-                        oi_started: false,
-                        power_toggled: false,
-                    };
+                match status::known_create_power_state(status::snapshot(now_ms).create_power_state)
+                {
+                    Some(false) => {
+                        self.push_event(BrainstemEvent::CreatePowerOnRequested);
+                        self.hardware.begin_power_toggle_pulse();
+                        self.active = ActiveAction::PowerPulse {
+                            release_at_ms: now_ms.wrapping_add(body::POWER_TOGGLE_PULSE_MS),
+                            wake_wait_until_ms: Some(
+                                now_ms.wrapping_add(body::CREATE_WAKE_WAIT_MS),
+                            ),
+                            power_on: true,
+                        };
+                    }
+                    known_state => {
+                        self.active = ActiveAction::WaitForCreate {
+                            deadline_ms: now_ms.wrapping_add(body::CREATE_RESPONSIVE_TIMEOUT_MS),
+                            next_probe_ms: now_ms,
+                            response_bytes: 0,
+                            oi_started: false,
+                            // UNKNOWN gets one documented best-effort pulse
+                            // after a full probe timeout. Known ON is probe-only:
+                            // an RX failure must never toggle a running Create off.
+                            allow_power_toggle_on_timeout: known_state.is_none(),
+                        };
+                    }
                 };
             }
             RuntimeCommand::SleepCreate => {
                 self.create_responsive = false;
                 status::set_oi_mode_unknown();
-                status::set_body_state(BodyState::PowerCycling);
                 self.stop_drive()?;
-                self.push_event(BrainstemEvent::CreatePowerOffRequested);
-                self.hardware.begin_power_toggle_pulse();
-                self.active = ActiveAction::PowerPulse {
-                    release_at_ms: now_ms.wrapping_add(body::POWER_TOGGLE_PULSE_MS),
-                    wake_wait_until_ms: None,
-                    power_on: false,
-                };
-            }
-            RuntimeCommand::PulseBrc => {
-                if body::CREATE_BRC_ENABLED {
-                    self.push_event(BrainstemEvent::CreateBrcPulseRequested);
-                    self.hardware.set_brc(false);
-                    self.active = ActiveAction::BrcLow {
-                        release_at_ms: now_ms.wrapping_add(body::BRC_LOW_PULSE_MS),
-                    };
+                match status::known_create_power_state(status::snapshot(now_ms).create_power_state)
+                {
+                    Some(false) => {
+                        // Pin 3 is a toggle, so sleeping an already-OFF Create
+                        // succeeds without touching POWER_TOGGLE.
+                        status::set_body_state(BodyState::Idle);
+                        self.active = ActiveAction::None;
+                    }
+                    Some(true) => {
+                        status::set_body_state(BodyState::PowerCycling);
+                        self.push_event(BrainstemEvent::CreatePowerOffRequested);
+                        self.hardware.begin_power_toggle_pulse();
+                        self.active = ActiveAction::PowerPulse {
+                            release_at_ms: now_ms.wrapping_add(body::POWER_TOGGLE_PULSE_MS),
+                            wake_wait_until_ms: None,
+                            power_on: false,
+                        };
+                    }
+                    None => {
+                        // Refuse an ambiguous toggle after stopping output. The
+                        // command is reported interrupted, not completed.
+                        status::set_body_state(BodyState::Idle);
+                        self.refuse_active_command();
+                        self.active = ActiveAction::None;
+                    }
                 }
             }
             RuntimeCommand::StartOi => {
@@ -1244,10 +1239,7 @@ where
                         status::set_create_power_on(power_on);
                     }
                     self.active = match wake_wait_until_ms {
-                        Some(until_ms) => ActiveAction::WakeSettle {
-                            until_ms,
-                            power_toggled: true,
-                        },
+                        Some(until_ms) => ActiveAction::WakeSettle { until_ms },
                         None => ActiveAction::None,
                     };
                     if self.active == ActiveAction::None {
@@ -1256,34 +1248,21 @@ where
                 }
                 Ok(())
             }
-            ActiveAction::BrcLow { release_at_ms } => {
-                if time_reached(now_ms, release_at_ms) {
-                    self.hardware.set_brc(true);
-                    self.push_event(BrainstemEvent::CreateBrcPulsed);
-                    self.active = ActiveAction::BrcSettle {
-                        until_ms: now_ms.wrapping_add(body::POST_BRC_SETTLE_MS),
-                    };
-                }
-                Ok(())
-            }
-            ActiveAction::BrcSettle { until_ms } | ActiveAction::Settle { until_ms } => {
+            ActiveAction::Settle { until_ms } => {
                 if time_reached(now_ms, until_ms) {
                     self.active = ActiveAction::None;
                     self.complete_active_command();
                 }
                 Ok(())
             }
-            ActiveAction::WakeSettle {
-                until_ms,
-                power_toggled,
-            } => {
+            ActiveAction::WakeSettle { until_ms } => {
                 if time_reached(now_ms, until_ms) {
                     self.active = ActiveAction::WaitForCreate {
                         deadline_ms: now_ms.wrapping_add(body::CREATE_RESPONSIVE_TIMEOUT_MS),
                         next_probe_ms: now_ms,
                         response_bytes: 0,
                         oi_started: false,
-                        power_toggled,
+                        allow_power_toggle_on_timeout: false,
                     };
                 }
                 Ok(())
@@ -1293,7 +1272,7 @@ where
                 next_probe_ms,
                 mut response_bytes,
                 oi_started,
-                power_toggled,
+                allow_power_toggle_on_timeout,
             } => {
                 while let Some(event) = self.events.pop_front() {
                     match event {
@@ -1311,7 +1290,6 @@ where
 
                 if response_bytes >= WAKE_PROBE_RESPONSE_BYTES_REQUIRED {
                     self.create_responsive = true;
-                    self.create_no_response_restart_queued = false;
                     status::set_create_power_on(true);
                     self.active = ActiveAction::None;
                     self.complete_active_command();
@@ -1319,7 +1297,7 @@ where
                 }
 
                 if time_reached(now_ms, deadline_ms) {
-                    if !power_toggled {
+                    if allow_power_toggle_on_timeout {
                         self.push_event(BrainstemEvent::CreatePowerOnRequested);
                         self.hardware.begin_power_toggle_pulse();
                         self.active = ActiveAction::PowerPulse {
@@ -1335,15 +1313,11 @@ where
                     status::set_create_power_unknown();
                     status::set_oi_mode_unknown();
                     status::mark_uart_rx_error();
-                    if response_bytes == 0 && !self.create_no_response_restart_queued {
-                        self.create_no_response_restart_queued = true;
-                        self.queue_create_restart_front(self.active_command_id.unwrap_or(0));
-                    }
-                    // Do not strand supervision in Error because RX failed.
-                    // The queued START/FULL commands and periodic assertion
-                    // still have value when the receive side is broken.
+                    // Do not silently escalate a failed probe into another
+                    // power cycle. An explicit service-scoped restart remains
+                    // available to an attended diagnostic operator.
                     self.active = ActiveAction::None;
-                    self.complete_active_command();
+                    self.fail_active_command(BrainstemError::Timeout);
                     return Ok(());
                 }
 
@@ -1357,7 +1331,7 @@ where
                             next_probe_ms: now_ms.wrapping_add(body::POST_START_SETTLE_MS),
                             response_bytes: 0,
                             oi_started: true,
-                            power_toggled,
+                            allow_power_toggle_on_timeout,
                         };
                         return Ok(());
                     }
@@ -1376,7 +1350,7 @@ where
                         next_probe_ms: now_ms.wrapping_add(SENSOR_PROBE_PERIOD_MS),
                         response_bytes,
                         oi_started,
-                        power_toggled,
+                        allow_power_toggle_on_timeout,
                     };
                 } else {
                     self.active = ActiveAction::WaitForCreate {
@@ -1384,7 +1358,7 @@ where
                         next_probe_ms,
                         response_bytes,
                         oi_started,
-                        power_toggled,
+                        allow_power_toggle_on_timeout,
                     };
                 }
                 Ok(())
@@ -2218,8 +2192,6 @@ where
         match self.active {
             ActiveAction::None => RuntimeActionCode::None,
             ActiveAction::PowerPulse { .. } => RuntimeActionCode::PowerPulse,
-            ActiveAction::BrcLow { .. } => RuntimeActionCode::BrcLow,
-            ActiveAction::BrcSettle { .. } => RuntimeActionCode::BrcSettle,
             ActiveAction::WakeSettle { .. } => RuntimeActionCode::WakeSettle,
             ActiveAction::WaitForCreate { .. } => RuntimeActionCode::WaitForCreate,
             ActiveAction::Settle { .. } => RuntimeActionCode::Settle,
@@ -2239,6 +2211,14 @@ where
         status::clear_velocity_stream();
         if let Some(command_id) = self.active_command_id.take() {
             status::mark_command_completed(command_id);
+        }
+    }
+
+    fn refuse_active_command(&mut self) {
+        self.safety_recovery_motion = false;
+        status::clear_velocity_stream();
+        if let Some(command_id) = self.active_command_id.take() {
+            status::mark_command_interrupted(command_id);
         }
     }
 
@@ -2456,7 +2436,6 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
         BrainstemCommand::PowerState { request, .. } => match request {
             PowerStateRequest::Wake => Some(RuntimeCommand::WakeCreate),
             PowerStateRequest::Sleep => Some(RuntimeCommand::SleepCreate),
-            PowerStateRequest::PulseBrc => Some(RuntimeCommand::PulseBrc),
             PowerStateRequest::StartOi => Some(RuntimeCommand::StartOi),
             PowerStateRequest::DebugBaud19200 => Some(RuntimeCommand::SetCreateBaud(19_200)),
             PowerStateRequest::DebugBaud57600 => Some(RuntimeCommand::SetCreateBaud(57_600)),
@@ -2685,8 +2664,6 @@ mod tests {
             let _ = self.power_toggle_levels.push(false);
         }
 
-        fn set_brc(&mut self, _high: bool) {}
-
         fn set_indicators(&mut self, _on: bool) {}
 
         fn set_primary_indicator(&mut self, _on: bool) {}
@@ -2820,6 +2797,7 @@ mod tests {
         status::set_create_power_on(false);
         let mut runtime = Runtime::new(FakeHardware::new(1_000));
 
+        assert_eq!(body::POWER_TOGGLE_PULSE_MS, 500);
         assert!(runtime.enqueue_command(RuntimeCommand::WakeCreate).is_ok());
         assert!(runtime.start_next_command().is_ok());
 
@@ -2836,7 +2814,15 @@ mod tests {
             }
         ));
 
-        runtime.hardware.delay_ms(body::POWER_TOGGLE_PULSE_MS);
+        runtime.hardware.delay_ms(body::POWER_TOGGLE_PULSE_MS - 1);
+        assert!(runtime.advance_active_action().is_ok());
+        assert_eq!(
+            runtime.hardware.power_toggle_levels.as_slice(),
+            &[false, true],
+            "POWER_TOGGLE must remain high for the full 500 ms"
+        );
+
+        runtime.hardware.delay_ms(1);
         assert!(runtime.advance_active_action().is_ok());
 
         assert_eq!(
@@ -2869,60 +2855,144 @@ mod tests {
     }
 
     #[test]
-    fn zero_byte_wake_timeout_queues_create_restart_once() {
+    fn repeated_sleep_cannot_toggle_a_known_off_create_back_on() {
         let _guard = status::status_test_guard();
+        status::set_create_power_on(true);
         let mut runtime = Runtime::new(FakeHardware::new(1_000));
-        runtime.active_command_id = Some(77);
-        runtime.active = ActiveAction::WaitForCreate {
-            deadline_ms: 1_000,
-            next_probe_ms: 2_000,
-            response_bytes: 0,
-            oi_started: true,
-            power_toggled: true,
-        };
 
+        assert!(runtime.enqueue_command(RuntimeCommand::SleepCreate).is_ok());
+        assert!(runtime.start_next_command().is_ok());
+        assert_eq!(
+            runtime.hardware.power_toggle_levels.as_slice(),
+            &[false, true]
+        );
+
+        runtime.hardware.delay_ms(body::POWER_TOGGLE_PULSE_MS);
         assert!(runtime.advance_active_action().is_ok());
+        assert_eq!(
+            runtime.hardware.power_toggle_levels.as_slice(),
+            &[false, true, false]
+        );
+        assert_eq!(
+            status::known_create_power_state(status::snapshot(runtime.now_ms()).create_power_state),
+            Some(false)
+        );
 
-        assert_eq!(runtime.commands.len(), RESTART_CREATE_SCRIPT.len());
-        for (queued, expected) in runtime.commands.iter().zip(RESTART_CREATE_SCRIPT.iter()) {
-            assert_eq!(queued.command_id, 77);
-            assert!(queued.command == *expected);
-        }
-        assert!(runtime.create_no_response_restart_queued);
+        assert!(runtime.enqueue_command(RuntimeCommand::SleepCreate).is_ok());
+        assert!(runtime.start_next_command().is_ok());
+        assert_eq!(
+            runtime.hardware.power_toggle_levels.as_slice(),
+            &[false, true, false],
+            "sleeping a known-OFF Create must not produce another edge"
+        );
+    }
 
-        runtime.commands.clear();
-        runtime.active_command_id = Some(78);
-        runtime.active = ActiveAction::WaitForCreate {
-            deadline_ms: 1_000,
-            next_probe_ms: 2_000,
-            response_bytes: 0,
-            oi_started: true,
-            power_toggled: true,
-        };
-
-        assert!(runtime.advance_active_action().is_ok());
-        assert!(runtime.commands.is_empty());
-
-        let mut bytes = heapless::Vec::<u8, 32>::new();
-        assert!(bytes.push(1).is_ok());
+    #[test]
+    fn sleep_with_unknown_power_state_refuses_without_pulsing() {
+        let _guard = status::status_test_guard();
+        status::set_create_power_unknown();
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
         assert!(runtime
-            .events
-            .push_back(BrainstemEvent::CreatePacketReceived {
-                packet_id: 35,
-                bytes
-            })
+            .commands
+            .push_back(QueuedCommand::new(55, RuntimeCommand::SleepCreate))
             .is_ok());
-        runtime.active = ActiveAction::WaitForCreate {
-            deadline_ms: 1_010,
-            next_probe_ms: 2_000,
-            response_bytes: 0,
-            oi_started: true,
-            power_toggled: true,
-        };
 
+        assert!(runtime.start_next_command().is_ok());
+
+        assert!(runtime.hardware.power_toggle_levels.is_empty());
+        assert_eq!(
+            status::snapshot(runtime.now_ms()).last_interrupted_command_id,
+            55
+        );
+    }
+
+    #[test]
+    fn known_on_wake_timeout_never_toggles_create_power() {
+        let _guard = status::status_test_guard();
+        status::set_create_power_on(true);
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        assert!(runtime
+            .commands
+            .push_back(QueuedCommand::new(61, RuntimeCommand::WakeCreate))
+            .is_ok());
+
+        assert!(runtime.start_next_command().is_ok());
+        let deadline_ms = match runtime.active {
+            ActiveAction::WaitForCreate {
+                deadline_ms,
+                allow_power_toggle_on_timeout: false,
+                ..
+            } => deadline_ms,
+            _ => panic!("known-ON wake must start with a probe-only wait"),
+        };
         assert!(runtime.advance_active_action().is_ok());
-        assert!(!runtime.create_no_response_restart_queued);
-        assert!(runtime.create_responsive);
+        assert!(
+            runtime.hardware.writes.contains(&128),
+            "wake must probe OI first"
+        );
+
+        runtime.hardware.now_us = deadline_ms * 1_000;
+        assert!(runtime.advance_active_action().is_ok());
+
+        assert!(runtime.hardware.power_toggle_levels.is_empty());
+        assert!(runtime.commands.is_empty());
+        assert_eq!(
+            status::snapshot(runtime.now_ms()).last_timed_out_command_id,
+            61
+        );
+    }
+
+    #[test]
+    fn unknown_wake_allows_at_most_one_best_effort_pulse() {
+        let _guard = status::status_test_guard();
+        status::set_create_power_unknown();
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        assert!(runtime.enqueue_command(RuntimeCommand::WakeCreate).is_ok());
+
+        assert!(runtime.start_next_command().is_ok());
+        let first_deadline_ms = match runtime.active {
+            ActiveAction::WaitForCreate {
+                deadline_ms,
+                allow_power_toggle_on_timeout: true,
+                ..
+            } => deadline_ms,
+            _ => panic!("UNKNOWN wake must probe before its best-effort pulse"),
+        };
+        assert!(runtime.advance_active_action().is_ok());
+
+        runtime.hardware.now_us = first_deadline_ms * 1_000;
+        assert!(runtime.advance_active_action().is_ok());
+        assert_eq!(
+            runtime.hardware.power_toggle_levels.as_slice(),
+            &[false, true]
+        );
+
+        runtime.hardware.delay_ms(body::POWER_TOGGLE_PULSE_MS);
+        assert!(runtime.advance_active_action().is_ok());
+        let settle_until_ms = match runtime.active {
+            ActiveAction::WakeSettle { until_ms } => until_ms,
+            _ => panic!("best-effort pulse must enter wake settle"),
+        };
+        runtime.hardware.now_us = settle_until_ms * 1_000;
+        assert!(runtime.advance_active_action().is_ok());
+        let second_deadline_ms = match runtime.active {
+            ActiveAction::WaitForCreate {
+                deadline_ms,
+                allow_power_toggle_on_timeout: false,
+                ..
+            } => deadline_ms,
+            _ => panic!("post-pulse probe must prohibit another toggle"),
+        };
+        assert!(runtime.advance_active_action().is_ok());
+
+        runtime.hardware.now_us = second_deadline_ms * 1_000;
+        assert!(runtime.advance_active_action().is_ok());
+
+        assert_eq!(
+            runtime.hardware.power_toggle_levels.as_slice(),
+            &[false, true, false]
+        );
+        assert!(runtime.commands.is_empty());
     }
 
     #[test]

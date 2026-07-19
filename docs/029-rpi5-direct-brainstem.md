@@ -30,10 +30,9 @@ adapter is safe. The connector also exposes unregulated battery voltage; do not
 connect its Vpwr pins to the RPi 5.
 
 The standard serial cable gives this backend serial TX, RX, and ground. It does
-not give the isolated power-toggle circuit, charging-indicator GPIO, external
-IMU, or general-purpose BRC drive present on the Pico board. The RPi 5
-capability response therefore omits those features. Turn the Create on manually
-before starting the service.
+not give the isolated power-toggle circuit, charging-indicator GPIO, or
+external IMU present on the Pico board. The RPi 5 capability response therefore
+omits those features. Turn the Create on manually before starting the service.
 
 ## Configure and run
 
@@ -108,7 +107,7 @@ group need the corresponding local adjustment.
 With the wheels lifted clear of the floor:
 
 1. `just brainstem-rpi5-check` reports the Create body contract without
-   power-toggle, BRC, or IMU capabilities.
+   power-toggle or IMU capabilities.
 2. Status advances `create_rx_packets` and `create_body_packets`, and OI mode
    reaches `full`.
 3. A 125 ms velocity pulse stops at its TTL without a possessor STOP.

@@ -6,6 +6,16 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Read the r23 Create charging indicator from GP20/physical pin 26 in both Pico
+  backends, and move the optional external status output to GP17 so firmware
+  never drives the TXS channel 8 charging signal.
+- Make r23 Create sleep/wake requests state-aware at the pulse site: repeated
+  sleeps cannot toggle a known-OFF robot back on, known-ON wake timeouts remain
+  probe-only, UNKNOWN wake permits at most one best-effort pulse, and failed
+  probes no longer queue an automatic power cycle.
+- Remove the unused Create baud-control configuration, commands, runtime
+  actions, capability field, operator control, compatibility parser, and dead
+  driver path; r23 power control now has only the state-aware GP18 toggle.
 - Restrict brainstem contact withdrawal to a fresh bumper edge during unsafe
   forward output; held-at-boot and stationary contact now latch and stop
   without starting authority-independent reverse motion.

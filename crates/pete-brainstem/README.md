@@ -44,8 +44,6 @@ gpio = 19
 physical_pin = 25
 ```
 
-Create BRC is unconnected on r23 and is not used for power control.
-
 ## Wiring
 
 | Signal | Pico GPIO | Pico physical pin | Direction |
@@ -54,8 +52,8 @@ Create BRC is unconnected on r23 and is not used for power control.
 | Create OI UART RX | GP1 | 2 | Create TX to Pico RX |
 | `POWER_TOGGLE` | GP18 | 24 | Pico output through TXS0108E channel 7 to Create DB-25 pin 3 |
 | `TXS_OE` | GP19 | 25 | Pico output to TXS0108E OE; external 10 kΩ pull-down |
-| Create charging indicator | GP17 | 22 | Level-shifted Create DB-25 pin 13 to Pico input |
-| External status LED | GP20 | 26 | Pico output, optional |
+| Create charging indicator | GP20 | 26 | Create DB-25 pin 13 through TXS0108E channel 8 to Pico input |
+| Unused external status output | GP17 | 22 | Pico output role; unconnected on r23 |
 | Onboard LED | GP25 | onboard | Pico output |
 | Shared sensor I2C SDA | GP2 | 4 | Pico I2C1 SDA to MPU-6050 and optional SSD1306 OLED SDA |
 | Shared sensor I2C SCL | GP3 | 5 | Pico I2C1 SCL to MPU-6050 and optional SSD1306 OLED SCL |
@@ -93,13 +91,13 @@ or suppress MPU probing and sampling.
 Do not connect 5V Create TX directly to RP2040 RX. The firmware assumes external level shifting or a divider is present on the Create TX to Pico GP1 line.
 
 The original Create drives Cargo Bay DB-25 pin 13 high at 5V while charging.
-GP17 is configured as an active-high 3.3V input, so this path also requires a
-divider or level shifter; never connect DB-25 pin 13 directly to GP17. Status
-reports both the normalized `charging_indicator` and the inferred raw
-`charging_indicator_level`, plus GPIO, physical pin, and configured polarity.
-While docked, verify the Create side of the interface reaches 5V and the GP17
-side reaches a valid 3.3V high before treating `charging_indicator: off` as a
-firmware polarity result.
+On r23, TXS0108E channel 8 level-shifts that signal to GP20, which firmware
+configures as an active-high input with a pull-down. Firmware never drives GP20
+as an LED output. Status reports both the normalized `charging_indicator` and
+the inferred raw `charging_indicator_level`, plus GPIO, physical pin, and
+configured polarity. While docked, verify the Create side of the interface
+reaches 5V and the GP20 side reaches a valid 3.3V high before treating
+`charging_indicator: off` as a firmware polarity result.
 
 On r23, Create DB-25 pin 3 toggles robot power on a low-to-high transition.
 Pico GP18 drives that input through TXS0108E channel 7. Firmware first
@@ -110,9 +108,19 @@ configured pulse interval, then low again. Ordinary startup does not request a
 power toggle. If firmware panics, it clears GP18 and GP19 before halting so the
 translator is disabled and the toggle signal is low.
 
+Because Create pin 3 is a toggle rather than separate on/off control, firmware
+re-checks the observed power state when each sleep or wake command reaches the
+runtime. Sleep is a no-op when Create is known off, pulses once when known on,
+and is refused without a pulse when power is unknown. Wake pulses once when
+known off and only probes when known on. When power is unknown, wake probes
+first and permits one best-effort pulse after the first probe timeout; the
+post-pulse probe cannot trigger another pulse. A failed probe never queues an
+automatic power-cycle script. The attended, service-scoped `restart_create`
+operation remains the explicit diagnostic path for a full restart.
+
 The board's 10 kΩ OE pull-down keeps the translator disabled during reset and
 early boot. It is a hardware backstop, not a substitute for the firmware's
-ordered output initialization. BRC remains unconnected.
+ordered output initialization.
 
 ## Architecture
 
@@ -649,7 +657,7 @@ STREAM_SENSORS seq true|false packet_id period_ms
 CLEAR_MOTION_QUEUE seq
 DEFINE_CHIRP seq ok|error|armed|lost_target|dock_seen|danger note duration_64ths...
 PLAY_FEEDBACK seq ok|error|armed|lost_target|dock_seen|danger
-POWER_STATE seq wake|sleep|pulse_brc|start_oi
+POWER_STATE seq wake|sleep|start_oi
 CALIBRATE_TURN seq angular_mrad_s duration_ms
 RESET_ODOMETRY seq
 SONG_PLAY seq id
@@ -662,9 +670,7 @@ BOOTSEL seq
 
 `GET_CAPABILITIES` replies with one compact `CAPABILITIES` line. `GET_EVENTS` replies with one compact `EVENTS` line containing records newer than `since_seq`.
 
-`ARM` expands internally to body wake, the legacy optional BRC step, interface
-start, and safe mode. BRC is not advertised and that step is a no-op on r23;
-the legacy `pulse_brc` request remains accepted for host compatibility.
+`ARM` expands internally to body wake, interface start, and safe mode.
 `CMD_VEL` replaces the latest velocity mailbox instead of waiting behind
 ordinary commands, and the runtime stops the drive when its `ttl_ms` expires.
 `STOP` and `ESTOP` preempt immediately. Parse errors, line timeout, UART errors,
@@ -696,7 +702,7 @@ The Pico W onboard LED normally emits a one-blink heartbeat every 15 seconds. Ev
 | 1 | Boot or Wi-Fi starting |
 | 2 | Create power request or AP started |
 | 3 | Create power toggled or web services started |
-| 4 | BRC event or HTTP request |
+| 4 | HTTP request |
 | 5 | OI request or DHCP grant |
 | 6 | Create UART packet received |
 | 7 | Drive requested/stopped |

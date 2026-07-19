@@ -193,10 +193,6 @@ impl BrainstemHardware for Rpi5Hardware {
         // the isolated power-button circuit owned by the Pico board.
     }
 
-    fn set_brc(&mut self, _released: bool) {
-        // BRC/DD is unavailable on a three-wire side-port adapter.
-    }
-
     fn set_indicators(&mut self, _on: bool) {}
 
     fn set_primary_indicator(&mut self, _on: bool) {}

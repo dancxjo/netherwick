@@ -159,7 +159,6 @@ pub enum FeedbackKind {
 pub enum PowerStateRequest {
     Wake,
     Sleep,
-    PulseBrc,
     StartOi,
     DebugBaud19200,
     DebugBaud57600,
@@ -239,7 +238,6 @@ pub(crate) enum RuntimeCommand {
     ResetOdometry,
     ZeroImuOrientation,
     ClearImuOrientation,
-    PulseBrc,
     StartOi,
     SetCreateBaud(u32),
     SetMode(CreateOiMode),
@@ -267,7 +265,6 @@ pub(crate) enum RuntimeCommand {
 
 pub(crate) const ACQUIRE_CREATE_SCRIPT: &[RuntimeCommand] = &[
     RuntimeCommand::WakeCreate,
-    RuntimeCommand::PulseBrc,
     RuntimeCommand::StartOi,
     RuntimeCommand::SetMode(CreateOiMode::Full),
     RuntimeCommand::PlayFeedback {
@@ -284,7 +281,6 @@ pub(crate) const RESTART_CREATE_SCRIPT: &[RuntimeCommand] = &[
     RuntimeCommand::Stop,
     RuntimeCommand::SleepCreate,
     RuntimeCommand::WakeCreate,
-    RuntimeCommand::PulseBrc,
     RuntimeCommand::StartOi,
     RuntimeCommand::SetMode(CreateOiMode::Full),
 ];

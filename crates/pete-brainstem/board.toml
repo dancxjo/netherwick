@@ -28,15 +28,16 @@ physical_pin = 25
 [pins.leds]
 onboard = "GP25"
 onboard_gpio = 25
-status = "GP20"
-status_gpio = 20
-status_physical_pin = 26
+# GP17 is unconnected on r23; retain it only as the unused status-output role.
+status = "GP17"
+status_gpio = 17
+status_physical_pin = 22
 
 [pins.create_charging_indicator]
 enabled = true
-pin = "GP17"
-gpio = 17
-physical_pin = 22
+pin = "GP20"
+gpio = 20
+physical_pin = 26
 active = "high"
 
 [pins.motherbrain_reset]

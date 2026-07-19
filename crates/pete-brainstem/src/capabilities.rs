@@ -31,7 +31,6 @@ pub struct BrainstemCapabilities {
 pub struct BodyDriverCapabilities {
     pub modes: &'static [&'static str],
     pub sensor_packets: &'static str,
-    pub has_brc: bool,
     pub has_power_toggle: bool,
     pub has_lights: bool,
     pub has_songs: bool,

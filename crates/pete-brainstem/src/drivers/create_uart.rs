@@ -696,7 +696,6 @@ mod tests {
         fn feed_watchdog(&mut self) {}
         fn begin_power_toggle_pulse(&mut self) {}
         fn end_power_toggle_pulse(&mut self) {}
-        fn set_brc(&mut self, _high: bool) {}
         fn set_indicators(&mut self, _on: bool) {}
         fn set_primary_indicator(&mut self, _on: bool) {}
         fn write_byte(&mut self, byte: u8) -> Result<(), ()> {

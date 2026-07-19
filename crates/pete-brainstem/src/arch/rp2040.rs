@@ -1,15 +1,17 @@
 use core::convert::Infallible;
 
 use embedded_hal::delay::DelayNs;
-use embedded_hal::digital::OutputPin;
+use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal_nb::serial::{Read, Write};
 use fugit::RateExtU32;
 use nb::block;
 use rp2040_hal as hal;
 
 use hal::clocks::{init_clocks_and_plls, Clock};
-use hal::gpio::bank0::{Gpio0, Gpio1, Gpio18, Gpio19, Gpio2, Gpio20, Gpio25, Gpio3};
-use hal::gpio::{FunctionI2c, FunctionSioOutput, FunctionUart, Pin, PullDown, PullUp};
+use hal::gpio::bank0::{Gpio0, Gpio1, Gpio17, Gpio18, Gpio19, Gpio2, Gpio20, Gpio25, Gpio3};
+use hal::gpio::{
+    FunctionI2c, FunctionSioInput, FunctionSioOutput, FunctionUart, Pin, PullDown, PullUp,
+};
 use hal::i2c::I2C;
 use hal::pac;
 use hal::sio::Sio;
@@ -33,8 +35,12 @@ const CREATE_UART_STOP_BITS: StopBits = StopBits::One;
 // - body.toml maps GP1/Pico physical pin 2 from Create TX through external 5V-to-3.3V level shifting.
 // - board.toml maps GP18/Pico physical pin 24 to r23 POWER_TOGGLE through TXS0108E channel 7.
 // - board.toml maps GP19/Pico physical pin 25 to r23 TXS_OE. The board pulls OE low during reset.
-// - Create BRC is unconnected on r23 and must not be used for power control.
-// - body.toml maps GP20 as an optional external LED output; leave unconnected if unused.
+// - board.toml maps GP20/Pico physical pin 26 from Create DB-25 pin 13 through TXS channel 8.
+// - board.toml maps GP17/Pico physical pin 22 as an optional external LED output.
+
+const _: () = assert!(body::CREATE_CHARGING_INDICATOR_GPIO == 20);
+const _: () = assert!(body::CREATE_CHARGING_INDICATOR_ACTIVE_HIGH);
+const _: () = assert!(body::EXTERNAL_LED_GPIO == 17);
 
 type CreateUart = UartPeripheral<
     Enabled,
@@ -46,6 +52,7 @@ type CreateUart = UartPeripheral<
 >;
 
 type Output<P> = Pin<P, FunctionSioOutput, PullDown>;
+type Input<P> = Pin<P, FunctionSioInput, PullDown>;
 type ImuBus = I2C<
     pac::I2C1,
     (
@@ -60,7 +67,8 @@ pub struct Rp2040Brainstem {
     imu: Option<Mpu6050<ImuBus>>,
     power_toggle: Output<Gpio18>,
     _txs_oe: Output<Gpio19>,
-    external_led: Output<Gpio20>,
+    external_led: Output<Gpio17>,
+    charging_indicator: Input<Gpio20>,
     onboard_led: Output<Gpio25>,
 }
 
@@ -142,7 +150,8 @@ impl Rp2040Brainstem {
             imu,
             power_toggle,
             _txs_oe: txs_oe,
-            external_led: pins.gpio20.into_push_pull_output(),
+            external_led: pins.gpio17.into_push_pull_output(),
+            charging_indicator: pins.gpio20.into_pull_down_input(),
             onboard_led,
         }
     }
@@ -168,10 +177,6 @@ impl BrainstemHardware for Rp2040Brainstem {
 
     fn end_power_toggle_pulse(&mut self) {
         set_pin(&mut self.power_toggle, false);
-    }
-
-    fn set_brc(&mut self, _released: bool) {
-        // Create BRC is unconnected on the r23 carrier.
     }
 
     fn set_indicators(&mut self, on: bool) {
@@ -204,6 +209,17 @@ impl BrainstemHardware for Rp2040Brainstem {
             return Err(ImuHealth::Absent);
         };
         imu.poll(now_ms)
+    }
+
+    fn charging_indicator_active(&mut self) -> Option<bool> {
+        if body::CREATE_CHARGING_INDICATOR_ENABLED {
+            Some(
+                self.charging_indicator.is_high().ok()?
+                    == body::CREATE_CHARGING_INDICATOR_ACTIVE_HIGH,
+            )
+        } else {
+            None
+        }
     }
 }
 

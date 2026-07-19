@@ -238,6 +238,10 @@ pub struct PicoWBrainstem {
     motherbrain_reset: Output<'static>,
 }
 
+const _: () = assert!(body::CREATE_CHARGING_INDICATOR_GPIO == 20);
+const _: () = assert!(body::CREATE_CHARGING_INDICATOR_ACTIVE_HIGH);
+const _: () = assert!(body::EXTERNAL_LED_GPIO == 17);
+
 impl PicoWBrainstem {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -246,8 +250,8 @@ impl PicoWBrainstem {
         rx: Peri<'static, PIN_1>,
         power_toggle: Peri<'static, PIN_18>,
         txs_oe: Peri<'static, PIN_19>,
-        status_led: Peri<'static, PIN_20>,
-        charging_indicator: Peri<'static, PIN_17>,
+        status_led: Peri<'static, PIN_17>,
+        charging_indicator: Peri<'static, PIN_20>,
         #[cfg(motherbrain_reset_hardware)] motherbrain_reset: Peri<
             'static,
             embassy_rp::peripherals::PIN_21,
@@ -315,10 +319,6 @@ impl BrainstemHardware for PicoWBrainstem {
 
     fn end_power_toggle_pulse(&mut self) {
         self.power_toggle.set_low();
-    }
-
-    fn set_brc(&mut self, _released: bool) {
-        // Create BRC is unconnected on the r23 carrier.
     }
 
     fn set_indicators(&mut self, on: bool) {
@@ -392,8 +392,8 @@ pub fn spawn_safety_lane(p: embassy_rp::Peripherals) -> ! {
         p.PIN_1,
         p.PIN_18,
         p.PIN_19,
-        p.PIN_20,
         p.PIN_17,
+        p.PIN_20,
         #[cfg(motherbrain_reset_hardware)]
         p.PIN_21,
     );
@@ -1727,7 +1727,7 @@ label{font-size:12px;color:#5b655f;font-weight:750}.slider,.field{display:grid;g
 <div class="controls">
 <div class="seg three"><button id="undock">Undock</button><button id="dock">Dock</button><button id="ping">Ping</button></div>
 <div class="seg"><button id="stream">Stream Sensors</button><button id="createon" class="blue">Create On</button></div>
-<div class="seg"><button id="createoi">Start OI</button><button id="createbrc">Pulse BRC</button></div>
+<div class="seg"><button id="createoi">Start OI</button></div>
 <div class="seg"><button id="createoff" class="warnbtn">Create Off</button><button id="createrestart" class="warnbtn">Restart Create</button></div>
 </div>
 </div>
@@ -1817,7 +1817,7 @@ function handleReply(j){if(j.type==='status'){showStatus(j);return}if(j.type==='
 function sendCockpit(o,ack){let cid=id++;o.command_id=cid;if(sessionId)o.session_id=sessionId;if(controlLeaseId)o.lease_id=controlLeaseId;if(serviceLeaseId)o.service_lease_id=serviceLeaseId;if(seqKinds.has(o.kind)&&o.seq===undefined)o.seq=cid;let body=JSON.stringify(o),name=o.kind==='cmd_vel'?'drive':o.kind;return fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body}).then(r=>r.json()).then(j=>{handleReply(j);return j}).catch(_=>{pill(net,'offline','bad');addLog('offline '+name)})}
 function requestStatus(){return sendCockpit({kind:'status'},false)}
 function requestCaps(){return sendCockpit({kind:'get_capabilities'},false).then(j=>{if(j&&j.verbs){caps=j;applyCaps();ensureSensorStream()}})}
-function applyCaps(){let drive=canMotion('cmd_vel'),svc=!!sessionId,canClearLatch=canControl('clear_safety_latch'),docked=!!(lastStatus&&lastStatus.create_sensors&&homeBaseContact(lastStatus.create_sensors));setEnabled('controllease',!!sessionId);setEnabled('stop',hasVerb('stop'));setEnabled('padstop',hasVerb('stop'));setEnabled('estop',hasVerb('estop'));setEnabled('clear',canSession('clear_estop'));setEnabled('careful',canControl('careful_mode'));setEnabled('clearcharge',canClearLatch&&!(lastStatus&&lastStatus.create_sensors&&chargeActive(lastStatus.create_sensors)));['clearbump','clearwheel','clearcliff','cleartilt','clearimpact'].forEach(id=>setEnabled(id,canClearLatch));setEnabled('stream',canSession('stream_sensors'));setEnabled('imuzero',canControl('zero_imu_orientation'));setEnabled('imuclear',canControl('clear_imu_orientation'));setEnabled('createrestart',svc&&hasVerb('restart_create'));setEnabled('mbreset',svc&&hasVerb('reset_motherbrain'));setEnabled('bootsel',svc&&hasVerb('bootsel'));setEnabled('createon',canControl('create_power_on'));setEnabled('createoff',canControl('create_power_off'));setEnabled('createbrc',canControl('power_state')&&hasOutput('brc'));setEnabled('createoi',canControl('power_state'));setEnabledAll('[data-drive]',drive);setEnabled('speed',drive);setEnabled('turn',drive);base.style.pointerEvents=drive?'auto':'none';document.querySelectorAll('[data-action]').forEach(b=>{let v=actionVerb[b.dataset.action];b.disabled=!(v&&canControl(v))});setEnabled('undock',drive&&docked);setEnabled('dock',canMotion('dock'));setEnabled('songdef',canControl('song_define'));setEnabled('songplay',canControl('song_play'));setEnabled('song',canControl('song_define')&&canControl('song_play'));setEnabled('songid',canControl('song_define')||canControl('song_play'));setEnabled('tones',canControl('song_define'));setEnabled('ping',hasVerb('ping'));setEnabled('refresh',true);refreshControlLock();if(caps&&caps.limits){if(caps.limits.max_linear_mm_s)$('speed').max=caps.limits.max_linear_mm_s;if(caps.limits.max_angular_mrad_s)$('turn').max=caps.limits.max_angular_mrad_s}}
+function applyCaps(){let drive=canMotion('cmd_vel'),svc=!!sessionId,canClearLatch=canControl('clear_safety_latch'),docked=!!(lastStatus&&lastStatus.create_sensors&&homeBaseContact(lastStatus.create_sensors));setEnabled('controllease',!!sessionId);setEnabled('stop',hasVerb('stop'));setEnabled('padstop',hasVerb('stop'));setEnabled('estop',hasVerb('estop'));setEnabled('clear',canSession('clear_estop'));setEnabled('careful',canControl('careful_mode'));setEnabled('clearcharge',canClearLatch&&!(lastStatus&&lastStatus.create_sensors&&chargeActive(lastStatus.create_sensors)));['clearbump','clearwheel','clearcliff','cleartilt','clearimpact'].forEach(id=>setEnabled(id,canClearLatch));setEnabled('stream',canSession('stream_sensors'));setEnabled('imuzero',canControl('zero_imu_orientation'));setEnabled('imuclear',canControl('clear_imu_orientation'));setEnabled('createrestart',svc&&hasVerb('restart_create'));setEnabled('mbreset',svc&&hasVerb('reset_motherbrain'));setEnabled('bootsel',svc&&hasVerb('bootsel'));setEnabled('createon',canControl('create_power_on'));setEnabled('createoff',canControl('create_power_off'));setEnabled('createoi',canControl('power_state'));setEnabledAll('[data-drive]',drive);setEnabled('speed',drive);setEnabled('turn',drive);base.style.pointerEvents=drive?'auto':'none';document.querySelectorAll('[data-action]').forEach(b=>{let v=actionVerb[b.dataset.action];b.disabled=!(v&&canControl(v))});setEnabled('undock',drive&&docked);setEnabled('dock',canMotion('dock'));setEnabled('songdef',canControl('song_define'));setEnabled('songplay',canControl('song_play'));setEnabled('song',canControl('song_define')&&canControl('song_play'));setEnabled('songid',canControl('song_define')||canControl('song_play'));setEnabled('tones',canControl('song_define'));setEnabled('ping',hasVerb('ping'));setEnabled('refresh',true);refreshControlLock();if(caps&&caps.limits){if(caps.limits.max_linear_mm_s)$('speed').max=caps.limits.max_linear_mm_s;if(caps.limits.max_angular_mrad_s)$('turn').max=caps.limits.max_angular_mrad_s}}
 function releaseDriveUi(){let wasDriving=active||timer||driveKind;clearInterval(timer);timer=0;active=false;driveKind='';nub.style.left='50%';nub.style.top='50%';document.querySelectorAll('[data-drive].active').forEach(b=>b.classList.remove('active'));return wasDriving}
 function stop(){releaseDriveUi();sendCockpit({kind:'stop'})}
 function clearLatch(kind,attempt=0){return sendCockpit({kind:'clear_safety_latch',latch:kind}).then(j=>{let reason=j&&(j.message||j.reason);if(j&&j.accepted===false&&reason==='busy'&&attempt<5){addLog('retry clear '+kind);return new Promise(r=>setTimeout(r,180)).then(()=>clearLatch(kind,attempt+1))}return requestStatus()})}
@@ -1857,7 +1857,6 @@ $('createrestart').onclick=()=>serviceCommand('restart_create',{kind:'restart_cr
 $('mbreset').onclick=()=>serviceCommand('reset_motherbrain',{kind:'reset_motherbrain'})
 $('createon').onclick=()=>sendCockpit({kind:'create_power_on'})
 $('createoff').onclick=()=>sendCockpit({kind:'create_power_off'})
-$('createbrc').onclick=()=>sendCockpit({kind:'power_state',request:'pulse_brc'})
 $('createoi').onclick=()=>sendCockpit({kind:'power_state',request:'start_oi'})
 $('songdef').onclick=defineSong
 $('songplay').onclick=()=>sendCockpit({kind:'song_play',id:songSlot()})
@@ -3578,7 +3577,6 @@ fn parse_power_request(request: &str) -> Option<PowerStateRequest> {
     match request {
         "wake" | "WAKE" => Some(PowerStateRequest::Wake),
         "sleep" | "SLEEP" => Some(PowerStateRequest::Sleep),
-        "pulse_brc" | "PULSE_BRC" => Some(PowerStateRequest::PulseBrc),
         "start_oi" | "START_OI" => Some(PowerStateRequest::StartOi),
         "debug_baud_19200" | "DEBUG_BAUD_19200" => Some(PowerStateRequest::DebugBaud19200),
         "debug_baud_57600" | "DEBUG_BAUD_57600" => Some(PowerStateRequest::DebugBaud57600),

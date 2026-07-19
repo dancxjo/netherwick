@@ -46,9 +46,6 @@ pub enum BrainstemEvent {
     CreatePowerOffRequested,
     CreatePowerToggled,
 
-    CreateBrcPulseRequested,
-    CreateBrcPulsed,
-
     CreateOiStartRequested,
     CreateOiModeRequested(CreateOiMode),
 

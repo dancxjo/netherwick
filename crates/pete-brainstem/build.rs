@@ -97,8 +97,6 @@ struct Timing {
     power_toggle_pulse_ms: u32,
     wake_wait_ms: u32,
     responsive_timeout_ms: u32,
-    brc_low_pulse_ms: u32,
-    post_brc_settle_ms: u32,
     post_start_settle_ms: u32,
     post_mode_settle_ms: u32,
     uart_byte_timeout_ms: u32,
@@ -300,7 +298,6 @@ pub const CREATE_DEFAULT_MODE: CreateOiMode = {default_mode};
 pub const CREATE_SENSOR_PROBE_PACKET: u8 = {sensor_probe_packet};
 pub const CREATE_SUPPORTED_SENSOR_PACKETS: &str = {supported_sensor_packets:?};
 pub const CREATE_SUPPORTED_MODES: &[&str] = {supported_modes};
-pub const CREATE_BRC_ENABLED: bool = false;
 
 pub const CAPABILITY_VERBS: &[&str] = {capability_verbs};
 pub const CAPABILITY_SENSORS: &[&str] = {capability_sensors};
@@ -327,8 +324,6 @@ pub const BUILD_ID: &str = {build_id:?};
 pub const POWER_TOGGLE_PULSE_MS: u32 = {power_toggle_pulse_ms};
 pub const CREATE_WAKE_WAIT_MS: u32 = {wake_wait_ms};
 pub const CREATE_RESPONSIVE_TIMEOUT_MS: u32 = {responsive_timeout_ms};
-pub const BRC_LOW_PULSE_MS: u32 = {brc_low_pulse_ms};
-pub const POST_BRC_SETTLE_MS: u32 = {post_brc_settle_ms};
 pub const POST_START_SETTLE_MS: u32 = {post_start_settle_ms};
 pub const POST_MODE_SETTLE_MS: u32 = {post_mode_settle_ms};
 pub const UART_BYTE_TIMEOUT_MS: u32 = {uart_byte_timeout_ms};
@@ -403,8 +398,6 @@ pub const IMU_IMPACT_STOP_MM_S2: u16 = {imu_impact_stop_mm_s2};
         power_toggle_pulse_ms = body.timing.power_toggle_pulse_ms,
         wake_wait_ms = body.timing.wake_wait_ms,
         responsive_timeout_ms = body.timing.responsive_timeout_ms,
-        brc_low_pulse_ms = body.timing.brc_low_pulse_ms,
-        post_brc_settle_ms = body.timing.post_brc_settle_ms,
         post_start_settle_ms = body.timing.post_start_settle_ms,
         post_mode_settle_ms = body.timing.post_mode_settle_ms,
         uart_byte_timeout_ms = body.timing.uart_byte_timeout_ms,

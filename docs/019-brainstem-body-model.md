@@ -97,7 +97,7 @@ that safety behavior does not depend on allocation or an unbounded queue.
 
 A body driver translates the generic runtime contract into the protocol and
 physics of one machine. For the Create body this includes Open Interface
-opcodes, OI modes, sensor packets, BRC, LEDs, songs, docking, and differential
+opcodes, OI modes, sensor packets, LEDs, songs, docking, and differential
 drive. Other bodies would own different operations without changing the reason
 for the brainstem boundary.
 

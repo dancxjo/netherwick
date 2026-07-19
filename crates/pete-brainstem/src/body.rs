@@ -15,6 +15,26 @@ pub enum DriveKind {
 
 include!(concat!(env!("OUT_DIR"), "/body_config.rs"));
 
+#[cfg(test)]
+mod tests {
+    use super::{
+        CREATE_CHARGING_INDICATOR_ACTIVE_HIGH, CREATE_CHARGING_INDICATOR_ENABLED,
+        CREATE_CHARGING_INDICATOR_GPIO, CREATE_CHARGING_INDICATOR_PHYSICAL_PIN,
+        CREATE_CHARGING_INDICATOR_PIN, EXTERNAL_LED_GPIO, EXTERNAL_LED_PIN,
+    };
+
+    #[test]
+    fn r23_assigns_create_charging_input_to_gp20() {
+        assert!(CREATE_CHARGING_INDICATOR_ENABLED);
+        assert_eq!(CREATE_CHARGING_INDICATOR_PIN, "GP20");
+        assert_eq!(CREATE_CHARGING_INDICATOR_GPIO, 20);
+        assert_eq!(CREATE_CHARGING_INDICATOR_PHYSICAL_PIN, 26);
+        assert!(CREATE_CHARGING_INDICATOR_ACTIVE_HIGH);
+        assert_eq!(EXTERNAL_LED_PIN, "GP17");
+        assert_eq!(EXTERNAL_LED_GPIO, 17);
+    }
+}
+
 #[cfg(feature = "rpi5")]
 pub fn current_capabilities() -> BrainstemCapabilities {
     rpi5_create_oi_capabilities()
@@ -102,7 +122,6 @@ fn rpi5_create_oi_capabilities() -> BrainstemCapabilities {
         driver: BodyDriverCapabilities {
             modes: CREATE_SUPPORTED_MODES,
             sensor_packets: CREATE_SUPPORTED_SENSOR_PACKETS,
-            has_brc: false,
             has_power_toggle: false,
             has_lights: true,
             has_songs: true,
@@ -135,7 +154,6 @@ fn create_oi_capabilities() -> BrainstemCapabilities {
         driver: BodyDriverCapabilities {
             modes: CREATE_SUPPORTED_MODES,
             sensor_packets: CREATE_SUPPORTED_SENSOR_PACKETS,
-            has_brc: CREATE_BRC_ENABLED,
             has_power_toggle: true,
             has_lights: CAPABILITY_OUTPUTS.contains(&"lights"),
             has_songs: CAPABILITY_OUTPUTS.contains(&"song"),
@@ -161,12 +179,10 @@ mod tests {
     use super::current_capabilities;
 
     #[test]
-    fn r23_advertises_power_toggle_but_not_unconnected_brc() {
+    fn r23_advertises_power_toggle() {
         let capabilities = current_capabilities();
 
         assert!(capabilities.outputs.contains(&"power_toggle"));
-        assert!(!capabilities.outputs.contains(&"brc"));
         assert!(capabilities.driver.has_power_toggle);
-        assert!(!capabilities.driver.has_brc);
     }
 }

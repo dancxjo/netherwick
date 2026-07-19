@@ -346,7 +346,6 @@ enum CommandCode {
     None = 0,
     WakeCreate = 1,
     SleepCreate = 2,
-    PulseBrc = 3,
     StartOi = 4,
     SetOiPassive = 5,
     SetOiSafe = 6,
@@ -394,8 +393,6 @@ pub enum ForebrainUartErrorCode {
 pub enum RuntimeActionCode {
     None = 0,
     PowerPulse = 1,
-    BrcLow = 2,
-    BrcSettle = 3,
     WakeSettle = 4,
     WaitForCreate = 5,
     Settle = 6,
@@ -640,7 +637,6 @@ pub fn set_command(command: Option<RuntimeCommand>) -> u8 {
         Some(RuntimeCommand::ClearSafetyLatch { .. })
         | Some(RuntimeCommand::CarefulMode { .. })
         | Some(RuntimeCommand::HeartbeatStop { .. }) => CommandCode::Behavior,
-        Some(RuntimeCommand::PulseBrc) => CommandCode::PulseBrc,
         Some(RuntimeCommand::StartOi) => CommandCode::StartOi,
         Some(RuntimeCommand::Drive { .. }) => CommandCode::Drive,
         Some(RuntimeCommand::StopDrive) => CommandCode::StopDrive,
@@ -1919,7 +1915,6 @@ fn encode_power_request(request: PowerStateRequest) -> u8 {
     match request {
         PowerStateRequest::Wake => 1,
         PowerStateRequest::Sleep => 2,
-        PowerStateRequest::PulseBrc => 3,
         PowerStateRequest::StartOi => 4,
         PowerStateRequest::DebugBaud19200 => 5,
         PowerStateRequest::DebugBaud57600 => 6,
@@ -1931,7 +1926,6 @@ fn decode_power_request(value: u8) -> Option<PowerStateRequest> {
     match value {
         1 => Some(PowerStateRequest::Wake),
         2 => Some(PowerStateRequest::Sleep),
-        3 => Some(PowerStateRequest::PulseBrc),
         4 => Some(PowerStateRequest::StartOi),
         5 => Some(PowerStateRequest::DebugBaud19200),
         6 => Some(PowerStateRequest::DebugBaud57600),
@@ -1990,8 +1984,12 @@ pub fn set_create_power_unknown() {
     clear_create_sensor_snapshot();
 }
 
-pub fn create_power_state_is_off(state: u8) -> bool {
-    state == OFF
+pub fn known_create_power_state(state: u8) -> Option<bool> {
+    match state {
+        OFF => Some(false),
+        ON => Some(true),
+        _ => None,
+    }
 }
 
 pub fn mark_create_charging_indicator(active: Option<bool>) {
@@ -2694,7 +2692,6 @@ pub fn signal_event(event: &BrainstemEvent) {
         BrainstemEvent::Boot => 1,
         BrainstemEvent::CreatePowerOnRequested | BrainstemEvent::CreatePowerOffRequested => 2,
         BrainstemEvent::CreatePowerToggled => 3,
-        BrainstemEvent::CreateBrcPulseRequested | BrainstemEvent::CreateBrcPulsed => 4,
         BrainstemEvent::CreateOiStartRequested | BrainstemEvent::CreateOiModeRequested(_) => 5,
         BrainstemEvent::CreatePacketReceived { .. }
         | BrainstemEvent::CreateSensorPacketDecoded { .. } => 6,
@@ -2908,9 +2905,7 @@ fn record_public_event_from_brainstem_event(event: &BrainstemEvent) {
         BrainstemEvent::Error(error) => {
             record_public_event(PublicEventKind::Error, encode_error_public(*error), 0, 0)
         }
-        BrainstemEvent::CreateBrcPulseRequested
-        | BrainstemEvent::CreateBrcPulsed
-        | BrainstemEvent::TickMs(_) => 0,
+        BrainstemEvent::TickMs(_) => 0,
     };
 }
 
@@ -3793,7 +3788,6 @@ fn command_text(code: u8) -> &'static str {
     match code {
         x if x == CommandCode::WakeCreate as u8 => "wake_create",
         x if x == CommandCode::SleepCreate as u8 => "sleep_create",
-        x if x == CommandCode::PulseBrc as u8 => "pulse_brc",
         x if x == CommandCode::StartOi as u8 => "start_oi",
         x if x == CommandCode::SetOiPassive as u8 => "set_oi_passive",
         x if x == CommandCode::SetOiSafe as u8 => "set_oi_safe",
@@ -3872,8 +3866,6 @@ fn imu_calibration_text(code: u8) -> &'static str {
 fn runtime_action_text(code: u8) -> &'static str {
     match code {
         x if x == RuntimeActionCode::PowerPulse as u8 => "power_pulse",
-        x if x == RuntimeActionCode::BrcLow as u8 => "brc_low",
-        x if x == RuntimeActionCode::BrcSettle as u8 => "brc_settle",
         x if x == RuntimeActionCode::WakeSettle as u8 => "wake_settle",
         x if x == RuntimeActionCode::WaitForCreate as u8 => "wait_for_create",
         x if x == RuntimeActionCode::Settle as u8 => "settle",

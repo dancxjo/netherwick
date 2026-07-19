@@ -781,7 +781,6 @@ pub struct SongTone {
 pub enum PowerStateRequest {
     Wake,
     Sleep,
-    PulseBrc,
     StartOi,
     DebugBaud19200,
     DebugBaud57600,
@@ -900,7 +899,6 @@ impl PowerStateRequest {
         match self {
             Self::Wake => "wake",
             Self::Sleep => "sleep",
-            Self::PulseBrc => "pulse_brc",
             Self::StartOi => "start_oi",
             Self::DebugBaud19200 => "debug_baud_19200",
             Self::DebugBaud57600 => "debug_baud_57600",
