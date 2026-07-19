@@ -16,7 +16,7 @@ pub enum DriveKind {
 include!(concat!(env!("OUT_DIR"), "/body_config.rs"));
 
 #[cfg(test)]
-mod tests {
+mod gpio_tests {
     use super::{
         CREATE_CHARGING_INDICATOR_ACTIVE_HIGH, CREATE_CHARGING_INDICATOR_ENABLED,
         CREATE_CHARGING_INDICATOR_GPIO, CREATE_CHARGING_INDICATOR_PHYSICAL_PIN,
