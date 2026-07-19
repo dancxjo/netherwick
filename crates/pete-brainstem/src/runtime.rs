@@ -41,6 +41,8 @@ const DOCK_DEPARTURE_SPEED_MM_S: i16 = -200;
 const DOCK_DEPARTURE_DURATION_MS: u32 = 1_500;
 const CREATE_CHARGING_SOURCES_PACKET: u8 = 34;
 const CREATE_CHARGING_SOURCES_POLL_PERIOD_MS: u32 = 250;
+const CREATE_COMPLETE_SENSOR_PACKET: u8 = 0;
+const CREATE_COMPLETE_SENSOR_POLL_PERIOD_MS: u32 = 750;
 const CREATE_LINK_FRESHNESS_TIMEOUT_MS: u32 = 1_000;
 // Accelerometer-derived tilt is contaminated by short acceleration and dock-ramp
 // impacts. Keep impact detection immediate, but require the gravity-vector tilt
@@ -211,6 +213,7 @@ where
     careful_mode_until_ms: Option<u32>,
     sensor_stream: Option<SensorStream>,
     next_charging_sources_poll_ms: u32,
+    next_complete_sensor_poll_ms: u32,
     next_imu_poll_ms: u32,
     next_full_mode_refresh_ms: u32,
     next_supervision_light_ms: u32,
@@ -276,6 +279,7 @@ where
             careful_mode_until_ms: None,
             sensor_stream: None,
             next_charging_sources_poll_ms: 0,
+            next_complete_sensor_poll_ms: 0,
             next_imu_poll_ms: 0,
             next_full_mode_refresh_ms: 0,
             next_supervision_light_ms: 0,
@@ -1567,6 +1571,14 @@ where
                 .request_sensor_packet(&mut self.hardware, CREATE_CHARGING_SOURCES_PACKET)?;
             self.next_charging_sources_poll_ms =
                 now_ms.wrapping_add(CREATE_CHARGING_SOURCES_POLL_PERIOD_MS);
+            return Ok(());
+        }
+
+        if time_reached(now_ms, self.next_complete_sensor_poll_ms) {
+            self.create_uart
+                .request_sensor_packet(&mut self.hardware, CREATE_COMPLETE_SENSOR_PACKET)?;
+            self.next_complete_sensor_poll_ms =
+                now_ms.wrapping_add(CREATE_COMPLETE_SENSOR_POLL_PERIOD_MS);
             return Ok(());
         }
 
@@ -3163,12 +3175,12 @@ mod tests {
     }
 
     #[test]
-    fn home_base_source_poll_is_private_and_does_not_replace_public_stream() {
+    fn private_status_polls_are_self_sustaining_and_preserve_public_stream() {
         let _guard = status::status_test_guard();
         let mut runtime = Runtime::new(FakeHardware::new(1_000));
         runtime.create_responsive = true;
         runtime.sensor_stream = Some(SensorStream {
-            packet_id: 0,
+            packet_id: 35,
             period_ms: 250,
             next_request_ms: 1_000,
         });
@@ -3180,7 +3192,12 @@ mod tests {
         runtime.hardware.now_us = 1_010_000;
         assert!(runtime.poll_sensor_stream().is_ok());
         assert_eq!(runtime.hardware.writes.as_slice(), &[148, 1, 0]);
-        assert_eq!(runtime.sensor_stream.unwrap().packet_id, 0);
+
+        runtime.hardware.writes.clear();
+        runtime.hardware.now_us = 1_020_000;
+        assert!(runtime.poll_sensor_stream().is_ok());
+        assert_eq!(runtime.hardware.writes.as_slice(), &[148, 1, 35]);
+        assert_eq!(runtime.sensor_stream.unwrap().packet_id, 35);
     }
 
     #[test]

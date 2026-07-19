@@ -42,7 +42,7 @@ use crate::commands::{
     MAX_SONG_TONES,
 };
 use crate::dhcp::{DhcpClient, DhcpGrant, DhcpLeaseState, DhcpRequest, DHCP_LEASE_SECONDS};
-use crate::display::{self, DisplaySafety, DisplayStatus};
+use crate::display::{self, DisplayNetwork, DisplaySafety, DisplayStatus};
 use crate::drivers::imu::{decode_mpu6050_sample, ImuHealth};
 use crate::hardware::{initialize_power_control, BrainstemHardware, SerialRead, UartReadError};
 use crate::icmp::{
@@ -60,6 +60,8 @@ const MDNS_NAME: &[u8] = b"\x04pete\x05local\x00";
 const AP_CHANNEL: u8 = 6;
 const AP_IP_OCTETS: [u8; 4] = [192, 168, 4, 1];
 const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
+const AP_INSTANCE_UNKNOWN: u32 = u32::MAX;
+static AP_INSTANCE_ID: AtomicU32 = AtomicU32::new(AP_INSTANCE_UNKNOWN);
 const HTTP_PORT: u16 = 80;
 const HTTP_TASKS: usize = 3;
 const WS_CONTROL_PORT: u16 = 81;
@@ -528,7 +530,9 @@ async fn start_wifi_ap(
     let _ = stack.join_multicast_group(IpAddress::Ipv4(Ipv4Address::new(224, 0, 0, 251)));
     spawner.spawn(net_runner_task(runner).expect("spawn net runner"));
 
-    let ssid = ap_ssid(stack.hardware_address());
+    let hardware_address = stack.hardware_address();
+    AP_INSTANCE_ID.store(stable_instance_id(hardware_address), Ordering::Release);
+    let ssid = ap_ssid(hardware_address);
     control.start_ap_open(&ssid, AP_CHANNEL).await;
     Some((stack, control))
 }
@@ -758,8 +762,15 @@ impl OledService {
 
         if self.transfer_offset.is_none() && deadline_reached(now_ms, self.next_refresh_ms) {
             let snapshot = status::snapshot(now_ms);
-            let page =
-                DisplayStatus::from_snapshot(&snapshot).page(DisplaySafety::current(), now_ms);
+            let ap_instance_id = AP_INSTANCE_ID.load(Ordering::Acquire);
+            let page = DisplayStatus::from_snapshot(
+                &snapshot,
+                DisplayNetwork {
+                    ssid_suffix: (ap_instance_id != AP_INSTANCE_UNKNOWN).then_some(ap_instance_id),
+                    active_clients: network_registry::diagnostics(now_ms).active_leases,
+                },
+            )
+            .page(DisplaySafety::current(), now_ms);
             self.desired_frame = display::render(&page);
             self.next_refresh_ms = now_ms.wrapping_add(display::REFRESH_PERIOD_MS);
             if self.desired_frame != self.sent_frame {
