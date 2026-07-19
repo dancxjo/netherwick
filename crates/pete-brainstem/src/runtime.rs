@@ -969,7 +969,7 @@ where
                 status::set_body_state(BodyState::WaitingForCreate);
                 if status::create_power_state_is_off(status::snapshot(now_ms).create_power_state) {
                     self.push_event(BrainstemEvent::CreatePowerOnRequested);
-                    self.hardware.set_power_toggle(true);
+                    self.hardware.begin_power_toggle_pulse();
                     self.active = ActiveAction::PowerPulse {
                         release_at_ms: now_ms.wrapping_add(body::POWER_TOGGLE_PULSE_MS),
                         wake_wait_until_ms: Some(now_ms.wrapping_add(body::CREATE_WAKE_WAIT_MS)),
@@ -992,7 +992,7 @@ where
                 status::set_body_state(BodyState::PowerCycling);
                 self.stop_drive()?;
                 self.push_event(BrainstemEvent::CreatePowerOffRequested);
-                self.hardware.set_power_toggle(true);
+                self.hardware.begin_power_toggle_pulse();
                 self.active = ActiveAction::PowerPulse {
                     release_at_ms: now_ms.wrapping_add(body::POWER_TOGGLE_PULSE_MS),
                     wake_wait_until_ms: None,
@@ -1234,7 +1234,7 @@ where
                 power_on,
             } => {
                 if time_reached(now_ms, release_at_ms) {
-                    self.hardware.set_power_toggle(false);
+                    self.hardware.end_power_toggle_pulse();
                     self.push_event(BrainstemEvent::CreatePowerToggled);
                     if wake_wait_until_ms.is_none() {
                         status::set_create_power_on(power_on);
@@ -1317,7 +1317,7 @@ where
                 if time_reached(now_ms, deadline_ms) {
                     if !power_toggled {
                         self.push_event(BrainstemEvent::CreatePowerOnRequested);
-                        self.hardware.set_power_toggle(true);
+                        self.hardware.begin_power_toggle_pulse();
                         self.active = ActiveAction::PowerPulse {
                             release_at_ms: now_ms.wrapping_add(body::POWER_TOGGLE_PULSE_MS),
                             wake_wait_until_ms: Some(
@@ -2231,6 +2231,9 @@ where
     }
 
     fn interrupt_active_command(&mut self) {
+        if matches!(self.active, ActiveAction::PowerPulse { .. }) {
+            self.hardware.end_power_toggle_pulse();
+        }
         self.safety_recovery_motion = false;
         self.active_velocity = None;
         self.active_escape = None;
@@ -2661,8 +2664,13 @@ mod tests {
 
         fn feed_watchdog(&mut self) {}
 
-        fn set_power_toggle(&mut self, high: bool) {
-            let _ = self.power_toggle_levels.push(high);
+        fn begin_power_toggle_pulse(&mut self) {
+            let _ = self.power_toggle_levels.push(false);
+            let _ = self.power_toggle_levels.push(true);
+        }
+
+        fn end_power_toggle_pulse(&mut self) {
+            let _ = self.power_toggle_levels.push(false);
         }
 
         fn set_brc(&mut self, _high: bool) {}
@@ -2768,6 +2776,10 @@ mod tests {
             status::snapshot(0).current_runtime_state,
             RuntimeState::Running as u8
         );
+        assert!(
+            runtime.hardware.power_toggle_levels.is_empty(),
+            "ordinary startup must not toggle Create power"
+        );
     }
 
     #[test]
@@ -2799,7 +2811,10 @@ mod tests {
         assert!(runtime.enqueue_command(RuntimeCommand::WakeCreate).is_ok());
         assert!(runtime.start_next_command().is_ok());
 
-        assert_eq!(runtime.hardware.power_toggle_levels.as_slice(), &[true]);
+        assert_eq!(
+            runtime.hardware.power_toggle_levels.as_slice(),
+            &[false, true]
+        );
         assert!(matches!(
             runtime.active,
             ActiveAction::PowerPulse {
@@ -2814,7 +2829,22 @@ mod tests {
 
         assert_eq!(
             runtime.hardware.power_toggle_levels.as_slice(),
-            &[true, false]
+            &[false, true, false]
+        );
+        assert_eq!(
+            runtime
+                .hardware
+                .power_toggle_levels
+                .windows(2)
+                .filter(|levels| levels == &[false, true])
+                .count(),
+            1,
+            "one request must create exactly one low-to-high edge"
+        );
+        assert_eq!(
+            runtime.hardware.power_toggle_levels.last(),
+            Some(&false),
+            "POWER_TOGGLE must return low after the pulse"
         );
         assert_eq!(
             runtime
@@ -2881,6 +2911,27 @@ mod tests {
         assert!(runtime.advance_active_action().is_ok());
         assert!(!runtime.create_no_response_restart_queued);
         assert!(runtime.create_responsive);
+    }
+
+    #[test]
+    fn interrupting_power_pulse_returns_power_toggle_low() {
+        let _guard = status::status_test_guard();
+        status::set_create_power_on(false);
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+
+        assert!(runtime.enqueue_command(RuntimeCommand::WakeCreate).is_ok());
+        assert!(runtime.start_next_command().is_ok());
+        assert_eq!(
+            runtime.hardware.power_toggle_levels.as_slice(),
+            &[false, true]
+        );
+
+        runtime.shutdown();
+
+        assert_eq!(
+            runtime.hardware.power_toggle_levels.as_slice(),
+            &[false, true, false]
+        );
     }
 
     #[test]

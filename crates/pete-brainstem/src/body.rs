@@ -155,3 +155,18 @@ fn drive_kind_text(kind: DriveKind) -> &'static str {
         DriveKind::Differential => "differential",
     }
 }
+
+#[cfg(all(test, not(feature = "rpi5")))]
+mod tests {
+    use super::current_capabilities;
+
+    #[test]
+    fn r23_advertises_power_toggle_but_not_unconnected_brc() {
+        let capabilities = current_capabilities();
+
+        assert!(capabilities.outputs.contains(&"power_toggle"));
+        assert!(!capabilities.outputs.contains(&"brc"));
+        assert!(capabilities.driver.has_power_toggle);
+        assert!(!capabilities.driver.has_brc);
+    }
+}

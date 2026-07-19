@@ -22,7 +22,15 @@ pub trait BrainstemHardware {
     fn now_us(&mut self) -> u32;
     fn feed_watchdog(&mut self);
 
-    fn set_power_toggle(&mut self, high: bool);
+    /// Starts one deliberate Create power-toggle pulse.
+    ///
+    /// Implementations must first drive POWER_TOGGLE low and only then drive
+    /// it high. This is intentionally not an arbitrary GPIO setter: every
+    /// call represents exactly one requested low-to-high transition.
+    fn begin_power_toggle_pulse(&mut self);
+    /// Ends a Create power-toggle pulse and leaves POWER_TOGGLE low so the
+    /// circuit is armed for the next request.
+    fn end_power_toggle_pulse(&mut self);
     /// Create 1 BRC/DD is a 0-5V input to the robot. `false` asserts it by
     /// pulling low; `true` releases the line so the robot/external pull-up can
     /// read high. Implementations must not drive this signal high push-pull.
@@ -58,5 +66,75 @@ pub trait BrainstemHardware {
                 SerialRead::WouldBlock => break,
             }
         }
+    }
+}
+
+/// Establishes the r23 power-control outputs in their electrically safe order.
+///
+/// TXS_OE must remain under its external pull-down until POWER_TOGGLE has been
+/// configured as a driven-low output. Keeping the two construction operations
+/// in this helper makes that dependency explicit for both RP2040 backends and
+/// gives host tests a way to prove the order and failure behavior.
+pub(crate) fn initialize_power_control<
+    PowerTogglePin,
+    TxsOePin,
+    PowerToggleOutput,
+    TxsOeOutput,
+    Error,
+>(
+    power_toggle_pin: PowerTogglePin,
+    txs_oe_pin: TxsOePin,
+    establish_power_toggle_low: impl FnOnce(PowerTogglePin) -> Result<PowerToggleOutput, Error>,
+    enable_txs_oe: impl FnOnce(TxsOePin) -> Result<TxsOeOutput, Error>,
+) -> Result<(PowerToggleOutput, TxsOeOutput), Error> {
+    let power_toggle = establish_power_toggle_low(power_toggle_pin)?;
+    let txs_oe = enable_txs_oe(txs_oe_pin)?;
+    Ok((power_toggle, txs_oe))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::initialize_power_control;
+    use core::cell::Cell;
+
+    #[test]
+    fn power_toggle_is_established_low_before_txs_oe_is_enabled() {
+        let step = Cell::new(0);
+
+        let initialized = initialize_power_control(
+            (),
+            (),
+            |_| {
+                assert_eq!(step.get(), 0);
+                step.set(1);
+                Ok::<_, ()>("POWER_TOGGLE low")
+            },
+            |_| {
+                assert_eq!(step.get(), 1);
+                step.set(2);
+                Ok::<_, ()>("TXS_OE high")
+            },
+        );
+
+        assert_eq!(initialized, Ok(("POWER_TOGGLE low", "TXS_OE high")));
+        assert_eq!(step.get(), 2);
+    }
+
+    #[test]
+    fn txs_oe_stays_disabled_when_power_toggle_low_initialization_fails() {
+        let oe_enable_attempts = Cell::new(0);
+
+        let initialized = initialize_power_control(
+            (),
+            (),
+            |_| Err::<(), _>("POWER_TOGGLE initialization failed"),
+            |_| {
+                oe_enable_attempts.set(oe_enable_attempts.get() + 1);
+                Ok::<_, &str>(())
+            },
+        );
+
+        assert_eq!(initialized, Err("POWER_TOGGLE initialization failed"));
+        assert_eq!(oe_enable_attempts.get(), 0);
     }
 }

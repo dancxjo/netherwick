@@ -14,7 +14,6 @@ embedded-hal-nb = "1.0"
 fugit = "0.3"
 heapless = { version = "0.8", features = ["serde"] }
 nb = "1"
-panic-halt = "1.0"
 rp2040-boot2 = "0.3"
 rp-pac = { version = "7", features = ["rp2040"], optional = true }
 rp2040-hal = { version = "0.12", features = ["rt", "critical-section-impl"], optional = true }

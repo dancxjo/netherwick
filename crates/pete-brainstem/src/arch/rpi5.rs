@@ -183,7 +183,12 @@ impl BrainstemHardware for Rpi5Hardware {
 
     fn feed_watchdog(&mut self) {}
 
-    fn set_power_toggle(&mut self, _high: bool) {
+    fn begin_power_toggle_pulse(&mut self) {
+        // A normal Create side-port USB serial lead exposes OI TX/RX/GND, not
+        // the isolated power-button circuit owned by the Pico board.
+    }
+
+    fn end_power_toggle_pulse(&mut self) {
         // A normal Create side-port USB serial lead exposes OI TX/RX/GND, not
         // the isolated power-button circuit owned by the Pico board.
     }

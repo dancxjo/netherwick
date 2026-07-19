@@ -1,15 +1,14 @@
 #![cfg_attr(not(any(test, feature = "rpi5")), no_std)]
 #![cfg_attr(not(any(test, feature = "rpi5")), no_main)]
 
-#[cfg(all(not(test), not(feature = "pico-w"), not(feature = "rpi5")))]
-use panic_halt as _;
-
-#[cfg(all(not(test), feature = "pico-w"))]
+#[cfg(all(not(test), not(feature = "rpi5")))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
-    // RP2040 SIO GPIO_OUT_CLR. Fail the external reset gate inactive even if
-    // firmware panics during the asserted portion of a RUN pulse.
-    unsafe { core::ptr::write_volatile(0xd000_0018 as *mut u32, 1 << 21) };
+    // RP2040 SIO GPIO_OUT_CLR. Leave POWER_TOGGLE low, disable TXS_OE, and
+    // fail the external reset gate inactive before halting.
+    unsafe {
+        core::ptr::write_volatile(0xd000_0018 as *mut u32, (1 << 18) | (1 << 19) | (1 << 21))
+    };
     cortex_m::interrupt::disable();
     loop {
         cortex_m::asm::wfi();

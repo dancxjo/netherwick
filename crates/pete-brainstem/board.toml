@@ -13,13 +13,14 @@ rx = "GP1"
 rx_gpio = 1
 rx_physical_pin = 2
 
+# r23 POWER_TOGGLE: TXS0108E channel 7 -> Create DB-25 pin 3.
 [pins.power_toggle]
 pin = "GP18"
 gpio = 18
 physical_pin = 24
 
-[pins.create_brc]
-enabled = false
+# r23 TXS_OE: held disabled by an external 10 kΩ pull-down during reset.
+[pins.txs_oe]
 pin = "GP19"
 gpio = 19
 physical_pin = 25
@@ -30,14 +31,6 @@ onboard_gpio = 25
 status = "GP20"
 status_gpio = 20
 status_physical_pin = 26
-
-[pins.create_device_detect]
-enabled = false
-# Create 1 BRC and Device Detect are the same robot-side Mini-DIN pin.
-# Keep this placeholder disabled; the active firmware role is create_brc.
-pin = "GP19"
-gpio = 19
-physical_pin = 25
 
 [pins.create_charging_indicator]
 enabled = true

@@ -9,10 +9,7 @@ use rp2040_hal as hal;
 
 use hal::clocks::{init_clocks_and_plls, Clock};
 use hal::gpio::bank0::{Gpio0, Gpio1, Gpio18, Gpio19, Gpio2, Gpio20, Gpio25, Gpio3};
-use hal::gpio::{
-    FunctionI2c, FunctionNull, FunctionSioOutput, FunctionUart, InOutPin, Pin, PullDown, PullNone,
-    PullUp,
-};
+use hal::gpio::{FunctionI2c, FunctionSioOutput, FunctionUart, Pin, PullDown, PullUp};
 use hal::i2c::I2C;
 use hal::pac;
 use hal::sio::Sio;
@@ -21,7 +18,7 @@ use hal::watchdog::Watchdog;
 
 use crate::body;
 use crate::drivers::imu::{ImuDriver, ImuHealth, ImuSample, Mpu6050};
-use crate::hardware::{BrainstemHardware, SerialRead, UartReadError};
+use crate::hardware::{initialize_power_control, BrainstemHardware, SerialRead, UartReadError};
 use crate::runtime::Runtime;
 
 #[link_section = ".boot2"]
@@ -34,8 +31,9 @@ const CREATE_UART_STOP_BITS: StopBits = StopBits::One;
 // Unsafe hardware assumptions for this RP2040/Pico backend:
 // - body.toml maps GP0/Pico physical pin 1 to Create RX.
 // - body.toml maps GP1/Pico physical pin 2 from Create TX through external 5V-to-3.3V level shifting.
-// - body.toml maps GP18 to the external Create Power Toggle interface with the correct polarity and isolation.
-// - body.toml maps GP19 to Create BRC/DD; firmware only pulls this line low or releases it.
+// - board.toml maps GP18/Pico physical pin 24 to r23 POWER_TOGGLE through TXS0108E channel 7.
+// - board.toml maps GP19/Pico physical pin 25 to r23 TXS_OE. The board pulls OE low during reset.
+// - Create BRC is unconnected on r23 and must not be used for power control.
 // - body.toml maps GP20 as an optional external LED output; leave unconnected if unused.
 
 type CreateUart = UartPeripheral<
@@ -48,7 +46,6 @@ type CreateUart = UartPeripheral<
 >;
 
 type Output<P> = Pin<P, FunctionSioOutput, PullDown>;
-type Brc = InOutPin<Pin<Gpio19, FunctionNull, PullNone>>;
 type ImuBus = I2C<
     pac::I2C1,
     (
@@ -62,7 +59,7 @@ pub struct Rp2040Brainstem {
     uart: CreateUart,
     imu: Option<Mpu6050<ImuBus>>,
     power_toggle: Output<Gpio18>,
-    brc: Brc,
+    _txs_oe: Output<Gpio19>,
     external_led: Output<Gpio20>,
     onboard_led: Output<Gpio25>,
 }
@@ -95,6 +92,15 @@ impl Rp2040Brainstem {
             sio.gpio_bank0,
             &mut pac.RESETS,
         );
+        let (power_toggle, txs_oe) = initialize_power_control(
+            pins.gpio18,
+            pins.gpio19,
+            |pin| Ok::<_, Infallible>(pin.into_push_pull_output_in_state(hal::gpio::PinState::Low)),
+            |pin| {
+                Ok::<_, Infallible>(pin.into_push_pull_output_in_state(hal::gpio::PinState::High))
+            },
+        )
+        .unwrap();
 
         let mut onboard_led = pins.gpio25.into_push_pull_output();
         early_onboard_heartbeat(&mut timer, &mut onboard_led);
@@ -134,8 +140,8 @@ impl Rp2040Brainstem {
             timer,
             uart,
             imu,
-            power_toggle: pins.gpio18.into_push_pull_output(),
-            brc: InOutPin::new(pins.gpio19.into_floating_disabled()),
+            power_toggle,
+            _txs_oe: txs_oe,
             external_led: pins.gpio20.into_push_pull_output(),
             onboard_led,
         }
@@ -155,16 +161,17 @@ impl BrainstemHardware for Rp2040Brainstem {
         // The bare RP2040 backend does not enable the watchdog yet.
     }
 
-    fn set_power_toggle(&mut self, high: bool) {
-        set_pin(&mut self.power_toggle, high);
+    fn begin_power_toggle_pulse(&mut self) {
+        set_pin(&mut self.power_toggle, false);
+        set_pin(&mut self.power_toggle, true);
     }
 
-    fn set_brc(&mut self, released: bool) {
-        if released {
-            let _ = self.brc.set_high();
-        } else {
-            let _ = self.brc.set_low();
-        }
+    fn end_power_toggle_pulse(&mut self) {
+        set_pin(&mut self.power_toggle, false);
+    }
+
+    fn set_brc(&mut self, _released: bool) {
+        // Create BRC is unconnected on the r23 carrier.
     }
 
     fn set_indicators(&mut self, on: bool) {

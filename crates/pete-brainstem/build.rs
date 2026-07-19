@@ -125,9 +125,8 @@ struct Rp2040 {
 struct Pins {
     create_uart: CreateUartPins,
     power_toggle: GpioPin,
-    create_brc: OptionalGpioPin,
+    txs_oe: GpioPin,
     leds: LedPins,
-    create_device_detect: OptionalGpioPin,
     create_charging_indicator: OptionalInputPin,
     estop: OptionalGpioPin,
     motherbrain_reset: OptionalGpioPin,
@@ -301,7 +300,7 @@ pub const CREATE_DEFAULT_MODE: CreateOiMode = {default_mode};
 pub const CREATE_SENSOR_PROBE_PACKET: u8 = {sensor_probe_packet};
 pub const CREATE_SUPPORTED_SENSOR_PACKETS: &str = {supported_sensor_packets:?};
 pub const CREATE_SUPPORTED_MODES: &[&str] = {supported_modes};
-pub const CREATE_BRC_ENABLED: bool = {create_brc_enabled};
+pub const CREATE_BRC_ENABLED: bool = false;
 
 pub const CAPABILITY_VERBS: &[&str] = {capability_verbs};
 pub const CAPABILITY_SENSORS: &[&str] = {capability_sensors};
@@ -347,13 +346,12 @@ pub const ONBOARD_LED_GPIO: u8 = {onboard_led_gpio};
 pub const ONBOARD_LED_PIN: &str = {onboard_led_pin:?};
 pub const CREATE_POWER_TOGGLE_PIN: &str = {create_power_toggle_pin:?};
 pub const CREATE_POWER_TOGGLE_GPIO: u8 = {create_power_toggle_gpio};
-pub const CREATE_BRC_PIN: &str = {create_brc_pin:?};
-pub const CREATE_BRC_GPIO: u8 = {create_brc_gpio};
+pub const CREATE_POWER_TOGGLE_PHYSICAL_PIN: u8 = {create_power_toggle_physical_pin};
+pub const TXS_OE_PIN: &str = {txs_oe_pin:?};
+pub const TXS_OE_GPIO: u8 = {txs_oe_gpio};
+pub const TXS_OE_PHYSICAL_PIN: u8 = {txs_oe_physical_pin};
 pub const EXTERNAL_LED_GPIO: u8 = {external_led_gpio};
 pub const EXTERNAL_LED_PIN: &str = {external_led_pin:?};
-pub const CREATE_DEVICE_DETECT_ENABLED: bool = {create_device_detect_enabled};
-pub const CREATE_DEVICE_DETECT_PIN: &str = {create_device_detect_pin:?};
-pub const CREATE_DEVICE_DETECT_GPIO: u8 = {create_device_detect_gpio};
 pub const CREATE_CHARGING_INDICATOR_ENABLED: bool = {create_charging_indicator_enabled};
 pub const CREATE_CHARGING_INDICATOR_PIN: &str = {create_charging_indicator_pin:?};
 pub const CREATE_CHARGING_INDICATOR_GPIO: u8 = {create_charging_indicator_gpio};
@@ -382,7 +380,6 @@ pub const IMU_IMPACT_STOP_MM_S2: u16 = {imu_impact_stop_mm_s2};
         sensor_probe_packet = body.create_oi.sensor_probe_packet,
         supported_sensor_packets = body.create_oi.supported_sensor_packets,
         supported_modes = string_slice_literal(&body.create_oi.supported_modes),
-        create_brc_enabled = board.pins.create_brc.enabled,
         capability_verbs = string_slice_literal(&body.capabilities.verbs),
         capability_sensors = string_slice_literal(&body.capabilities.sensors),
         capability_outputs = string_slice_literal(&body.capabilities.outputs),
@@ -423,13 +420,12 @@ pub const IMU_IMPACT_STOP_MM_S2: u16 = {imu_impact_stop_mm_s2};
         onboard_led_pin = board.pins.leds.onboard,
         create_power_toggle_pin = board.pins.power_toggle.pin,
         create_power_toggle_gpio = board.pins.power_toggle.gpio,
-        create_brc_pin = board.pins.create_brc.pin,
-        create_brc_gpio = board.pins.create_brc.gpio,
+        create_power_toggle_physical_pin = board.pins.power_toggle.physical_pin.unwrap_or(0),
+        txs_oe_pin = board.pins.txs_oe.pin,
+        txs_oe_gpio = board.pins.txs_oe.gpio,
+        txs_oe_physical_pin = board.pins.txs_oe.physical_pin.unwrap_or(0),
         external_led_gpio = board.pins.leds.status_gpio,
         external_led_pin = board.pins.leds.status,
-        create_device_detect_enabled = board.pins.create_device_detect.enabled,
-        create_device_detect_pin = board.pins.create_device_detect.pin,
-        create_device_detect_gpio = board.pins.create_device_detect.gpio,
         create_charging_indicator_enabled = board.pins.create_charging_indicator.enabled,
         create_charging_indicator_pin = board.pins.create_charging_indicator.pin,
         create_charging_indicator_gpio = board.pins.create_charging_indicator.gpio,
@@ -715,14 +711,9 @@ fn validate_board_gpio_assignments(board: &BoardToml) {
     claim(board.pins.create_uart.tx_gpio, "create_uart.tx");
     claim(board.pins.create_uart.rx_gpio, "create_uart.rx");
     claim(board.pins.power_toggle.gpio, "power_toggle");
+    claim(board.pins.txs_oe.gpio, "txs_oe");
     claim(board.pins.leds.onboard_gpio, "leds.onboard");
     claim(board.pins.leds.status_gpio, "leds.status");
-    if board.pins.create_brc.enabled {
-        claim(board.pins.create_brc.gpio, "create_brc");
-    }
-    if board.pins.create_device_detect.enabled {
-        claim(board.pins.create_device_detect.gpio, "create_device_detect");
-    }
     if board.pins.create_charging_indicator.enabled {
         claim(
             board.pins.create_charging_indicator.gpio,

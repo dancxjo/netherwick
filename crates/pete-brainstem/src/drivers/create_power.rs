@@ -41,9 +41,9 @@ impl CreatePower {
     where
         H: BrainstemHardware,
     {
-        hardware.set_power_toggle(true);
+        hardware.begin_power_toggle_pulse();
         hardware.delay_ms(body::POWER_TOGGLE_PULSE_MS);
-        hardware.set_power_toggle(false);
+        hardware.end_power_toggle_pulse();
         push_event(events, BrainstemEvent::CreatePowerToggled);
     }
 
