@@ -8,12 +8,13 @@ use pete_actions::{
     ActionPrimitive, ApproachTarget, ChirpPattern, ExploreStyle, InspectTarget, TurnDir,
 };
 use pete_cognition::{
-    BoundedImageInput, BoundedInputRef, CallerRole, CapabilityDescriptor, CognitiveCapability,
-    CognitiveProvider, CognitiveProviderDescriptor, CognitiveRequest, CognitiveRequestPayload,
-    CognitiveResponse, CognitiveResponsePayload, CognitiveResponseStatus, CognitiveRole,
-    CognitiveRouter, HostId, LatencyEstimate, Locality, PrivacyPolicy, ProcessId, ProviderHealth,
-    ProviderHealthState, ProviderId, ProviderRegistrySnapshot, RequestProvenance, ResourceClass,
-    ResourceCost, ResponseDisposition, RoutedResponse, SnapshotRef, TrustPolicy,
+    AsyncCognitionSupervisor, BoundedImageInput, BoundedInputRef, CallerRole, CapabilityDescriptor,
+    CognitiveCapability, CognitiveProvider, CognitiveProviderDescriptor, CognitiveRequest,
+    CognitiveRequestPayload, CognitiveResponse, CognitiveResponsePayload, CognitiveResponseStatus,
+    CognitiveRole, CognitiveRouter, HostId, LatencyEstimate, Locality, PrivacyPolicy, ProcessId,
+    ProviderHealth, ProviderHealthState, ProviderId, ProviderRegistrySnapshot, RequestProvenance,
+    ResourceClass, ResourceCost, ResponseDisposition, RoutedResponse, SnapshotRef,
+    SubmissionDisposition, TrustPolicy,
 };
 use pete_experience::{EmbodiedContext, ExperienceLatent, FuturePrediction, Impression};
 use pete_now::{
@@ -33,7 +34,6 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
-use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 pub const IMAGE_CAPTION_PROMPT: &str = "Describe only what you see from your viewpoint. Start from the fact that this is your own vision looking out, so the first person should mean phrases like \"I see...\" or \"in front of me,\" not that visible people, faces, hands, eyes, or bodies are yours. You may use more than one sentence when the visible scene needs fuller description, but stay grounded in visible evidence and do not speculate beyond what can be seen. Do not interpret this as an image; interpret it as the machine's own live view. When looking out, one does not see oneself: anyone you see is most likely someone you're looking at, not yourself, unless you're clearly looking in a mirror or reflection. Describe visible people in third person, as someone in front of you.";
@@ -488,10 +488,8 @@ pub struct LiveImageEnrichment {
 const OLLAMA_SCENE_PROVIDER_ID: &str = "ollama.scene_description";
 
 pub struct LiveImageCognition {
-    router: Option<CognitiveRouter>,
-    pending: Option<JoinHandle<(CognitiveRouter, RoutedResponse)>>,
+    supervisor: AsyncCognitionSupervisor,
     last_frame_key: Option<LiveImageFrameKey>,
-    last_registry: ProviderRegistrySnapshot,
     request_timeout_ms: u64,
 }
 
@@ -517,18 +515,15 @@ impl LiveImageCognition {
     }
 
     pub fn from_router(router: CognitiveRouter, request_timeout_ms: u64) -> Self {
-        let last_registry = router.registry_snapshot(wall_now_ms());
         Self {
-            router: Some(router),
-            pending: None,
+            supervisor: AsyncCognitionSupervisor::new(router, wall_now_ms()),
             last_frame_key: None,
-            last_registry,
             request_timeout_ms: request_timeout_ms.max(1),
         }
     }
 
     pub fn registry_snapshot(&self) -> &ProviderRegistrySnapshot {
-        &self.last_registry
+        self.supervisor.registry_snapshot()
     }
 
     /// Poll a completed request and enqueue at most one new frame. This never
@@ -541,75 +536,34 @@ impl LiveImageCognition {
         now_ms: u64,
     ) -> LiveImageCognitionTick {
         let mut tick = LiveImageCognitionTick::default();
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(tokio::task::JoinHandle::is_finished)
-        {
-            let handle = self.pending.take().expect("finished handle exists");
-            match handle.await {
-                Ok((router, mut response)) => {
-                    self.router = Some(router);
-                    let current_frame_id = frame.map(live_image_source_frame_id);
-                    if current_frame_id.as_deref()
-                        != Some(response.response.input_snapshot.snapshot_id.as_str())
-                    {
-                        response.disposition = ResponseDisposition::Stale;
-                        response.response.status = CognitiveResponseStatus::Stale;
-                    }
-                    if response.disposition == ResponseDisposition::Accepted {
-                        tick.enrichment = enrichment_from_response(&response.response);
-                    }
-                    tick.response = Some(response);
-                }
-                Err(error) => {
-                    tick.response = None;
-                    self.router = Some(CognitiveRouter::default());
-                    self.last_registry = ProviderRegistrySnapshot {
-                        schema_version: 1,
-                        observed_at_ms: now_ms,
-                        ..ProviderRegistrySnapshot::default()
-                    };
-                    let _ = error;
-                }
+        let current_snapshot = frame.map_or_else(SnapshotRef::default, |frame| SnapshotRef {
+            snapshot_id: live_image_source_frame_id(frame),
+            schema_version: 1,
+            revision: world_revision,
+            captured_at_ms: frame.captured_at_ms,
+        });
+        if let Some(response) = self.supervisor.poll(&current_snapshot, now_ms).await {
+            if response.disposition == ResponseDisposition::Accepted {
+                tick.enrichment = enrichment_from_response(&response.response);
             }
+            tick.response = Some(response);
         }
 
-        if self.pending.is_none() {
-            if let (Some(frame), Some(mut router)) = (frame, self.router.take()) {
+        if !self.supervisor.is_pending() {
+            if let Some(frame) = frame {
                 let key = LiveImageFrameKey::from(frame);
                 if self.last_frame_key.as_ref() != Some(&key) {
                     self.last_frame_key = Some(key);
-                    let provider_id = ProviderId(OLLAMA_SCENE_PROVIDER_ID.to_string());
-                    router.update_health(
-                        &provider_id,
-                        ProviderHealth {
-                            state: ProviderHealthState::Degraded,
-                            confidence: 0.8,
-                            observed_at_ms: now_ms,
-                            valid_until_ms: now_ms.saturating_add(self.request_timeout_ms),
-                            reason: Some("probing optional scene provider".to_string()),
-                        },
-                    );
-                    match scene_request(frame, world_revision, now_ms, self.request_timeout_ms) {
-                        Ok(request) => {
-                            self.last_registry = router.registry_snapshot(now_ms);
-                            self.pending = Some(tokio::spawn(async move {
-                                let response = router.dispatch(request, now_ms).await;
-                                (router, response)
-                            }));
-                        }
-                        Err(_) => self.router = Some(router),
+                    if let Ok(request) =
+                        scene_request(frame, world_revision, now_ms, self.request_timeout_ms)
+                    {
+                        let disposition = self.supervisor.submit(request, now_ms);
+                        debug_assert_ne!(disposition, SubmissionDisposition::Busy);
                     }
-                } else {
-                    self.router = Some(router);
                 }
             }
         }
-        if let Some(router) = self.router.as_ref() {
-            self.last_registry = router.registry_snapshot(now_ms);
-        }
-        tick.registry = self.last_registry.clone();
+        tick.registry = self.supervisor.registry_snapshot().clone();
         tick
     }
 }
