@@ -81,6 +81,7 @@ use pete_skills::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::task::JoinHandle;
 use tsrun::{js_value_to_json, Interpreter, JsError, StepResult};
 use uuid::Uuid;
 
@@ -91,14 +92,17 @@ where
     R: Recall + Sync,
     C: Conductor,
     S: SafetyLayer,
-    A: LlmAgent,
+    A: LlmAgent + 'static,
 {
     pub ledger: L,
     pub memory_store: M,
     pub memory_recall: R,
     pub conductor: C,
     pub safety: S,
-    pub llm: A,
+    /// Optional higher cognition is shared only with a background job.  The
+    /// control tick never takes this mutex; it is exclusively an ownership
+    /// device for the spawned provider future.
+    pub llm: Arc<tokio::sync::Mutex<A>>,
     pub extractor: EventExtractor,
     pub bus: EventBus,
     pub reign_queue: Arc<Mutex<ReignQueue>>,
@@ -122,6 +126,40 @@ where
     sleep_controller: SleepController,
     semantic_outcomes: SemanticOutcomeTracker,
     last_active_control: Option<ActiveControlSummary>,
+    cognition: RuntimeCognition,
+}
+
+const COGNITION_DEADLINE_MS: u64 = 2_000;
+
+#[derive(Default)]
+struct RuntimeCognition {
+    pending: Option<PendingLlmCognition>,
+    last_sense: pete_now::LlmSense,
+    last_sense_valid_until_ms: u64,
+    last_outcome: Option<CognitionOutcome>,
+}
+
+struct PendingLlmCognition {
+    snapshot_ref: String,
+    requested_at_ms: u64,
+    deadline_ms: u64,
+    task: JoinHandle<Result<(Option<Combobulation>, LlmTickResult)>>,
+}
+
+#[derive(Clone, Debug)]
+enum CognitionOutcome {
+    Accepted,
+    Expired,
+    Failed(String),
+    Cancelled,
+}
+
+struct AcceptedLlmCognition {
+    reflection: Option<Combobulation>,
+    tick: LlmTickResult,
+    snapshot_ref: String,
+    requested_at_ms: u64,
+    observed_at_ms: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3041,7 +3079,7 @@ where
     R: Recall + Sync,
     C: Conductor,
     S: SafetyLayer,
-    A: LlmAgent,
+    A: LlmAgent + 'static,
 {
     pub fn new(
         ledger: L,
@@ -3057,7 +3095,7 @@ where
             memory_recall,
             conductor,
             safety,
-            llm,
+            llm: Arc::new(tokio::sync::Mutex::new(llm)),
             extractor: EventExtractor::default(),
             bus: default_event_bus(),
             reign_queue: Arc::new(Mutex::new(ReignQueue::default())),
@@ -3081,6 +3119,7 @@ where
             sleep_controller: SleepController::default(),
             semantic_outcomes: SemanticOutcomeTracker::default(),
             last_active_control: None,
+            cognition: RuntimeCognition::default(),
         }
     }
 
@@ -3099,7 +3138,7 @@ where
             memory_recall,
             conductor,
             safety,
-            llm,
+            llm: Arc::new(tokio::sync::Mutex::new(llm)),
             extractor: EventExtractor::default(),
             bus: default_event_bus(),
             reign_queue,
@@ -3123,6 +3162,7 @@ where
             sleep_controller: SleepController::default(),
             semantic_outcomes: SemanticOutcomeTracker::default(),
             last_active_control: None,
+            cognition: RuntimeCognition::default(),
         }
     }
 
@@ -3166,8 +3206,140 @@ where
         self.nudge.status.clone()
     }
 
+    /// Cancel optional cognition without disturbing local control state.
+    pub fn cancel_cognition(&mut self) {
+        if let Some(pending) = self.cognition.pending.take() {
+            pending.task.abort();
+            self.cognition.last_outcome = Some(CognitionOutcome::Cancelled);
+        }
+    }
+
     pub fn behavior_node_states(&self) -> Vec<BehaviorNodeState> {
         self.models.behavior_node_states(&self.last_behavior_runs)
+    }
+
+    /// Poll a previous request and enqueue the current immutable view.
+    ///
+    /// `JoinHandle::is_finished` is deliberately checked before awaiting it,
+    /// making the only await here a ready-value extraction rather than model
+    /// or network I/O. Provider output is reduced to `LlmSense` and typed
+    /// evidence; decisions and conscious commands never cross this boundary.
+    async fn advance_cognition(
+        &mut self,
+        now: &Now,
+        impressions: &[Impression],
+        embodied: &pete_experience::EmbodiedContext,
+        latent: &ExperienceLatent,
+        futures: &[FuturePrediction],
+        recall_summary: &str,
+        notes: &mut Vec<String>,
+    ) -> Option<AcceptedLlmCognition> {
+        if now.t_ms > self.cognition.last_sense_valid_until_ms {
+            self.cognition.last_sense = pete_now::LlmSense::default();
+        }
+        let mut accepted = None;
+        if self
+            .cognition
+            .pending
+            .as_ref()
+            .is_some_and(|pending| now.t_ms > pending.deadline_ms)
+        {
+            let pending = self.cognition.pending.take().expect("expired task");
+            pending.task.abort();
+            self.cognition.last_outcome = Some(CognitionOutcome::Expired);
+        }
+        if self
+            .cognition
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.task.is_finished())
+        {
+            let pending = self.cognition.pending.take().expect("finished task");
+            match pending.task.await {
+                Err(error) => {
+                    let outcome = if error.is_cancelled() {
+                        CognitionOutcome::Cancelled
+                    } else {
+                        CognitionOutcome::Failed(error.to_string())
+                    };
+                    self.cognition.last_outcome = Some(outcome);
+                }
+                Ok(Err(error)) => {
+                    self.cognition.last_outcome = Some(CognitionOutcome::Failed(error.to_string()));
+                }
+                Ok(Ok((_reflection, _result))) if now.t_ms > pending.deadline_ms => {
+                    self.cognition.last_outcome = Some(CognitionOutcome::Expired);
+                }
+                Ok(Ok((reflection, result))) => {
+                    self.cognition.last_sense = result.sense.clone();
+                    self.cognition.last_sense_valid_until_ms =
+                        now.t_ms.saturating_add(COGNITION_DEADLINE_MS);
+                    self.cognition.last_outcome = Some(CognitionOutcome::Accepted);
+                    accepted = Some(AcceptedLlmCognition {
+                        reflection,
+                        tick: result,
+                        snapshot_ref: pending.snapshot_ref,
+                        requested_at_ms: pending.requested_at_ms,
+                        observed_at_ms: now.t_ms,
+                    });
+                }
+            }
+        }
+
+        if self.cognition.pending.is_none() {
+            let llm = Arc::clone(&self.llm);
+            let request_now = now.clone();
+            let request_impressions = impressions.to_vec();
+            let request_embodied = embodied.clone();
+            let request_latent = latent.clone();
+            let request_futures = futures.to_vec();
+            let request_recall = recall_summary.to_string();
+            let task = tokio::spawn(async move {
+                let mut agent = llm.lock().await;
+                let reflection = agent
+                    .combobulate(
+                        &request_now,
+                        &request_impressions,
+                        Some(&request_embodied),
+                        &request_latent,
+                        &request_futures,
+                        &request_recall,
+                    )
+                    .await?;
+                let awareness = reflection.as_ref().map(|value| value.summary.as_str());
+                let tick = agent
+                    .maybe_tick(
+                        &request_now,
+                        Some(&request_embodied),
+                        &request_latent,
+                        &request_futures,
+                        &request_recall,
+                        awareness,
+                    )
+                    .await?;
+                Ok((reflection, tick))
+            });
+            self.cognition.pending = Some(PendingLlmCognition {
+                snapshot_ref: now
+                    .extensions
+                    .get("frame_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown-frame")
+                    .to_string(),
+                requested_at_ms: now.t_ms,
+                deadline_ms: now.t_ms.saturating_add(COGNITION_DEADLINE_MS),
+                task,
+            });
+        }
+        if let Some(outcome) = self.cognition.last_outcome.as_ref() {
+            notes.push(match outcome {
+                CognitionOutcome::Accepted => "LlmProviderOutcome: accepted".to_string(),
+                CognitionOutcome::Expired => "LlmProviderOutcome: expired".to_string(),
+                CognitionOutcome::Cancelled => "LlmProviderOutcome: cancelled".to_string(),
+                CognitionOutcome::Failed(error) => format!("LlmProviderOutcome: failed: {error}"),
+            });
+        }
+        accepted
     }
 
     pub fn apply_behavior_node_update(&mut self, node_id: &str, update: &BehaviorNodeUpdate) {
@@ -3469,56 +3641,47 @@ where
         );
         let embodied_context = runtime_instant.embodied_context();
 
-        let combobulation = match self
-            .llm
-            .combobulate(
+        let accepted_llm = self
+            .advance_cognition(
                 &now,
                 &impressions,
-                Some(&embodied_context),
+                &embodied_context,
                 &latent,
                 &futures,
                 &recall.first_person_summary,
+                &mut notes,
             )
-            .await
-        {
-            Ok(value) => value,
-            Err(error) => {
-                notes.push(format!("LlmCombobulationSkipped: {error}"));
-                None
+            .await;
+        now.llm = self.cognition.last_sense.clone();
+        if let Some(accepted) = accepted_llm.as_ref() {
+            if let Some(reflection) = accepted.reflection.as_ref() {
+                append_combobulation(
+                    &mut sensations,
+                    &mut impressions,
+                    &mut experiences,
+                    accepted.requested_at_ms,
+                    accepted.observed_at_ms,
+                    &accepted.snapshot_ref,
+                    reflection,
+                );
             }
-        };
-
-        let awareness_summary = combobulation.as_ref().map(|value| value.summary.as_str());
-        let llm_tick = match self
-            .llm
-            .maybe_tick(
-                &now,
-                Some(&embodied_context),
-                &latent,
-                &futures,
-                &recall.first_person_summary,
-                awareness_summary,
-            )
-            .await
-        {
-            Ok(value) => value,
-            Err(error) => {
-                notes.push(format!("LlmTickSkipped: {error}"));
-                LlmTickResult::default()
-            }
-        };
-        now.llm = llm_tick.sense.clone();
-        apply_llm_tick(
-            &llm_tick,
-            &mut sensations,
-            &mut impressions,
-            &mut experiences,
-            &mut teachings,
-        );
-        let llm_command_action = llm_tick
-            .decision
-            .as_ref()
-            .and_then(|decision| decision.action.clone());
+            apply_llm_tick(
+                &accepted.tick,
+                accepted.requested_at_ms,
+                accepted.observed_at_ms,
+                &accepted.snapshot_ref,
+                &mut sensations,
+                &mut impressions,
+                &mut experiences,
+                &mut teachings,
+            );
+        }
+        // Higher cognition is advisory. Even a valid response cannot become a
+        // Cockpit proposal; local goals, skills, Reign, and safety own motion.
+        let llm_tick = accepted_llm
+            .map(|accepted| accepted.tick)
+            .unwrap_or_default();
+        let llm_command_action = None;
         let mut llm_action_proposal = LlmActionProposal {
             proposed_action: llm_command_action.clone(),
             ignored_reason: if llm_command_action.is_none() {
@@ -3599,18 +3762,26 @@ where
         }
         world_context.active_control = self.last_active_control.clone();
         world_context.semantic_observations = self.semantic_outcomes.take_pending();
-        let enhanced_cognition_available = self.llm.enhanced_cognition_available();
+        let cognition_busy = self.cognition.pending.is_some();
+        let cognition_failure =
+            self.cognition
+                .last_outcome
+                .as_ref()
+                .and_then(|outcome| match outcome {
+                    CognitionOutcome::Failed(error) => Some(error.clone()),
+                    CognitionOutcome::Expired => Some("latest request expired".to_string()),
+                    CognitionOutcome::Cancelled => Some("latest request was cancelled".to_string()),
+                    _ => None,
+                });
+        let enhanced_cognition_available = !cognition_busy && cognition_failure.is_none();
         world_context.cognitive_services.insert(
             "rich_language".to_string(),
             CognitiveServiceBelief {
                 available: enhanced_cognition_available,
                 confidence: 1.0,
-                unavailable_reason: (!enhanced_cognition_available).then(|| {
-                    self.llm
-                        .enhanced_cognition_unavailable_reason()
-                        .unwrap_or("enhanced cognition is unavailable")
-                        .to_string()
-                }),
+                unavailable_reason: cognition_busy
+                    .then(|| "request in flight (busy)".to_string())
+                    .or(cognition_failure),
                 meta: BeliefMeta {
                     confidence: 1.0,
                     observed_at_ms: now.t_ms,
@@ -4302,16 +4473,6 @@ where
             "llm.action_proposal".to_string(),
             serde_json::to_value(&llm_action_proposal)?,
         );
-
-        if let Some(combobulation) = &combobulation {
-            append_combobulation(
-                &mut sensations,
-                &mut impressions,
-                &mut experiences,
-                now.t_ms,
-                combobulation,
-            );
-        }
 
         attach_structured_predictions_to_experience(
             &mut embodied_experience,
@@ -5035,7 +5196,7 @@ where
     R: Recall + Send + Sync,
     C: Conductor + Send,
     S: SafetyLayer + Send,
-    A: LlmAgent + Send,
+    A: LlmAgent + Send + 'static,
 {
     fn reign_sense(&self, now_ms: TimeMs) -> Result<ReignSense> {
         let mut reign_queue = self
@@ -9345,6 +9506,9 @@ fn apply_responses(
 
 fn apply_llm_tick(
     llm_tick: &LlmTickResult,
+    occurred_at_ms: u64,
+    observed_at_ms: u64,
+    snapshot_ref: &str,
     sensations: &mut Vec<Sensation>,
     impressions: &mut Vec<Impression>,
     experiences: &mut Vec<Experience>,
@@ -9354,19 +9518,12 @@ fn apply_llm_tick(
         let sensation = Sensation::new(
             "llm.command",
             "llm",
-            llm_tick
-                .teaching
-                .first()
-                .map(|value| value.t_ms)
-                .unwrap_or_default(),
-            llm_tick
-                .teaching
-                .first()
-                .map(|value| value.t_ms)
-                .unwrap_or_default(),
+            occurred_at_ms,
+            observed_at_ms,
             serde_json::json!({
                 "summary": command.summary,
                 "action": command.action,
+                "input_snapshot_ref": snapshot_ref,
             }),
         )
         .with_summary(command.summary.clone())
@@ -9396,17 +9553,12 @@ fn apply_llm_tick(
         let sensation = Sensation::new(
             "llm.critique",
             "llm",
-            llm_tick
-                .teaching
-                .first()
-                .map(|value| value.t_ms)
-                .unwrap_or_default(),
-            llm_tick
-                .teaching
-                .first()
-                .map(|value| value.t_ms)
-                .unwrap_or_default(),
-            serde_json::json!({ "critique": critique }),
+            occurred_at_ms,
+            observed_at_ms,
+            serde_json::json!({
+                "critique": critique,
+                "input_snapshot_ref": snapshot_ref,
+            }),
         )
         .with_summary(critique.clone())
         .with_provenance(Provenance::direct().with_stage("llm"));
@@ -9429,17 +9581,20 @@ fn append_combobulation(
     sensations: &mut Vec<Sensation>,
     impressions: &mut Vec<Impression>,
     experiences: &mut Vec<Experience>,
-    t_ms: u64,
+    occurred_at_ms: u64,
+    observed_at_ms: u64,
+    snapshot_ref: &str,
     combobulation: &Combobulation,
 ) {
     let sensation = Sensation::new(
         "llm.combobulation",
         "llm",
-        t_ms,
-        t_ms,
+        occurred_at_ms,
+        observed_at_ms,
         serde_json::json!({
             "summary": combobulation.summary,
             "confidence": combobulation.confidence,
+            "input_snapshot_ref": snapshot_ref,
         }),
     )
     .with_summary(combobulation.summary.clone())
@@ -9448,8 +9603,8 @@ fn append_combobulation(
         "llm.combobulation.observation",
         combobulation.summary.clone(),
         vec![sensation.id],
-        t_ms,
-        t_ms,
+        occurred_at_ms,
+        observed_at_ms,
     )
     .with_confidence(combobulation.confidence);
     let experience = Experience::new(
@@ -9457,8 +9612,8 @@ fn append_combobulation(
         combobulation.summary.clone(),
         vec![impression.id],
         vec![sensation.id],
-        t_ms,
-        t_ms,
+        occurred_at_ms,
+        observed_at_ms,
     );
     sensations.push(sensation);
     impressions.push(impression);
@@ -16569,6 +16724,62 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct SlowAdvisoryAgent;
+
+    #[async_trait::async_trait]
+    impl LlmAgent for SlowAdvisoryAgent {
+        async fn combobulate(
+            &mut self,
+            _now: &Now,
+            _impressions: &[Impression],
+            _embodied: Option<&EmbodiedContext>,
+            _z: &ExperienceLatent,
+            _futures: &[FuturePrediction],
+            _recall_summary: &str,
+        ) -> Result<Option<Combobulation>> {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            Ok(Some(Combobulation {
+                summary: "historical doorway hypothesis".to_string(),
+                confidence: 0.8,
+            }))
+        }
+
+        async fn maybe_tick(
+            &mut self,
+            _now: &Now,
+            _embodied: Option<&EmbodiedContext>,
+            _z: &ExperienceLatent,
+            _futures: &[FuturePrediction],
+            _recall_summary: &str,
+            _awareness_summary: Option<&str>,
+        ) -> Result<LlmTickResult> {
+            Ok(LlmTickResult {
+                sense: pete_now::LlmSense {
+                    schema_version: 1,
+                    critique: Some("test the doorway hypothesis".to_string()),
+                    confidence: 0.8,
+                    ..pete_now::LlmSense::default()
+                },
+                decision: Some(LlmDecision {
+                    action: Some(ActionPrimitive::Go {
+                        intensity: 1.0,
+                        duration_ms: 5_000,
+                    }),
+                    ..LlmDecision::default()
+                }),
+                ..LlmTickResult::default()
+            })
+        }
+
+        async fn scientific_review(
+            &mut self,
+            _request: &LlmReviewRequest,
+        ) -> Result<Option<LlmScientificReview>> {
+            Ok(None)
+        }
+    }
+
     fn test_runtime<C>(
         ledger: JsonlLedger,
         conductor: C,
@@ -16596,7 +16807,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn llm_command_action_overrides_default_curiosity_drive() {
+    async fn llm_command_is_never_granted_control_authority() {
         let ledger = JsonlLedger::new("/tmp/pete-runtime-llm-command-action-test");
         let memory = InMemoryExperienceStore::new();
         let recall = memory.clone();
@@ -16608,7 +16819,7 @@ mod tests {
             ledger,
             memory,
             recall,
-            SimpleConductor::default(),
+            FixedConductor::new(ActionPrimitive::Stop),
             SimpleSafety::default(),
             FixedLlmAgent {
                 action: llm_action.clone(),
@@ -16622,14 +16833,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(tick.chosen_action, Some(llm_action.clone()));
-        assert_eq!(
-            tick.frame
-                .conscious_command
-                .as_ref()
-                .and_then(|cmd| cmd.action.clone()),
-            Some(llm_action.clone())
-        );
+        assert_eq!(tick.chosen_action, Some(ActionPrimitive::Stop));
+        assert!(tick.frame.conscious_command.is_none());
         let decision = tick
             .frame
             .now
@@ -16638,7 +16843,60 @@ mod tests {
             .cloned()
             .and_then(|value| serde_json::from_value::<ActionSelectionDecision>(value).ok())
             .unwrap();
-        assert_eq!(decision.selected_action, Some(llm_action));
+        assert_eq!(decision.selected_action, Some(ActionPrimitive::Stop));
+    }
+
+    #[tokio::test]
+    async fn slow_advice_is_retained_as_historical_evidence_only() {
+        let ledger = JsonlLedger::new("/tmp/pete-runtime-slow-advice-test");
+        let memory = InMemoryExperienceStore::new();
+        let mut runtime = MinimalRuntime::new(
+            ledger,
+            memory.clone(),
+            memory,
+            FixedConductor::new(ActionPrimitive::Stop),
+            SimpleSafety::default(),
+            SlowAdvisoryAgent,
+        );
+        let mut accepted_tick = None;
+
+        for step in 0..8 {
+            let t_ms = 100 + step * 100;
+            let mut now = idle_now(t_ms);
+            now.body.last_update_ms = t_ms;
+            let tick = runtime
+                .tick(now, ExperienceLatent::default(), Vec::new())
+                .await
+                .unwrap();
+            assert_eq!(tick.chosen_action, Some(ActionPrimitive::Stop));
+            if tick
+                .frame
+                .experiences
+                .iter()
+                .any(|experience| experience.kind == "llm.combobulation")
+            {
+                accepted_tick = Some(tick);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        let tick = accepted_tick.expect("500 ms advice should be retained on a later tick");
+        let evidence = tick
+            .frame
+            .sensations
+            .iter()
+            .find(|sensation| sensation.kind == "llm.combobulation")
+            .expect("provenance-bearing advisory sensation");
+        assert_eq!(evidence.occurred_at_ms, 100);
+        assert!(evidence.observed_at_ms >= 600);
+        assert!(evidence
+            .payload
+            .get("input_snapshot_ref")
+            .and_then(serde_json::Value::as_str)
+            .is_some());
+        assert_eq!(tick.chosen_action, Some(ActionPrimitive::Stop));
+        assert!(tick.frame.conscious_command.is_none());
     }
 
     #[tokio::test]
@@ -16689,14 +16947,11 @@ mod tests {
 
         assert_eq!(tick.chosen_action, reign_command.to_action());
         assert!(!proposal.accepted);
-        assert_eq!(
-            proposal.ignored_reason.as_deref(),
-            Some("safe active Reign command outranked LLM action")
-        );
+        assert_eq!(proposal.ignored_reason.as_deref(), None);
     }
 
     #[tokio::test]
-    async fn unsafe_llm_action_is_safety_vetoed_and_recorded() {
+    async fn llm_action_is_discarded_before_safety_and_cockpit() {
         let ledger = JsonlLedger::new("/tmp/pete-runtime-llm-safety-veto-test");
         let memory = InMemoryExperienceStore::new();
         let recall = memory.clone();
@@ -16729,21 +16984,10 @@ mod tests {
             .and_then(|value| serde_json::from_value::<LlmActionProposal>(value).ok())
             .unwrap();
 
-        assert_eq!(
-            proposal.proposed_action,
-            Some(ActionPrimitive::Go {
-                intensity: 0.3,
-                duration_ms: 700,
-            })
-        );
-        assert!(proposal.accepted);
-        assert!(proposal.safety_vetoed);
-        assert_eq!(proposal.safety_reason.as_deref(), Some("cliff"));
-        assert!(tick.frame.llm_teaching.iter().any(|teaching| teaching
-            .critique
-            .as_deref()
-            .unwrap_or_default()
-            .contains("unsafe action")));
+        assert!(proposal.proposed_action.is_none());
+        assert!(!proposal.accepted);
+        assert!(!proposal.safety_vetoed);
+        assert_eq!(tick.chosen_action, Some(ActionPrimitive::Stop));
     }
 
     fn arena() -> ArenaConfig {
