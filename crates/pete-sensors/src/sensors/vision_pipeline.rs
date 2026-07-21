@@ -819,13 +819,13 @@ struct Track {
 }
 
 #[derive(Clone, Debug, Default)]
-struct ShortTermTracker {
+pub struct ShortTermTracker {
     next_id: u64,
     tracks: Vec<Track>,
 }
 
 impl ShortTermTracker {
-    fn assign(
+    pub fn assign(
         &mut self,
         proposals: &[VisionProposal],
         timestamp_ms: u64,
@@ -836,12 +836,14 @@ impl ShortTermTracker {
             track.calibration_epoch == calibration_epoch
                 && timestamp_ms.saturating_sub(track.last_seen_ms) <= config.track_max_age_ms
         });
-        let mut used = vec![false; self.tracks.len()];
+        let matchable_track_count = self.tracks.len();
+        let mut used = vec![false; matchable_track_count];
         let mut ids = Vec::with_capacity(proposals.len());
         for proposal in proposals {
             let matched = self
                 .tracks
                 .iter()
+                .take(matchable_track_count)
                 .enumerate()
                 .filter(|(index, _)| !used[*index])
                 .map(|(index, track)| (index, bbox_iou(proposal.bbox, track.bbox)))

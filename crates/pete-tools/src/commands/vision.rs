@@ -227,13 +227,6 @@ async fn load_vision_capture_frames(path: &str) -> Result<Vec<VisionEvalFrame>> 
         .collect())
 }
 
-#[derive(Clone, Debug, Default)]
-struct EvalTrack {
-    id: String,
-    bbox: pete_now::VisionBoundingBox,
-    sequence: Option<String>,
-}
-
 fn evaluate_vision_backend(
     backend: std::sync::Arc<dyn pete_sensors::VisionBackend>,
     config: pete_sensors::VisionPipelineConfig,
@@ -243,8 +236,9 @@ fn evaluate_vision_backend(
     let mut inference_us = Vec::new();
     let mut detections = Vec::new();
     let mut failures = Vec::new();
-    let mut tracks = Vec::<EvalTrack>::new();
-    let mut next_track_id = 0_u64;
+    let mut tracker = pete_sensors::ShortTermTracker::default();
+    let mut previous_sequence = None;
+    let mut has_previous_sequence = false;
     let mut metrics = VisionEvalMetrics {
         frames: frames.len(),
         tag_counts: frames.iter().flat_map(|frame| frame.tags.iter()).fold(
@@ -273,47 +267,27 @@ fn evaluate_vision_backend(
                 continue;
             }
         };
-        if tracks
-            .first()
-            .is_some_and(|track| track.sequence != frame.sequence)
-        {
-            tracks.clear();
+        if has_previous_sequence && previous_sequence != frame.sequence {
+            tracker = pete_sensors::ShortTermTracker::default();
         }
-        let mut used_tracks = BTreeSet::new();
-        let mut frame_detections = Vec::new();
-        for proposal in proposals {
-            let matched = tracks
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| !used_tracks.contains(index))
-                .map(|(index, track)| (index, vision_bbox_iou(proposal.bbox, track.bbox)))
-                .filter(|(_, iou)| *iou >= config.track_iou_threshold)
-                .max_by(|left, right| {
-                    left.1
-                        .partial_cmp(&right.1)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            let track_id = if let Some((index, _)) = matched {
-                used_tracks.insert(index);
-                tracks[index].bbox = proposal.bbox;
-                tracks[index].id.clone()
-            } else {
-                next_track_id += 1;
-                let id = format!("eval-track-{next_track_id}");
-                tracks.push(EvalTrack {
-                    id: id.clone(),
-                    bbox: proposal.bbox,
-                    sequence: frame.sequence.clone(),
-                });
-                id
-            };
-            frame_detections.push(VisionEvalDetection {
+        previous_sequence = frame.sequence.clone();
+        has_previous_sequence = true;
+        let track_ids = tracker.assign(
+            &proposals,
+            frame.frame.captured_at_ms,
+            None,
+            &config,
+        );
+        let frame_detections = proposals
+            .into_iter()
+            .zip(track_ids)
+            .map(|(proposal, track_id)| VisionEvalDetection {
                 frame_id: frame.id.clone(),
                 bbox: proposal.bbox,
                 labels: proposal.labels,
                 track_id,
-            });
-        }
+            })
+            .collect::<Vec<_>>();
         score_vision_frame(
             frame,
             &frame_detections,
