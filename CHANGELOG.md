@@ -6,6 +6,11 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Add exact-input learned-locomotion shadow records with baseline/candidate
+  provenance, inference timing, explicit candidate failures, downstream safety
+  evidence, and fail-closed promotion gates requiring valid held-out simulation
+  plus physical metrics, hardcoded fallback, atomic activation, and rollback.
+
 - Add a truthful pogo-only X1202/Create power evidence model with per-signal
   ages/confidence, explicit absent-current semantics, trend-qualified charging
   inference, independent consolidation gates, mid-cycle pause on power loss,
