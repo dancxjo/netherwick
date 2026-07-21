@@ -234,6 +234,9 @@ fn stale_brainstem_cannot_overwrite_fresh_authoritative_local_history() {
     assert!(candidates
         .iter()
         .all(|candidate| candidate["history_samples"] == 1 || candidate["history_samples"] == 2));
+    assert!(candidates
+        .iter()
+        .all(|candidate| candidate["sample"]["captured_at_ms"].is_number()));
 }
 
 impl FaceDetector for StaticFaceDetector {

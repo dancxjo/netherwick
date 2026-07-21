@@ -244,6 +244,59 @@ async fn inspect_capture_reads_tiny_fake_capture() {
 }
 
 #[tokio::test]
+async fn inspect_capture_reports_asset_ranges_bytes_and_integrity() {
+    let temp_dir = temp_path("pete_inspect_capture_assets");
+    let mut writer = CaptureWriter::create(&temp_dir, CaptureSource::RealRobot, Some(100))
+        .await
+        .unwrap();
+    let mut snapshot = WorldSnapshot::default();
+    snapshot.kinect.captured_at_ms = 990;
+    snapshot.kinect.depth_width = 1;
+    snapshot.kinect.depth_height = 1;
+    snapshot.kinect.depth_m = vec![1.0];
+    snapshot.kinect.geometry_calibration = Some(pete_now::DepthGeometryCalibration {
+        calibrated: true,
+        depth: pete_now::CameraIntrinsics {
+            width: 1,
+            height: 1,
+            fx: 1.0,
+            fy: 1.0,
+            cx: 0.0,
+            cy: 0.0,
+            distortion: [0.0; 5],
+        },
+        depth_scale: 1.0,
+        ..pete_now::DepthGeometryCalibration::default()
+    });
+    writer
+        .append_snapshot_with_exported_assets(
+            1_000,
+            snapshot,
+            Vec::new(),
+            false,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+    writer.finish().await.unwrap();
+
+    let report = inspect_capture_report(&temp_dir).await.unwrap();
+    let depth = report
+        .asset_streams
+        .iter()
+        .find(|stream| stream.kind == "depth")
+        .unwrap();
+    assert_eq!(depth.count, 1);
+    assert_eq!(depth.first_producer_ms, Some(990));
+    assert_eq!(depth.last_producer_ms, Some(990));
+    assert!(depth.bytes > 0);
+    assert!(depth.missing_intervals.is_empty());
+    assert_eq!(depth.checksum_failures, 0);
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
 async fn pose_graph_report_reads_capture_frames_and_gates_loop_candidates() {
     let temp_dir = temp_path("pete_pose_graph_capture");
     let mut writer = CaptureWriter::create(&temp_dir, CaptureSource::Sim, Some(100))

@@ -21,12 +21,25 @@ data/captures/<capture-id>/
   events.jsonl
   assets/
     rgb/
+    camera/
     depth/
+    lidar/
+    imu/
     audio/
+    transcript/
+    calibration/
     pointcloud/
 ```
 
-`manifest.json` stores the capture id, source, schema version, tick duration, frame count, optional machine info, command args, device availability, streams present/missing, capture start/end times, warnings, and asset layout. `frames.jsonl` contains one JSON record per captured frame with `index`, `t_ms`, the serialized `WorldSnapshot`, any recorded events, optional frame asset references, and optional stream metadata. For real-robot sessions, `t_ms` is the canonical fused runtime-frame time; producer timestamps such as `body.last_update_ms`, Kinect `captured_at_ms`, and IMU `captured_at_ms` remain in the snapshot as provenance. Asset paths are relative to the capture root.
+`manifest.json` stores the capture id, source, schema version, tick duration,
+frame count, optional machine info, command args, device availability, streams
+present/missing, capture start/end times, warnings, asset layout, and bounded
+writer health/drop accounting. `frames.jsonl` contains one compact JSON record
+per written frame with `index`, `t_ms`, the `WorldSnapshot`, events, asset
+references, and per-stream status/checksum metadata. For real-robot sessions,
+`t_ms` is the canonical fused runtime-frame time; each asset retains its own
+producer time and provenance. Asset paths are relative to the capture root, and
+capture readers rehydrate externalized raw arrays before replay.
 
 ## Commands
 

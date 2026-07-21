@@ -277,10 +277,22 @@ async fn background_writer_exports_timestamped_checksummed_raw_streams() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(raw_record["snapshot"]["eye_frame"]["bytes"], serde_json::json!([]));
-    assert_eq!(raw_record["snapshot"]["kinect"]["depth_m"], serde_json::json!([]));
-    assert_eq!(raw_record["snapshot"]["ear_pcm"]["samples"], serde_json::json!([]));
-    assert_eq!(raw_record["snapshot"]["range"]["beams"], serde_json::json!([]));
+    assert_eq!(
+        raw_record["snapshot"]["eye_frame"]["bytes"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        raw_record["snapshot"]["kinect"]["depth_m"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        raw_record["snapshot"]["ear_pcm"]["samples"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        raw_record["snapshot"]["range"]["beams"],
+        serde_json::json!([])
+    );
     let reader = CaptureReader::open(dir.path()).await.unwrap();
     let frames = reader.read_frames().await.unwrap();
     let frame = &frames[0];
@@ -324,7 +336,10 @@ async fn background_writer_exports_timestamped_checksummed_raw_streams() {
         .as_ref()
         .is_some_and(|path| dir.path().join(path).exists()));
     assert_eq!(frame.snapshot.kinect.depth_m, vec![1.0, 2.0]);
-    assert_eq!(frame.snapshot.ear_pcm.as_ref().unwrap().samples, vec![1, -1, 2, -2]);
+    assert_eq!(
+        frame.snapshot.ear_pcm.as_ref().unwrap().samples,
+        vec![1, -1, 2, -2]
+    );
     assert_eq!(frame.snapshot.range.beams, vec![0.5, 0.75]);
 
     let expected_pointcloud_sha = frame.stream_metadata.as_ref().unwrap()["pointcloud"]["sha256"]
@@ -336,7 +351,12 @@ async fn background_writer_exports_timestamped_checksummed_raw_streams() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        sha256_file(dir.path().join(regenerated.assets.pointcloud.unwrap()).as_path()).unwrap(),
+        sha256_file(
+            dir.path()
+                .join(regenerated.assets.pointcloud.unwrap())
+                .as_path()
+        )
+        .unwrap(),
         expected_pointcloud_sha
     );
 }

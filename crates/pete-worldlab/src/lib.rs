@@ -564,7 +564,9 @@ pub fn hydrate_frame_assets(root: &Path, frame: &mut CaptureFrameRecord) -> Resu
             let mut reader = hound::WavReader::open(&path)
                 .with_context(|| format!("reading audio asset {}", path.display()))?;
             let spec = reader.spec();
-            let samples = reader.samples::<i16>().collect::<std::result::Result<Vec<_>, _>>()?;
+            let samples = reader
+                .samples::<i16>()
+                .collect::<std::result::Result<Vec<_>, _>>()?;
             let captured_at_ms = asset_producer_time(frame, "audio").unwrap_or(frame.t_ms);
             frame.snapshot.ear_pcm = Some(PcmAudioFrame {
                 captured_at_ms,

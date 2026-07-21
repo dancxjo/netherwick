@@ -153,18 +153,28 @@ manifest.json
 frames.jsonl
 events.jsonl
 assets/rgb/
+assets/camera/
 assets/depth/
+assets/lidar/
+assets/imu/
 assets/audio/
+assets/transcript/
+assets/calibration/
 assets/pointcloud/
 ```
 
 The manifest includes machine info, command args, device availability,
 present/missing streams, start/end times, warnings, and the asset layout.
-`robot --capture` writes lossless RGB PNG, depth16 PNG, and PCM16 WAV files when
-those source streams are present, while `frames.jsonl` retains the fused frame
-and calibration provenance that names each asset.
+`robot --capture` writes lossless Kinect RGB and camera PNG, depth16 PNG, lidar
+JSON, selected/candidate IMU JSON, PCM16 WAV, transcript JSON, calibration JSON,
+and calibrated derived PLY files when those source streams are present. A
+bounded background queue keeps encoding and disk I/O off the possession loop;
+its dropped frame/asset counters are finalized in the manifest.
 
-`inspect-capture` should show frame count, duration, streams present/missing, first/last timestamps, event count, asset counts, and warnings.
+`inspect-capture` should show frame count, duration, streams present/missing,
+first/last timestamps, event count, and per-asset counts, producer-time ranges,
+missing intervals, bytes, unavailable/late/partial/dropped totals, checksum
+failures, and warnings.
 
 ## What Failure Looks Like
 
