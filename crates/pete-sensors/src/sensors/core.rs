@@ -588,7 +588,9 @@ fn range_from_kinect_depth_with_config(
             .filter(|count| *count > 0)
             .unwrap_or(FALLBACK_BEAM_COUNT)
             .min(projection.width.max(1));
-        return range_from_depth_image(kinect, projection, beam_count, transform);
+        return range_from_depth_image(kinect, projection, beam_count, transform).or_else(|| {
+            range_from_depth_image_without_intrinsics(kinect, projection, beam_count, transform)
+        });
     }
 
     if config.is_some() && depth.len() == transform.compact_depth_beam_count {
@@ -614,6 +616,60 @@ fn range_from_kinect_depth_with_config(
         beam_angles_rad: Vec::new(),
         frame: None,
         source: Some("kinect_depth_legacy_range".to_string()),
+        extrinsics: None,
+        ..RangeSense::default()
+    })
+}
+
+fn range_from_depth_image_without_intrinsics(
+    kinect: &KinectSense,
+    projection: RangeDepthProjection,
+    beam_count: usize,
+    transform: DepthRangeProjectionConfig,
+) -> Option<RangeSense> {
+    let beam_count = beam_count.max(1);
+    let row_start = projection.height / 3;
+    let row_end = (projection.height * 2 / 3)
+        .max(row_start + 1)
+        .min(projection.height);
+    let mut beams = vec![projection.max_depth_m; beam_count];
+    let mut saw_valid = false;
+    for y in row_start..row_end {
+        let row = y * projection.width;
+        for x in 0..projection.width {
+            let depth_m = kinect.depth_m[row + x] * transform.depth_scale;
+            if !depth_m.is_finite()
+                || depth_m < projection.min_depth_m
+                || depth_m > projection.max_depth_m
+            {
+                continue;
+            }
+            let beam = (x * beam_count / projection.width).min(beam_count - 1);
+            beams[beam] = beams[beam].min(depth_m);
+            saw_valid = true;
+        }
+    }
+    if !saw_valid {
+        return None;
+    }
+    let fov = transform.compact_depth_fov_rad;
+    let angles = (0..beam_count)
+        .map(|beam| {
+            if beam_count == 1 {
+                0.0
+            } else {
+                -fov * 0.5 + fov * beam as f32 / (beam_count - 1) as f32
+            }
+        })
+        .collect();
+    Some(RangeSense {
+        schema_version: 1,
+        captured_at_ms: kinect.captured_at_ms,
+        nearest_m: beams.iter().copied().reduce(f32::min),
+        beams,
+        beam_angles_rad: angles,
+        frame: Some("robot_base".to_string()),
+        source: Some("kinect_depth_image".to_string()),
         extrinsics: None,
         ..RangeSense::default()
     })
