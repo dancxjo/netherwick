@@ -6,6 +6,9 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Honor a cognition provider's declared availability before scheduling work, so
+  a disabled forebrain is immediately represented as unavailable while local
+  control continues without generating background requests.
 - Preserve provider-suggested cognition decisions as provenance-bearing,
   non-executable advisory telemetry through runtime and scene snapshots when
   they are discarded at the authority boundary.
