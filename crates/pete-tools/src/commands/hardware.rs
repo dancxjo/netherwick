@@ -1256,6 +1256,13 @@ fn inspect_asset_streams(
                     {
                         report.late = report.late.saturating_add(1);
                     }
+                    if value
+                        .and_then(|value| value.get("completeness"))
+                        .and_then(Value::as_str)
+                        == Some("partial")
+                    {
+                        report.partial = report.partial.saturating_add(1);
+                    }
                     let checksum_matches = value
                         .and_then(|value| {
                             Some((

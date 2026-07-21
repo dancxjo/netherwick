@@ -886,10 +886,7 @@ fn export_snapshot_assets_with_context(
             } else {
                 metadata.insert(
                     "rgb".to_string(),
-                    unavailable_asset_metadata(
-                        capture_t_ms,
-                        "unsupported or partial Kinect RGB frame",
-                    ),
+                    partial_asset_metadata(capture_t_ms, "unsupported or partial Kinect RGB frame"),
                 );
             }
         } else {
@@ -924,7 +921,7 @@ fn export_snapshot_assets_with_context(
             } else {
                 metadata.insert(
                     "camera".to_string(),
-                    unavailable_asset_metadata(capture_t_ms, "unsupported or partial camera frame"),
+                    partial_asset_metadata(capture_t_ms, "unsupported or partial camera frame"),
                 );
             }
         } else if assets.rgb.is_none() {
@@ -990,6 +987,14 @@ fn export_snapshot_assets_with_context(
                     }),
                 )?,
             );
+        } else if !snapshot.kinect.depth_m.is_empty() {
+            metadata.insert(
+                "depth".to_string(),
+                partial_asset_metadata(
+                    capture_t_ms,
+                    "depth samples are present but declared dimensions are incomplete",
+                ),
+            );
         } else {
             metadata.insert(
                 "depth".to_string(),
@@ -1003,22 +1008,32 @@ fn export_snapshot_assets_with_context(
 
     if export_audio {
         if let Some(audio) = &snapshot.ear_pcm {
-            let rel = capture_asset_path("audio", index, "wav");
-            write_wav(&root.join(&rel), audio)?;
-            assets.audio = Some(rel.clone());
-            metadata.insert(
-                "audio".to_string(),
-                written_asset_metadata(
-                    root,
-                    &rel,
-                    capture_t_ms,
-                    Some(audio.captured_at_ms),
-                    serde_json::json!({
-                        "sample_rate_hz": audio.sample_rate_hz, "channels": audio.channels,
-                        "format": "pcm16_wav", "samples": audio.samples.len(),
-                    }),
-                )?,
-            );
+            if audio.sample_rate_hz == 0 || audio.channels == 0 {
+                metadata.insert(
+                    "audio".to_string(),
+                    partial_asset_metadata(
+                        capture_t_ms,
+                        "PCM audio chunk has no valid sample rate or channel count",
+                    ),
+                );
+            } else {
+                let rel = capture_asset_path("audio", index, "wav");
+                write_wav(&root.join(&rel), audio)?;
+                assets.audio = Some(rel.clone());
+                metadata.insert(
+                    "audio".to_string(),
+                    written_asset_metadata(
+                        root,
+                        &rel,
+                        capture_t_ms,
+                        Some(audio.captured_at_ms),
+                        serde_json::json!({
+                            "sample_rate_hz": audio.sample_rate_hz, "channels": audio.channels,
+                            "format": "pcm16_wav", "samples": audio.samples.len(),
+                        }),
+                    )?,
+                );
+            }
         } else {
             metadata.insert(
                 "audio".to_string(),
@@ -1028,6 +1043,20 @@ fn export_snapshot_assets_with_context(
     }
 
     if !snapshot.range.beams.is_empty() || snapshot.range.nearest_m.is_some() {
+        let angles_complete = snapshot.range.beam_angles_rad.is_empty()
+            || snapshot.range.beam_angles_rad.len() == snapshot.range.beams.len();
+        let timing_complete = snapshot.range.beam_time_offsets_ms.is_empty()
+            || snapshot.range.beam_time_offsets_ms.len() == snapshot.range.beams.len();
+        let poses_complete = snapshot.range.beam_poses.is_empty()
+            || snapshot.range.beam_poses.len() == snapshot.range.beams.len();
+        let partial_reasons = [
+            (!angles_complete).then_some("beam angle count does not match beam count"),
+            (!timing_complete).then_some("beam time-offset count does not match beam count"),
+            (!poses_complete).then_some("beam pose count does not match beam count"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
         let rel = capture_asset_path("lidar", index, "json");
         write_json_asset(&root.join(&rel), &snapshot.range)?;
         assets.lidar = Some(rel.clone());
@@ -1043,6 +1072,8 @@ fn export_snapshot_assets_with_context(
                     "source": snapshot.range.source, "frame": snapshot.range.frame,
                     "producer_time_offsets": snapshot.range.beam_time_offsets_ms.len(),
                     "interpolated_beam_poses": snapshot.range.beam_poses.len(),
+                    "completeness": if angles_complete && timing_complete && poses_complete { "complete" } else { "partial" },
+                    "partial_reasons": partial_reasons,
                 }),
             )?,
         );
@@ -1239,6 +1270,14 @@ fn written_asset_metadata(
 fn unavailable_asset_metadata(capture_t_ms: u64, reason: &str) -> Value {
     serde_json::json!({
         "status": "unavailable",
+        "capture_t_ms": capture_t_ms,
+        "reason": reason,
+    })
+}
+
+fn partial_asset_metadata(capture_t_ms: u64, reason: &str) -> Value {
+    serde_json::json!({
+        "status": "partial",
         "capture_t_ms": capture_t_ms,
         "reason": reason,
     })

@@ -183,6 +183,35 @@ fn snapshot_depth_image_rejects_invalid_dimensions() {
     assert!(snapshot_depth_image(&snapshot).is_none());
 }
 
+#[test]
+fn asset_export_reports_partial_depth_and_lidar_inputs() {
+    let dir = tempdir().unwrap();
+    let mut snapshot = WorldSnapshot::default();
+    snapshot.kinect.depth_width = 2;
+    snapshot.kinect.depth_height = 2;
+    snapshot.kinect.depth_m = vec![1.0, 2.0, 3.0];
+    snapshot.range.captured_at_ms = 100;
+    snapshot.range.beams = vec![0.5, 0.6];
+    snapshot.range.beam_time_offsets_ms = vec![0];
+
+    let export = export_snapshot_assets(dir.path(), 0, &snapshot, false, true, false).unwrap();
+
+    assert_eq!(export.metadata["depth"]["status"], "partial");
+    assert!(export.metadata["depth"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("dimensions"));
+    assert_eq!(export.metadata["lidar"]["status"], "written");
+    assert_eq!(export.metadata["lidar"]["completeness"], "partial");
+    assert_eq!(
+        export.metadata["lidar"]["partial_reasons"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn capture_writer_writes_manifest_and_frames() {
     let dir = tempdir().unwrap();
