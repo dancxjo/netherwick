@@ -13,9 +13,10 @@ use pete_core::Pose2;
 use pete_now::{
     AsrSense, CalibrationEvidenceSource, CalibrationResiduals, CalibrationStateConfig,
     CalibrationStateMachine, EarSense, ExtensionSense, EyeSense, FaceSense, GpsSense, ImuSense,
-    KinectFusionAlignment, KinectSense, LatencyEventFeature, LatencyTrustState, ObjectClass,
-    ObjectObservation, ObjectObservationSource, ObjectSense, RangeExtrinsics, RangeSense,
-    SensorLatencyRegistry, SensorTimingObservation, TranscriptCandidateEvent,
+    KinectFusionAlignment, KinectSense, LatencyEventFeature, LatencyTrustState,
+    LocomotionCalibrationEstimator, ObjectClass, ObjectObservation, ObjectObservationSource,
+    ObjectSense, RangeExtrinsics, RangeSense, RotationCalibrationEpisode, SensorLatencyRegistry,
+    SensorTimingObservation, StraightCalibrationEpisode, TranscriptCandidateEvent,
     TranscriptCandidateTracker, TranscriptStabilityState, TransformEstimateEvidence,
     VectorArtifact, VoiceSense, FACE_VECTOR_COLLECTION, IMAGE_DESCRIPTION_VECTOR_COLLECTION,
     IMAGE_VECTOR_COLLECTION, OBJECT_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION,

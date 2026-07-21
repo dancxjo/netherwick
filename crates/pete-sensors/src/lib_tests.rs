@@ -169,6 +169,59 @@ fn now_builder_publishes_replayable_latency_epochs_and_correlated_rotation() {
 }
 
 #[test]
+fn now_builder_captures_advisory_locomotion_calibration_without_applying_it() {
+    let mut builder = NowBuilder::new();
+    let conditions = pete_now::LocomotionConditions {
+        surface: Some("synthetic_floor".to_string()),
+        tire_condition: Some("nominal".to_string()),
+    };
+    for index in 0..5_u64 {
+        assert!(builder.observe_straight_calibration_episode(
+            pete_now::StraightCalibrationEpisode {
+                captured_at_ms: 1_000 + index,
+                direction: pete_now::TravelDirection::Forward,
+                reported_distance_m: 2.0,
+                actual_distance_m: 2.04,
+                lateral_drift_m: 0.01,
+                endpoint_heading_error_rad: 0.01,
+                environmental_alignment_residual_m: 0.02,
+                confidence: 0.95,
+                repeated_traversal: true,
+                loop_supported: true,
+                conditions: conditions.clone(),
+            }
+        ));
+        assert!(builder.observe_rotation_calibration_episode(
+            pete_now::RotationCalibrationEpisode {
+                captured_at_ms: 2_000 + index,
+                direction: pete_now::RotationDirection::Clockwise,
+                commanded_angle_rad: std::f32::consts::PI,
+                wheel_odometry_angle_rad: std::f32::consts::PI,
+                imu_angle_rad: Some(std::f32::consts::PI * 1.02),
+                imu_trusted: true,
+                environmental_angle_rad: Some(std::f32::consts::PI * 1.02),
+                environmental_alignment_residual_m: 0.02,
+                loop_angle_rad: Some(std::f32::consts::PI * 1.02),
+                axle_center_displacement_m: 0.01,
+                confidence: 0.95,
+                conditions: conditions.clone(),
+            }
+        ));
+    }
+    let now = builder
+        .build(3_000, BodySense::default(), Vec::new())
+        .unwrap();
+    let state: pete_now::LocomotionCalibrationState =
+        serde_json::from_value(now.extensions["calibration.locomotion"].clone()).unwrap();
+    assert_eq!(
+        state.trust_state,
+        pete_now::LocomotionCalibrationTrustState::Trusted
+    );
+    assert!(state.authority.contains("brainstem"));
+    assert_eq!(builder.snapshot().locomotion_calibration.epoch, state.epoch);
+}
+
+#[test]
 fn imu_auto_rejects_stale_unhealthy_future_and_untrusted_override() {
     let mut arbiter = ImuArbiter::default();
     arbiter.observe(trustworthy_imu("brainstem_board_imu", 990, 0), 1_000);

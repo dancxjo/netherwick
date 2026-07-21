@@ -6,6 +6,12 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Add advisory bounded locomotion calibration with conservative nominal
+  fallback, global/left/right/forward/reverse distance estimates, independent
+  CW/CCW rotation scale and effective wheelbase, condition epochs, uncertainty,
+  rejection and held-out validation, retained replay episodes, and capture
+  provenance without changing motor or brainstem safety authority.
+
 - Add per-stream end-to-end latency calibration with raw timestamp/clock/event
   provenance, median/p95/jitter/uncertainty distributions, correlated rotation
   evidence, drift and clock epochs, held-out validation, replayable capture

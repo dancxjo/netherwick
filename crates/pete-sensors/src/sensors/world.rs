@@ -18,6 +18,8 @@ pub struct WorldSnapshot {
     pub voice: VoiceSense,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub latency_calibration: BTreeMap<String, pete_now::StreamLatencyCalibration>,
+    #[serde(default)]
+    pub locomotion_calibration: pete_now::LocomotionCalibrationState,
     pub extensions: Vec<ExtensionSense>,
 }
 
@@ -64,6 +66,7 @@ impl Default for WorldSnapshot {
                 ..VoiceSense::default()
             },
             latency_calibration: BTreeMap::new(),
+            locomotion_calibration: pete_now::LocomotionCalibrationState::default(),
             extensions: Vec::new(),
         }
     }
@@ -89,6 +92,11 @@ impl WorldSnapshot {
                     .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
             );
         }
+        now.extensions.insert(
+            "calibration.locomotion".to_string(),
+            serde_json::to_value(&self.locomotion_calibration)
+                .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
+        );
         now.predictions = PredictionSense {
             schema_version: 1,
             ..PredictionSense::default()

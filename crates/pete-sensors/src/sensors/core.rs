@@ -152,6 +152,7 @@ pub struct NowBuilder {
     latency_calibration: SensorLatencyRegistry,
     body_rotation_sign: i8,
     stream_rotation_signs: BTreeMap<String, i8>,
+    locomotion_calibration: LocomotionCalibrationEstimator,
 }
 
 #[derive(Clone, Default)]
@@ -263,6 +264,20 @@ impl NowBuilder {
         observation: SensorTimingObservation,
     ) {
         self.latency_calibration.observe(stream, observation);
+    }
+
+    pub fn observe_straight_calibration_episode(
+        &mut self,
+        episode: StraightCalibrationEpisode,
+    ) -> bool {
+        self.locomotion_calibration.observe_straight(episode)
+    }
+
+    pub fn observe_rotation_calibration_episode(
+        &mut self,
+        episode: RotationCalibrationEpisode,
+    ) -> bool {
+        self.locomotion_calibration.observe_rotation(episode)
     }
 
     pub fn build(
@@ -443,6 +458,7 @@ impl NowBuilder {
 
         let latency_calibration = self.latency_calibration.snapshot(t_ms);
         self.last_snapshot.latency_calibration = latency_calibration.clone();
+        self.last_snapshot.locomotion_calibration = self.locomotion_calibration.state().clone();
         if self.last_snapshot.kinect.captured_at_ms > 0 {
             let captured_at_ms = self.last_snapshot.kinect.captured_at_ms;
             self.last_snapshot.kinect.fusion_alignment =

@@ -1160,6 +1160,7 @@ fn export_snapshot_assets_with_context(
         "range_extrinsics": snapshot.range.extrinsics,
         "range_source": snapshot.range.source,
         "sensor_latency": snapshot.latency_calibration,
+        "locomotion": snapshot.locomotion_calibration,
     });
     let rel = capture_asset_path("calibration", index, "json");
     write_json_asset(&root.join(&rel), &calibration)?;

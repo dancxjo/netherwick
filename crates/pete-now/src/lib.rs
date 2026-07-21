@@ -15,6 +15,7 @@ pub mod depth_geometry;
 pub mod epistemic;
 pub mod imu_calibration;
 pub mod latency_calibration;
+pub mod locomotion_calibration;
 pub mod semantic;
 pub mod social;
 pub mod temporal;
@@ -50,6 +51,11 @@ pub use imu_calibration::{
 pub use latency_calibration::{
     LatencyCalibrationConfig, LatencyDistribution, LatencyEventFeature, LatencyTrustState,
     SensorLatencyRegistry, SensorTimingObservation, StreamLatencyCalibration,
+};
+pub use locomotion_calibration::{
+    BoundedEstimate, LocomotionCalibrationConfig, LocomotionCalibrationEstimator,
+    LocomotionCalibrationState, LocomotionCalibrationTrustState, LocomotionConditions,
+    RotationCalibrationEpisode, RotationDirection, StraightCalibrationEpisode, TravelDirection,
 };
 pub use semantic::{
     SemanticActionId, SemanticBehaviorId, SemanticConceptId, SemanticContext, SemanticDriveId,
