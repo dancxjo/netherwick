@@ -135,13 +135,30 @@ const COGNITION_DEADLINE_MS: u64 = 2_000;
 /// disabled provider cannot turn the organism tick into a request generator.
 const COGNITION_COOLDOWN_MS: u64 = 2_000;
 
-#[derive(Default)]
 struct RuntimeCognition {
     pending: Option<PendingLlmCognition>,
     next_request_at_ms: u64,
     last_sense: pete_now::LlmSense,
     last_sense_valid_until_ms: u64,
     last_outcome: Option<CognitionOutcome>,
+    provider_declared_available: bool,
+    provider_unavailable_reason: Option<String>,
+}
+
+impl RuntimeCognition {
+    fn from_agent(agent: &impl LlmAgent) -> Self {
+        Self {
+            pending: None,
+            next_request_at_ms: 0,
+            last_sense: pete_now::LlmSense::default(),
+            last_sense_valid_until_ms: 0,
+            last_outcome: None,
+            provider_declared_available: agent.enhanced_cognition_available(),
+            provider_unavailable_reason: agent
+                .enhanced_cognition_unavailable_reason()
+                .map(str::to_string),
+        }
+    }
 }
 
 struct PendingLlmCognition {
@@ -3094,6 +3111,7 @@ where
         safety: S,
         llm: A,
     ) -> Self {
+        let cognition = RuntimeCognition::from_agent(&llm);
         Self {
             ledger,
             memory_store,
@@ -3124,7 +3142,7 @@ where
             sleep_controller: SleepController::default(),
             semantic_outcomes: SemanticOutcomeTracker::default(),
             last_active_control: None,
-            cognition: RuntimeCognition::default(),
+            cognition,
         }
     }
 
@@ -3137,6 +3155,7 @@ where
         llm: A,
         reign_queue: Arc<Mutex<ReignQueue>>,
     ) -> Self {
+        let cognition = RuntimeCognition::from_agent(&llm);
         Self {
             ledger,
             memory_store,
@@ -3167,7 +3186,7 @@ where
             sleep_controller: SleepController::default(),
             semantic_outcomes: SemanticOutcomeTracker::default(),
             last_active_control: None,
-            cognition: RuntimeCognition::default(),
+            cognition,
         }
     }
 
@@ -3297,7 +3316,10 @@ where
             }
         }
 
-        if self.cognition.pending.is_none() && now.t_ms >= self.cognition.next_request_at_ms {
+        if self.cognition.provider_declared_available
+            && self.cognition.pending.is_none()
+            && now.t_ms >= self.cognition.next_request_at_ms
+        {
             let llm = Arc::clone(&self.llm);
             let request_now = now.clone();
             let request_impressions = impressions.to_vec();
@@ -3795,20 +3817,26 @@ where
         world_context.active_control = self.last_active_control.clone();
         world_context.semantic_observations = self.semantic_outcomes.take_pending();
         let cognition_busy = self.cognition.pending.is_some();
-        let cognition_failure =
-            self.cognition
-                .last_outcome
-                .as_ref()
-                .and_then(|outcome| match outcome {
-                    CognitionOutcome::Failed(error) => Some(error.clone()),
-                    CognitionOutcome::Expired => Some("latest request expired".to_string()),
-                    CognitionOutcome::Cancelled => Some("latest request was cancelled".to_string()),
-                    _ => None,
-                });
+        let cognition_failure = self
+            .cognition
+            .last_outcome
+            .as_ref()
+            .and_then(|outcome| match outcome {
+                CognitionOutcome::Failed(error) => Some(error.clone()),
+                CognitionOutcome::Expired => Some("latest request expired".to_string()),
+                CognitionOutcome::Cancelled => Some("latest request was cancelled".to_string()),
+                _ => None,
+            })
+            .or_else(|| {
+                (!self.cognition.provider_declared_available)
+                    .then(|| self.cognition.provider_unavailable_reason.clone())
+                    .flatten()
+            });
         // Occupancy and health are separate: a pending task means the healthy
         // service is busy, not unavailable. The post-request cooldown is idle,
         // healthy time rather than either an outage or request occupancy.
-        let enhanced_cognition_available = cognition_failure.is_none();
+        let enhanced_cognition_available =
+            self.cognition.provider_declared_available && cognition_failure.is_none();
         world_context.cognitive_services.insert(
             "rich_language".to_string(),
             CognitiveServiceBelief {
@@ -16995,6 +17023,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_cognition_is_unavailable_without_scheduling_provider_work() {
+        let ledger = JsonlLedger::new("/tmp/pete-runtime-disabled-cognition-service-test");
+        let memory = InMemoryExperienceStore::new();
+        let mut runtime = MinimalRuntime::new(
+            ledger,
+            memory.clone(),
+            memory,
+            FixedConductor::new(ActionPrimitive::Stop),
+            SimpleSafety::default(),
+            pete_llm::NoopLlmAgent,
+        );
+
+        let tick = runtime
+            .tick(idle_now(100), ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+        let service = &tick.frame.now.world.self_model.service_state.services["rich_language"];
+
+        assert!(!service.available);
+        assert!(!service.busy);
+        assert_eq!(
+            service.unavailable_reason.as_deref(),
+            Some("enhanced language service is disabled")
+        );
+        assert!(runtime.cognition.pending.is_none());
+        assert_eq!(tick.chosen_action, Some(ActionPrimitive::Stop));
+    }
+
+    #[tokio::test]
     async fn paused_runtime_clock_does_not_expire_completed_cognition() {
         let ledger = JsonlLedger::new("/tmp/pete-runtime-cognition-paused-clock-test");
         let mut runtime = test_runtime(ledger, FixedConductor::new(ActionPrimitive::Stop));
@@ -17271,7 +17328,7 @@ mod tests {
             ledger,
             memory,
             recall,
-            SimpleConductor::default(),
+            FixedConductor::new(ActionPrimitive::Stop),
             SimpleSafety::default(),
             FixedLlmAgent {
                 action: ActionPrimitive::Go {
