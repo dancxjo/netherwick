@@ -255,6 +255,11 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     let env_report = collect_hardware_env_report().await;
     let llm_config = configured_llm_config(&args.llm)?;
     let llm_status = llm_startup_status(&llm_config, args.require_llm).await;
+    // Optional model discovery can download or initialize a large face model.
+    // Finish that work before acquiring physical possession so it cannot delay
+    // brainstem polling or the motion heartbeat.
+    let mut frame_processor_warnings = Vec::new();
+    let frame_processor = real_robot_frame_processor(&mut frame_processor_warnings).await;
     let lidar_device = selected_lidar_device(
         args.lidar.as_deref(),
         args.cockpit == CockpitBackendArg::Sim,
@@ -769,7 +774,6 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         reign_queue,
     );
     let live_image_enricher = LiveImageEnricher::new(llm_config)?;
-    let mut frame_processor_warnings = Vec::new();
     let active_sensor_count = sensors.len();
     let mut initialization = robot_initialization_metadata(
         robot_mode,
@@ -783,7 +787,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     );
     initialization["sensor_startup"] = serde_json::to_value(&sensor_startup)?;
     let mut runner = RealRobotRunner::new(robot_mode, cockpit, sensors, runtime)
-        .with_frame_processor(real_robot_frame_processor(&mut frame_processor_warnings).await)
+        .with_frame_processor(frame_processor)
         .with_live_image_enricher(live_image_enricher)
         .with_robot_initialization(initialization.clone())
         .with_brainstem_interface(serde_json::to_value(&brainstem_capabilities)?)
