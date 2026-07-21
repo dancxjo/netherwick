@@ -1,0 +1,10 @@
+{
+  "id": "legacy:evidence:1",
+  "kind": "evidence",
+  "component": "legacy.capture",
+  "occurred_at_ms": 10,
+  "observed_at_ms": 12,
+  "payload": {
+    "battery": 0.4
+  }
+}

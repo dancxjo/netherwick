@@ -9,6 +9,7 @@ publish = false
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 uuid.workspace = true
 pete-actions = { path = "../pete-actions" }
 pete-autonomic = { path = "../pete-autonomic" }

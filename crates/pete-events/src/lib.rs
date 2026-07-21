@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
+pub mod observability;
+pub use observability::*;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DriveName {
     BatteryHunger,
@@ -1103,3 +1106,7 @@ fn region_id(now: &Now, region_size_m: f32) -> String {
 #[cfg(test)]
 #[path = "lib_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "observability_tests.rs"]
+mod observability_tests;
