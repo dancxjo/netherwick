@@ -217,7 +217,9 @@ async fn possession_reconnect_can_be_cancelled_during_backoff() {
             60_000,
             || {
                 attempts += 1;
-                std::future::ready(Err(anyhow::anyhow!("brainstem remains unavailable")))
+                std::future::ready(Err::<(), _>(anyhow::anyhow!(
+                    "brainstem remains unavailable"
+                )))
             },
             shutdown.as_mut(),
         ),
