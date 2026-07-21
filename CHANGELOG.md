@@ -6,6 +6,11 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Add per-stream end-to-end latency calibration with raw timestamp/clock/event
+  provenance, median/p95/jitter/uncertainty distributions, correlated rotation
+  evidence, drift and clock epochs, held-out validation, replayable capture
+  state, optional-lidar reporting, and timing-aware fusion trust degradation.
+
 - Add adaptive local-IMU calibration with odometry-confirmed stationary windows,
   gyro bias/noise and temperature tracking, gravity-derived mounting, explicit
   yaw observability and rotation-scale evidence, remount epochs, trust-gated

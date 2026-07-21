@@ -124,6 +124,51 @@ fn schema3_imu_requires_trusted_adaptive_calibration() {
 }
 
 #[test]
+fn now_builder_publishes_replayable_latency_epochs_and_correlated_rotation() {
+    let mut builder = NowBuilder::new();
+    let mut final_now = None;
+    for index in 0..16_u64 {
+        let t_ms = 10_000 + index * 100;
+        let turning = index % 2 == 0;
+        let mut body = BodySense {
+            last_update_ms: t_ms - 30,
+            ..BodySense::default()
+        };
+        body.velocity.turn_rad_s = if turning { 0.5 } else { 0.0 };
+        let imu = ImuSense {
+            schema_version: 2,
+            captured_at_ms: t_ms - 10,
+            angular_velocity: vec![0.0, 0.0, if turning { 0.5 } else { 0.0 }],
+            orientation_source: Some("test_imu@0:synthetic".to_string()),
+            ..ImuSense::default()
+        };
+        final_now = Some(
+            builder
+                .build(t_ms, body, vec![SensePacket::Imu(imu)])
+                .unwrap(),
+        );
+    }
+    let states: BTreeMap<String, pete_now::StreamLatencyCalibration> =
+        serde_json::from_value(final_now.unwrap().extensions["sensor.latency_calibration"].clone())
+            .unwrap();
+    assert_eq!(
+        states["body"].trust_state,
+        pete_now::LatencyTrustState::Trusted
+    );
+    assert_eq!(
+        states["imu"].trust_state,
+        pete_now::LatencyTrustState::Trusted
+    );
+    assert_eq!(states["imu"].correlated_event_count, 8);
+    assert_eq!(
+        states["imu"].correlated_offset.as_ref().unwrap().median_ms,
+        20.0
+    );
+    assert!(states["lidar"].optional);
+    assert!(!states["lidar"].enabled);
+}
+
+#[test]
 fn imu_auto_rejects_stale_unhealthy_future_and_untrusted_override() {
     let mut arbiter = ImuArbiter::default();
     arbiter.observe(trustworthy_imu("brainstem_board_imu", 990, 0), 1_000);

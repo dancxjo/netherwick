@@ -149,6 +149,9 @@ pub struct NowBuilder {
     last_updates: SensorUpdateTimes,
     pose_history: VecDeque<(TimeMs, Pose2)>,
     imu_history: VecDeque<ImuSense>,
+    latency_calibration: SensorLatencyRegistry,
+    body_rotation_sign: i8,
+    stream_rotation_signs: BTreeMap<String, i8>,
 }
 
 #[derive(Clone, Default)]
@@ -249,6 +252,19 @@ impl NowBuilder {
         self.last_updates.imu = None;
     }
 
+    pub fn observe_latency_reference_event(&mut self, name: &str, occurred_at_ms: TimeMs) {
+        self.latency_calibration
+            .observe_reference_event(name, occurred_at_ms);
+    }
+
+    pub fn observe_sensor_timing(
+        &mut self,
+        stream: &str,
+        observation: SensorTimingObservation,
+    ) {
+        self.latency_calibration.observe(stream, observation);
+    }
+
     pub fn build(
         &mut self,
         t_ms: TimeMs,
@@ -262,6 +278,13 @@ impl NowBuilder {
         };
         body.last_update_ms = body_sample_ms;
         self.last_updates.body = Some(body_sample_ms);
+        observe_body_timing(
+            &mut self.latency_calibration,
+            &mut self.body_rotation_sign,
+            &body,
+            body_sample_ms,
+            t_ms,
+        );
         push_timestamped_pose(&mut self.pose_history, body_sample_ms, body.odometry);
         self.last_snapshot.body = body;
         self.last_snapshot.extensions.clear();
@@ -270,10 +293,20 @@ impl NowBuilder {
         for packet in packets {
             match packet {
                 SensePacket::Eye(eye) => {
+                    observe_packet_timing(&mut self.latency_calibration, "camera", None, t_ms, 0, 0.0, Vec::new());
                     self.last_snapshot.eye = eye;
                     self.last_updates.eye = Some(t_ms);
                 }
                 SensePacket::EyeFrame(frame) => {
+                    observe_packet_timing(
+                        &mut self.latency_calibration,
+                        "camera",
+                        nonzero_time(frame.captured_at_ms),
+                        t_ms,
+                        0,
+                        1.0,
+                        Vec::new(),
+                    );
                     self.last_snapshot.eye.frames = vec![bytes_to_unit_signal(&frame.bytes)];
                     let captured_at_ms = frame.captured_at_ms;
                     self.last_snapshot.eye_frame = Some(frame);
@@ -284,15 +317,43 @@ impl NowBuilder {
                     });
                 }
                 SensePacket::Ear(ear) => {
+                    observe_packet_timing(&mut self.latency_calibration, "audio", None, t_ms, 0, 0.0, Vec::new());
                     self.last_snapshot.ear = ear;
                     self.last_updates.ear = Some(t_ms);
                 }
                 SensePacket::EarPcm(frame) => {
+                    observe_packet_timing(
+                        &mut self.latency_calibration,
+                        "audio",
+                        nonzero_time(frame.captured_at_ms),
+                        t_ms,
+                        0,
+                        1.0,
+                        Vec::new(),
+                    );
                     self.last_snapshot.ear.features = vec![pcm_to_unit_signal(&frame.samples)];
                     self.last_snapshot.ear_pcm = Some(frame);
                     self.last_updates.ear = Some(t_ms);
                 }
                 SensePacket::Range(mut range) => {
+                    let timing_stream = if range
+                        .source
+                        .as_deref()
+                        .is_some_and(|source| source.contains("lidar") || source.contains("lfcd"))
+                    {
+                        "lidar"
+                    } else {
+                        "range"
+                    };
+                    observe_packet_timing(
+                        &mut self.latency_calibration,
+                        timing_stream,
+                        nonzero_time(range.captured_at_ms),
+                        t_ms,
+                        0,
+                        1.0,
+                        Vec::new(),
+                    );
                     align_range_beam_poses(&mut range, &self.pose_history);
                     let captured_at_ms = range.captured_at_ms;
                     self.last_snapshot.range = range;
@@ -304,6 +365,23 @@ impl NowBuilder {
                     saw_range_packet = true;
                 }
                 SensePacket::Imu(imu) => {
+                    let source_epoch = imu.source_epoch();
+                    let source_name = imu.source_id().unwrap_or("imu").to_string();
+                    let event_features = rotation_event_features(
+                        &mut self.stream_rotation_signs,
+                        &source_name,
+                        imu.angular_velocity.get(2).copied().unwrap_or(0.0),
+                        imu.captured_at_ms,
+                    );
+                    observe_packet_timing(
+                        &mut self.latency_calibration,
+                        "imu",
+                        nonzero_time(imu.captured_at_ms),
+                        t_ms,
+                        source_epoch,
+                        1.0,
+                        event_features,
+                    );
                     push_timestamped_imu(&mut self.imu_history, &imu, t_ms);
                     let captured_at_ms = imu.captured_at_ms;
                     self.last_snapshot.imu = imu;
@@ -318,6 +396,15 @@ impl NowBuilder {
                     self.last_updates.gps = Some(t_ms);
                 }
                 SensePacket::Kinect(kinect) => {
+                    observe_packet_timing(
+                        &mut self.latency_calibration,
+                        "kinect",
+                        nonzero_time(kinect.captured_at_ms),
+                        t_ms,
+                        0,
+                        1.0,
+                        Vec::new(),
+                    );
                     let captured_at_ms = kinect.captured_at_ms;
                     if let Some(color_frame) = kinect.color_frame.clone() {
                         self.last_updates.eye = Some(color_frame.captured_at_ms);
@@ -354,10 +441,16 @@ impl NowBuilder {
             }
         }
 
+        let latency_calibration = self.latency_calibration.snapshot(t_ms);
+        self.last_snapshot.latency_calibration = latency_calibration.clone();
         if self.last_snapshot.kinect.captured_at_ms > 0 {
             let captured_at_ms = self.last_snapshot.kinect.captured_at_ms;
             self.last_snapshot.kinect.fusion_alignment =
                 fusion_alignment_at(&self.pose_history, &self.imu_history, captured_at_ms);
+            apply_latency_fusion_trust(
+                &mut self.last_snapshot.kinect.fusion_alignment,
+                &latency_calibration,
+            );
         }
 
         let mut now = self.last_snapshot.to_now(t_ms);
@@ -373,6 +466,124 @@ impl NowBuilder {
 
     pub fn snapshot(&self) -> WorldSnapshot {
         self.last_snapshot.clone()
+    }
+}
+
+fn nonzero_time(value: TimeMs) -> Option<TimeMs> {
+    (value > 0).then_some(value)
+}
+
+fn observe_packet_timing(
+    registry: &mut SensorLatencyRegistry,
+    stream: &str,
+    producer_time_ms: Option<TimeMs>,
+    receive_time_ms: TimeMs,
+    clock_epoch: u64,
+    clock_confidence: f32,
+    event_features: Vec<LatencyEventFeature>,
+) {
+    registry.observe(
+        stream,
+        SensorTimingObservation {
+            producer_time_ms,
+            receive_time_ms,
+            canonical_frame_time_ms: receive_time_ms,
+            clock_epoch,
+            clock_confidence,
+            event_features,
+        },
+    );
+}
+
+fn observe_body_timing(
+    registry: &mut SensorLatencyRegistry,
+    last_rotation_sign: &mut i8,
+    body: &BodySense,
+    producer_time_ms: TimeMs,
+    receive_time_ms: TimeMs,
+) {
+    let sign = rotation_sign(body.velocity.turn_rad_s);
+    if sign != 0 && sign != *last_rotation_sign {
+        registry.observe_reference_event(rotation_event_name(sign), producer_time_ms);
+    }
+    *last_rotation_sign = sign;
+    observe_packet_timing(
+        registry,
+        "body",
+        Some(producer_time_ms),
+        receive_time_ms,
+        0,
+        1.0,
+        Vec::new(),
+    );
+}
+
+fn rotation_event_features(
+    signs: &mut BTreeMap<String, i8>,
+    source: &str,
+    angular_rate: f32,
+    occurred_at_ms: TimeMs,
+) -> Vec<LatencyEventFeature> {
+    let sign = rotation_sign(angular_rate);
+    let previous = signs.insert(source.to_string(), sign).unwrap_or(0);
+    if sign == 0 || sign == previous {
+        return Vec::new();
+    }
+    vec![LatencyEventFeature {
+        name: rotation_event_name(sign).to_string(),
+        value: angular_rate,
+        occurred_at_ms,
+    }]
+}
+
+fn rotation_sign(rate: f32) -> i8 {
+    if rate > 0.08 {
+        1
+    } else if rate < -0.08 {
+        -1
+    } else {
+        0
+    }
+}
+
+fn rotation_event_name(sign: i8) -> &'static str {
+    if sign > 0 {
+        "rotation_ccw_started"
+    } else {
+        "rotation_cw_started"
+    }
+}
+
+fn apply_latency_fusion_trust(
+    alignment: &mut Option<KinectFusionAlignment>,
+    states: &BTreeMap<String, pete_now::StreamLatencyCalibration>,
+) {
+    if ["kinect", "imu"].iter().any(|stream| {
+        states.get(*stream).is_some_and(|state| {
+            matches!(
+                state.trust_state,
+                LatencyTrustState::Degraded | LatencyTrustState::Invalidated
+            )
+        })
+    }) {
+        *alignment = None;
+        return;
+    }
+    let Some(alignment) = alignment.as_mut() else {
+        return;
+    };
+    for stream in ["kinect", "imu"] {
+        let Some(state) = states.get(stream) else {
+            alignment.confidence *= 0.25;
+            continue;
+        };
+        match state.trust_state {
+            LatencyTrustState::Trusted => alignment.confidence *= state.confidence.max(0.5),
+            LatencyTrustState::Estimating | LatencyTrustState::Unobservable => {
+                alignment.confidence *= 0.25
+            }
+            LatencyTrustState::Degraded | LatencyTrustState::Invalidated => unreachable!(),
+        }
     }
 }
 

@@ -16,6 +16,8 @@ pub struct WorldSnapshot {
     pub objects: ObjectSense,
     pub face: FaceSense,
     pub voice: VoiceSense,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub latency_calibration: BTreeMap<String, pete_now::StreamLatencyCalibration>,
     pub extensions: Vec<ExtensionSense>,
 }
 
@@ -61,6 +63,7 @@ impl Default for WorldSnapshot {
                 schema_version: 1,
                 ..VoiceSense::default()
             },
+            latency_calibration: BTreeMap::new(),
             extensions: Vec::new(),
         }
     }
@@ -79,6 +82,13 @@ impl WorldSnapshot {
         now.gps = self.gps.clone();
         now.kinect = self.kinect.clone();
         now.objects = self.objects.clone();
+        if !self.latency_calibration.is_empty() {
+            now.extensions.insert(
+                "sensor.latency_calibration".to_string(),
+                serde_json::to_value(&self.latency_calibration)
+                    .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
+            );
+        }
         now.predictions = PredictionSense {
             schema_version: 1,
             ..PredictionSense::default()
