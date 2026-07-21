@@ -61,9 +61,6 @@ impl VoxelPointCloud {
 
     pub fn integrate_observation(&mut self, observation: PointCloudObservation) {
         self.retained_observations.push(observation.clone());
-        if self.retained_observations.len() > 256 {
-            self.retained_observations.remove(0);
-        }
         self.pose_graph_corrections_applied = false;
         self.last_pose_graph_revision = None;
         self.integrate_observation_points(&observation);
