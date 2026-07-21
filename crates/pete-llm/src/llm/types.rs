@@ -374,6 +374,12 @@ pub struct LlmConfig {
     pub enrich_live_images: bool,
     pub temperature: f32,
     pub timeout_ms: u64,
+    /// Ollama context-window bound. `None` leaves the model/server default intact.
+    pub num_ctx: Option<u32>,
+    /// Ollama generated-token bound. `None` leaves the model/server default intact.
+    pub num_predict: Option<i32>,
+    /// Ollama CPU-thread bound. `None` leaves scheduling to the model/server.
+    pub num_thread: Option<u32>,
 }
 
 impl Default for LlmConfig {
@@ -402,6 +408,9 @@ impl Default for LlmConfig {
             enrich_live_images: true,
             temperature: 0.2,
             timeout_ms: DEFAULT_OLLAMA_TIMEOUT_MS,
+            num_ctx: None,
+            num_predict: None,
+            num_thread: None,
         }
     }
 }

@@ -51,6 +51,9 @@ async fn run_sim(args: SimArgs) -> Result<()> {
             tick_ms: Some(args.tick_delay_ms),
             control_state: None,
             control_detail: None,
+            safety_class: None,
+            independent_watchdog: None,
+            motion_surface: None,
         });
         live_state.update_training_status(pete_server::LiveTrainingStatus {
             training_mode: inline_learning.training_mode_label().to_string(),

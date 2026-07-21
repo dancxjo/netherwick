@@ -379,6 +379,7 @@ fn possession_attempt(
         "--capture".to_owned(),
         env_or("PETE_POSSESSION_CAPTURE", "data/captures/real/possession"),
     ];
+    robot_args.extend(rpi5_motion_surface_args(backend, args));
     robot_args.extend(possession_sense_args(sense_profile, args));
     if explicit_tick_ms.is_none() {
         robot_args.extend(["--tick-ms".to_owned(), tick_ms]);
@@ -396,6 +397,19 @@ fn possession_attempt(
     overrides.extend(possession_sense_overrides(sense_profile));
     let mut command = robot_process(&robot_args, &overrides)?;
     run_program_captured(&mut command)
+}
+
+fn rpi5_motion_surface_args(backend: &str, caller_args: &[String]) -> Vec<String> {
+    if backend == "local"
+        && !caller_args
+            .iter()
+            .any(|arg| arg == "--acknowledge-no-independent-watchdog")
+        && !caller_args.iter().any(|arg| arg == "--wheels-off-floor")
+    {
+        vec!["--wheels-off-floor".to_owned()]
+    } else {
+        Vec::new()
+    }
 }
 
 fn possession_sense_args(

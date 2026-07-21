@@ -1,5 +1,8 @@
 use std::fs as std_fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::thread::JoinHandle;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -11,12 +14,15 @@ use pete_sensors::{EyeFrameFormat, PcmAudioFrame, WorldSnapshot};
 use pete_sim::ScenarioMetadata;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_stream::{self as stream, Stream};
 use uuid::Uuid;
 
-pub const CAPTURE_SCHEMA_VERSION: u32 = 1;
+pub const CAPTURE_SCHEMA_VERSION: u32 = 2;
+pub const CAPTURE_QUEUE_CAPACITY: usize = 4;
+const ASSET_LATE_AFTER_MS: u64 = 1_000;
 const MANIFEST_FILE: &str = "manifest.json";
 const FRAMES_FILE: &str = "frames.jsonl";
 const EVENTS_FILE: &str = "events.jsonl";
@@ -36,6 +42,8 @@ pub struct CaptureManifest {
     pub machine: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub firmware_identity: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brainstem_safety: Option<Value>,
     #[serde(default)]
     pub command_args: Vec<String>,
     #[serde(default)]
@@ -52,6 +60,8 @@ pub struct CaptureManifest {
     pub asset_layout: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scenario: Option<ScenarioMetadata>,
+    #[serde(default)]
+    pub writer_health: CaptureWriterHealth,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +107,16 @@ pub struct CaptureFrameAssets {
     pub pointcloud: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perception: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lidar: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imu: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration: Option<String>,
 }
 
 impl CaptureFrameAssets {
@@ -106,14 +126,59 @@ impl CaptureFrameAssets {
             && self.audio.is_none()
             && self.pointcloud.is_none()
             && self.perception.is_none()
+            && self.camera.is_none()
+            && self.lidar.is_none()
+            && self.imu.is_none()
+            && self.transcript.is_none()
+            && self.calibration.is_none()
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureWriterHealth {
+    pub queue_capacity: usize,
+    pub submitted_frames: u64,
+    pub written_frames: u64,
+    pub dropped_frames: u64,
+    #[serde(default)]
+    pub dropped_assets: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    pub write_failures: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CaptureExportContext {
+    pub imu_selection: Option<Value>,
+}
+
+struct QueuedCaptureFrame {
+    index: u64,
+    t_ms: u64,
+    snapshot: WorldSnapshot,
+    events: Vec<RecordedEvent>,
+    export_rgb: bool,
+    export_depth: bool,
+    export_audio: bool,
+    context: CaptureExportContext,
+}
+
+enum BackgroundCommand {
+    Frame(QueuedCaptureFrame),
+    Finish,
+}
+
+struct BackgroundCaptureWriter {
+    sender: SyncSender<BackgroundCommand>,
+    worker: JoinHandle<Result<CaptureWriterHealth>>,
 }
 
 pub struct CaptureWriter {
     root: PathBuf,
     manifest: CaptureManifest,
-    frames: File,
+    frames: Option<File>,
     frame_count: u64,
+    background: Option<BackgroundCaptureWriter>,
+    writer_health: CaptureWriterHealth,
 }
 
 impl CaptureWriter {
@@ -127,6 +192,11 @@ impl CaptureWriter {
         fs::create_dir_all(root.join("assets").join("depth")).await?;
         fs::create_dir_all(root.join("assets").join("audio")).await?;
         fs::create_dir_all(root.join("assets").join("pointcloud")).await?;
+        fs::create_dir_all(root.join("assets").join("camera")).await?;
+        fs::create_dir_all(root.join("assets").join("lidar")).await?;
+        fs::create_dir_all(root.join("assets").join("imu")).await?;
+        fs::create_dir_all(root.join("assets").join("transcript")).await?;
+        fs::create_dir_all(root.join("assets").join("calibration")).await?;
         File::create(root.join(EVENTS_FILE)).await?;
 
         let now_ms = Utc::now().timestamp_millis().max(0) as u64;
@@ -140,6 +210,7 @@ impl CaptureWriter {
             notes: Vec::new(),
             machine: None,
             firmware_identity: None,
+            brainstem_safety: None,
             command_args: Vec::new(),
             device_availability: Value::Null,
             streams: CaptureStreams::default(),
@@ -148,6 +219,10 @@ impl CaptureWriter {
             warnings: Vec::new(),
             asset_layout: default_asset_layout(),
             scenario: None,
+            writer_health: CaptureWriterHealth {
+                queue_capacity: CAPTURE_QUEUE_CAPACITY,
+                ..CaptureWriterHealth::default()
+            },
         };
         write_manifest_atomic(&root, &manifest).await?;
 
@@ -161,8 +236,13 @@ impl CaptureWriter {
         Ok(Self {
             root,
             manifest,
-            frames,
+            frames: Some(frames),
             frame_count: 0,
+            background: None,
+            writer_health: CaptureWriterHealth {
+                queue_capacity: CAPTURE_QUEUE_CAPACITY,
+                ..CaptureWriterHealth::default()
+            },
         })
     }
 
@@ -199,9 +279,15 @@ impl CaptureWriter {
             stream_metadata,
         };
         let line = serde_json::to_string(&record)?;
-        self.frames.write_all(line.as_bytes()).await?;
-        self.frames.write_all(b"\n").await?;
+        let frames = self
+            .frames
+            .as_mut()
+            .context("direct capture append attempted after background writer started")?;
+        frames.write_all(line.as_bytes()).await?;
+        frames.write_all(b"\n").await?;
         self.frame_count = self.frame_count.saturating_add(1);
+        self.writer_health.submitted_frames = self.writer_health.submitted_frames.saturating_add(1);
+        self.writer_health.written_frames = self.writer_health.written_frames.saturating_add(1);
         Ok(())
     }
 
@@ -214,26 +300,130 @@ impl CaptureWriter {
         export_depth: bool,
         export_audio: bool,
     ) -> Result<()> {
-        let export = export_snapshot_assets(
-            &self.root,
-            self.frame_count,
-            &snapshot,
+        self.append_snapshot_with_exported_assets_and_context(
+            t_ms,
+            snapshot,
+            events,
             export_rgb,
             export_depth,
             export_audio,
-        )?;
-        let metadata = export
-            .metadata
-            .as_object()
-            .is_some_and(|metadata| !metadata.is_empty())
-            .then_some(export.metadata);
-        self.append_snapshot_with_assets(t_ms, snapshot, events, export.assets, metadata)
-            .await
+            CaptureExportContext::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn append_snapshot_with_exported_assets_and_context(
+        &mut self,
+        t_ms: u64,
+        snapshot: WorldSnapshot,
+        events: Vec<RecordedEvent>,
+        export_rgb: bool,
+        export_depth: bool,
+        export_audio: bool,
+        context: CaptureExportContext,
+    ) -> Result<()> {
+        self.ensure_background_writer().await?;
+        let index = self.frame_count;
+        self.frame_count = self.frame_count.saturating_add(1);
+        self.writer_health.submitted_frames = self.writer_health.submitted_frames.saturating_add(1);
+        let frame = QueuedCaptureFrame {
+            index,
+            t_ms,
+            snapshot,
+            events,
+            export_rgb,
+            export_depth,
+            export_audio,
+            context,
+        };
+        let background = self
+            .background
+            .as_ref()
+            .context("background capture writer missing")?;
+        match background.sender.try_send(BackgroundCommand::Frame(frame)) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(BackgroundCommand::Frame(frame))) => {
+                self.writer_health.dropped_frames =
+                    self.writer_health.dropped_frames.saturating_add(1);
+                for kind in requested_asset_kinds(&frame) {
+                    *self.writer_health.dropped_assets.entry(kind).or_default() += 1;
+                }
+                Ok(())
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                anyhow::bail!("background capture writer stopped unexpectedly")
+            }
+            Err(TrySendError::Full(BackgroundCommand::Finish)) => unreachable!(),
+        }
+    }
+
+    async fn ensure_background_writer(&mut self) -> Result<()> {
+        if self.background.is_some() {
+            return Ok(());
+        }
+        let frames = self
+            .frames
+            .take()
+            .context("capture frame file is unavailable")?;
+        let mut frames = frames.into_std().await;
+        let root = self.root.clone();
+        let (sender, receiver) = mpsc::sync_channel(CAPTURE_QUEUE_CAPACITY);
+        let worker = std::thread::Builder::new()
+            .name("pete-capture-writer".to_string())
+            .spawn(move || {
+                let mut health = CaptureWriterHealth {
+                    queue_capacity: CAPTURE_QUEUE_CAPACITY,
+                    ..CaptureWriterHealth::default()
+                };
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        BackgroundCommand::Frame(frame) => {
+                            match write_queued_capture_frame(&root, &mut frames, frame) {
+                                Ok(()) => {
+                                    health.written_frames = health.written_frames.saturating_add(1)
+                                }
+                                Err(error) => {
+                                    health.write_failures.push(format!("{error:#}"));
+                                    return Err(error);
+                                }
+                            }
+                        }
+                        BackgroundCommand::Finish => break,
+                    }
+                }
+                frames.flush()?;
+                Ok(health)
+            })?;
+        self.background = Some(BackgroundCaptureWriter { sender, worker });
+        Ok(())
     }
 
     pub async fn finish(mut self) -> Result<CaptureManifest> {
-        self.frames.flush().await?;
-        self.manifest.frame_count = self.frame_count;
+        if let Some(background) = self.background.take() {
+            background
+                .sender
+                .send(BackgroundCommand::Finish)
+                .map_err(|_| anyhow::anyhow!("background capture writer stopped before finish"))?;
+            let worker_health = tokio::task::spawn_blocking(move || background.worker.join())
+                .await
+                .context("joining background capture writer task")?
+                .map_err(|_| anyhow::anyhow!("background capture writer panicked"))??;
+            self.writer_health.written_frames = worker_health.written_frames;
+            self.writer_health
+                .write_failures
+                .extend(worker_health.write_failures);
+        } else if let Some(frames) = self.frames.as_mut() {
+            frames.flush().await?;
+        }
+        self.manifest.frame_count = self.writer_health.written_frames;
+        self.manifest.writer_health = self.writer_health.clone();
+        if self.writer_health.dropped_frames > 0 {
+            self.manifest.warnings.push(format!(
+                "capture writer queue dropped {} frame(s) and their requested assets: {:?}",
+                self.writer_health.dropped_frames, self.writer_health.dropped_assets
+            ));
+        }
         self.manifest.ended_at_ms = Some(Utc::now().timestamp_millis().max(0) as u64);
         write_manifest_atomic(&self.root, &self.manifest).await?;
         Ok(self.manifest)
@@ -246,6 +436,57 @@ impl CaptureWriter {
     pub fn root(&self) -> &Path {
         &self.root
     }
+}
+
+fn requested_asset_kinds(frame: &QueuedCaptureFrame) -> Vec<String> {
+    let mut kinds = vec![
+        "calibration".to_string(),
+        "lidar".to_string(),
+        "imu".to_string(),
+    ];
+    if frame.export_rgb {
+        kinds.extend(["rgb".to_string(), "camera".to_string()]);
+    }
+    if frame.export_depth {
+        kinds.extend(["depth".to_string(), "pointcloud".to_string()]);
+    }
+    if frame.export_audio {
+        kinds.extend(["audio".to_string(), "transcript".to_string()]);
+    }
+    kinds
+}
+
+fn write_queued_capture_frame(
+    root: &Path,
+    frames: &mut std_fs::File,
+    frame: QueuedCaptureFrame,
+) -> Result<()> {
+    let export = export_snapshot_assets_with_context(
+        root,
+        frame.index,
+        frame.t_ms,
+        &frame.snapshot,
+        frame.export_rgb,
+        frame.export_depth,
+        frame.export_audio,
+        &frame.context,
+    )?;
+    let metadata = export
+        .metadata
+        .as_object()
+        .is_some_and(|metadata| !metadata.is_empty())
+        .then_some(export.metadata);
+    let record = CaptureFrameRecord {
+        index: frame.index,
+        t_ms: frame.t_ms,
+        snapshot: frame.snapshot,
+        events: frame.events,
+        assets: export.assets,
+        stream_metadata: metadata,
+    };
+    serde_json::to_writer(&mut *frames, &record)?;
+    frames.write_all(b"\n")?;
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -365,12 +606,22 @@ fn default_asset_layout() -> Value {
         "audio": "assets/audio/",
         "pointcloud": "assets/pointcloud/",
         "perception": "assets/perception/",
+        "camera": "assets/camera/",
+        "lidar": "assets/lidar/",
+        "imu": "assets/imu/",
+        "transcript": "assets/transcript/",
+        "calibration": "assets/calibration/",
         "paths": "frame asset paths are relative to capture root",
         "rgb_format": "PNG RGB8",
         "depth_format": "PNG Gray16, millimeters",
         "audio_format": "WAV PCM16",
         "pointcloud_format": "PLY ASCII",
-        "perception_format": "JSON PerceptionFrame"
+        "perception_format": "JSON PerceptionFrame",
+        "camera_format": "PNG RGB8",
+        "lidar_format": "JSON RangeSense",
+        "imu_format": "JSON selected sample plus candidate diagnostics",
+        "transcript_format": "JSON EarSense timing and ASR provenance",
+        "calibration_format": "JSON sensor geometry/configuration identity"
     })
 }
 
@@ -424,26 +675,136 @@ pub fn export_snapshot_assets(
     export_depth: bool,
     export_audio: bool,
 ) -> Result<CaptureAssetExport> {
+    export_snapshot_assets_with_context(
+        root,
+        index,
+        0,
+        snapshot,
+        export_rgb,
+        export_depth,
+        export_audio,
+        &CaptureExportContext::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn export_snapshot_assets_with_context(
+    root: &Path,
+    index: u64,
+    capture_t_ms: u64,
+    snapshot: &WorldSnapshot,
+    export_rgb: bool,
+    export_depth: bool,
+    export_audio: bool,
+    context: &CaptureExportContext,
+) -> Result<CaptureAssetExport> {
     let mut assets = CaptureFrameAssets::default();
     let mut metadata = serde_json::Map::new();
 
     if export_rgb {
-        if let Some((width, height, rgb)) = snapshot_rgb8(snapshot) {
-            let rel = capture_asset_path("rgb", index, "png");
-            write_rgb_png(&root.join(&rel), width, height, &rgb)?;
-            assets.rgb = Some(rel);
+        if let Some(frame) = snapshot.kinect.color_frame.as_ref() {
+            if let Some((width, height, rgb)) = eye_frame_rgb8(frame) {
+                let rel = capture_asset_path("rgb", index, "png");
+                write_rgb_png(&root.join(&rel), width, height, &rgb)?;
+                assets.rgb = Some(rel.clone());
+                metadata.insert(
+                    "rgb".to_string(),
+                    written_asset_metadata(
+                        root,
+                        &rel,
+                        capture_t_ms,
+                        Some(frame.captured_at_ms),
+                        serde_json::json!({
+                            "width": width,
+                            "height": height,
+                            "format": "rgb8_png",
+                            "rgbd_frame_id": frame.rgbd_frame_id,
+                            "device_timestamp_ms": frame.device_timestamp_ms,
+                            "source": frame.source,
+                        }),
+                    )?,
+                );
+            } else {
+                metadata.insert(
+                    "rgb".to_string(),
+                    unavailable_asset_metadata(
+                        capture_t_ms,
+                        "unsupported or partial Kinect RGB frame",
+                    ),
+                );
+            }
+        } else {
             metadata.insert(
                 "rgb".to_string(),
-                serde_json::json!({
-                    "width": width,
-                    "height": height,
-                    "format": "rgb8_png",
-                    "captured_at_ms": snapshot.eye_frame.as_ref().map(|frame| frame.captured_at_ms),
-                    "rgbd_frame_id": snapshot.eye_frame.as_ref().and_then(|frame| frame.rgbd_frame_id.as_deref()),
-                    "device_timestamp_ms": snapshot.eye_frame.as_ref().and_then(|frame| frame.device_timestamp_ms),
-                    "source": snapshot.eye_frame.as_ref().and_then(|frame| frame.source.as_deref()),
-                }),
+                unavailable_asset_metadata(capture_t_ms, "Kinect RGB frame unavailable"),
             );
+        }
+
+        if let Some(frame) = snapshot.eye_frame.as_ref() {
+            if let Some((width, height, rgb)) = eye_frame_rgb8(frame) {
+                let rel = capture_asset_path("camera", index, "png");
+                write_rgb_png(&root.join(&rel), width, height, &rgb)?;
+                assets.camera = Some(rel.clone());
+                metadata.insert(
+                    "camera".to_string(),
+                    written_asset_metadata(
+                        root,
+                        &rel,
+                        capture_t_ms,
+                        Some(frame.captured_at_ms),
+                        serde_json::json!({
+                            "width": width,
+                            "height": height,
+                            "format": "rgb8_png",
+                            "rgbd_frame_id": frame.rgbd_frame_id,
+                            "device_timestamp_ms": frame.device_timestamp_ms,
+                            "source": frame.source,
+                        }),
+                    )?,
+                );
+            } else {
+                metadata.insert(
+                    "camera".to_string(),
+                    unavailable_asset_metadata(capture_t_ms, "unsupported or partial camera frame"),
+                );
+            }
+        } else if assets.rgb.is_none() {
+            // Older single-camera captures used eye_frame for Kinect RGB. Keep
+            // the compact fallback useful without claiming a raw camera asset.
+            if let Some((width, height, rgb)) = snapshot_rgb8(snapshot) {
+                let rel = capture_asset_path("rgb", index, "png");
+                write_rgb_png(&root.join(&rel), width, height, &rgb)?;
+                assets.rgb = Some(rel.clone());
+                metadata.insert(
+                    "rgb".to_string(),
+                    written_asset_metadata(root, &rel, capture_t_ms, None, serde_json::json!({
+                        "width": width, "height": height, "format": "rgb8_png", "source": "compact_eye_features"
+                    }))?,
+                );
+            }
+        } else {
+            metadata.insert(
+                "camera".to_string(),
+                unavailable_asset_metadata(capture_t_ms, "camera frame unavailable"),
+            );
+        }
+        if assets.rgb.is_none() {
+            if let Some((width, height, rgb)) = snapshot_rgb8(snapshot) {
+                let rel = capture_asset_path("rgb", index, "png");
+                write_rgb_png(&root.join(&rel), width, height, &rgb)?;
+                assets.rgb = Some(rel.clone());
+                let producer_t_ms = snapshot
+                    .eye_frame
+                    .as_ref()
+                    .map(|frame| frame.captured_at_ms);
+                metadata.insert(
+                    "rgb".to_string(),
+                    written_asset_metadata(root, &rel, capture_t_ms, producer_t_ms, serde_json::json!({
+                        "width": width, "height": height, "format": "rgb8_png",
+                        "source": snapshot.eye_frame.as_ref().and_then(|frame| frame.source.as_deref()).unwrap_or("compact_eye_features"),
+                    }))?,
+                );
+            }
         }
     }
 
@@ -451,20 +812,30 @@ pub fn export_snapshot_assets(
         if let Some(depth) = snapshot_depth_image(snapshot) {
             let rel = capture_asset_path("depth", index, "depth16.png");
             write_depth_png(&root.join(&rel), &depth)?;
-            assets.depth = Some(rel);
+            assets.depth = Some(rel.clone());
             metadata.insert(
                 "depth".to_string(),
-                serde_json::json!({
-                    "width": depth.width,
-                    "height": depth.height,
-                    "format": "gray16_png",
-                    "units": "millimeters",
-                    "scale": 0.001,
-                    "captured_at_ms": snapshot.kinect.captured_at_ms,
-                    "rgbd_frame_id": snapshot.kinect.rgbd_frame_id.as_deref(),
-                    "device_timestamp_ms": snapshot.kinect.device_timestamp_ms,
-                    "coordinate_system": snapshot.kinect.depth_coordinate_system.as_deref(),
-                }),
+                written_asset_metadata(
+                    root,
+                    &rel,
+                    capture_t_ms,
+                    Some(snapshot.kinect.captured_at_ms),
+                    serde_json::json!({
+                        "width": depth.width, "height": depth.height, "format": "gray16_png",
+                        "units": "millimeters", "scale": 0.001,
+                        "rgbd_frame_id": snapshot.kinect.rgbd_frame_id,
+                        "device_timestamp_ms": snapshot.kinect.device_timestamp_ms,
+                        "coordinate_system": snapshot.kinect.depth_coordinate_system,
+                    }),
+                )?,
+            );
+        } else {
+            metadata.insert(
+                "depth".to_string(),
+                unavailable_asset_metadata(
+                    capture_t_ms,
+                    "depth frame unavailable or dimensions are partial",
+                ),
             );
         }
     }
@@ -473,16 +844,181 @@ pub fn export_snapshot_assets(
         if let Some(audio) = &snapshot.ear_pcm {
             let rel = capture_asset_path("audio", index, "wav");
             write_wav(&root.join(&rel), audio)?;
-            assets.audio = Some(rel);
+            assets.audio = Some(rel.clone());
             metadata.insert(
                 "audio".to_string(),
+                written_asset_metadata(
+                    root,
+                    &rel,
+                    capture_t_ms,
+                    Some(audio.captured_at_ms),
+                    serde_json::json!({
+                        "sample_rate_hz": audio.sample_rate_hz, "channels": audio.channels,
+                        "format": "pcm16_wav", "samples": audio.samples.len(),
+                    }),
+                )?,
+            );
+        } else {
+            metadata.insert(
+                "audio".to_string(),
+                unavailable_asset_metadata(capture_t_ms, "PCM audio chunk unavailable"),
+            );
+        }
+    }
+
+    if !snapshot.range.beams.is_empty() || snapshot.range.nearest_m.is_some() {
+        let rel = capture_asset_path("lidar", index, "json");
+        write_json_asset(&root.join(&rel), &snapshot.range)?;
+        assets.lidar = Some(rel.clone());
+        metadata.insert(
+            "lidar".to_string(),
+            written_asset_metadata(
+                root,
+                &rel,
+                capture_t_ms,
+                Some(snapshot.range.captured_at_ms),
                 serde_json::json!({
-                    "sample_rate_hz": audio.sample_rate_hz,
-                    "channels": audio.channels,
-                    "format": "pcm16_wav",
-                    "samples": audio.samples.len(),
-                    "captured_at_ms": audio.captured_at_ms,
+                    "format": "range_sense_json", "beams": snapshot.range.beams.len(),
+                    "source": snapshot.range.source, "frame": snapshot.range.frame,
+                    "producer_time_offsets": snapshot.range.beam_time_offsets_ms.len(),
+                    "interpolated_beam_poses": snapshot.range.beam_poses.len(),
                 }),
+            )?,
+        );
+    } else {
+        metadata.insert(
+            "lidar".to_string(),
+            unavailable_asset_metadata(capture_t_ms, "lidar sweep unavailable"),
+        );
+    }
+
+    let has_imu = !snapshot.imu.orientation.is_empty()
+        || !snapshot.imu.acceleration.is_empty()
+        || !snapshot.imu.angular_velocity.is_empty()
+        || context.imu_selection.is_some();
+    if has_imu {
+        let rel = capture_asset_path("imu", index, "json");
+        let value = serde_json::json!({
+            "selected": snapshot.imu,
+            "selection": context.imu_selection,
+        });
+        write_json_asset(&root.join(&rel), &value)?;
+        assets.imu = Some(rel.clone());
+        metadata.insert(
+            "imu".to_string(),
+            written_asset_metadata(root, &rel, capture_t_ms, Some(snapshot.imu.captured_at_ms), serde_json::json!({
+                "format": "imu_selection_json", "selected_source": snapshot.imu.source_id(),
+                "source_epoch": snapshot.imu.source_epoch(),
+                "candidate_count": context.imu_selection.as_ref().and_then(|value| value.get("candidates")).and_then(Value::as_array).map(Vec::len).unwrap_or(0),
+            }))?,
+        );
+    } else {
+        metadata.insert(
+            "imu".to_string(),
+            unavailable_asset_metadata(
+                capture_t_ms,
+                "selected and candidate IMU samples unavailable",
+            ),
+        );
+    }
+
+    if snapshot.ear.transcript.is_some()
+        || snapshot.ear.asr.transcript.is_some()
+        || !snapshot.ear.asr.candidate_events.is_empty()
+    {
+        let rel = capture_asset_path("transcript", index, "json");
+        write_json_asset(&root.join(&rel), &snapshot.ear)?;
+        assets.transcript = Some(rel.clone());
+        metadata.insert(
+            "transcript".to_string(),
+            written_asset_metadata(
+                root,
+                &rel,
+                capture_t_ms,
+                snapshot.ear.asr.start_ms,
+                serde_json::json!({
+                    "format": "ear_sense_json", "start_ms": snapshot.ear.asr.start_ms,
+                    "end_ms": snapshot.ear.asr.end_ms, "is_final": snapshot.ear.asr.is_final,
+                    "candidate_events": snapshot.ear.asr.candidate_events.len(),
+                }),
+            )?,
+        );
+    } else {
+        metadata.insert(
+            "transcript".to_string(),
+            unavailable_asset_metadata(capture_t_ms, "audio transcript unavailable"),
+        );
+    }
+
+    let calibration = serde_json::json!({
+        "kinect_geometry": snapshot.kinect.geometry_calibration,
+        "depth_intrinsics_fallback": {
+            "width": snapshot.kinect.depth_width, "height": snapshot.kinect.depth_height,
+            "fx": snapshot.kinect.depth_fx, "fy": snapshot.kinect.depth_fy,
+            "cx": snapshot.kinect.depth_cx, "cy": snapshot.kinect.depth_cy,
+            "distortion": snapshot.kinect.depth_distortion,
+        },
+        "depth_coordinate_system": snapshot.kinect.depth_coordinate_system,
+        "range_extrinsics": snapshot.range.extrinsics,
+        "range_source": snapshot.range.source,
+    });
+    let rel = capture_asset_path("calibration", index, "json");
+    write_json_asset(&root.join(&rel), &calibration)?;
+    assets.calibration = Some(rel.clone());
+    let calibration_metadata = written_asset_metadata(
+        root,
+        &rel,
+        capture_t_ms,
+        None,
+        serde_json::json!({
+            "format": "sensor_calibration_json",
+            "identity": sha256_bytes(&serde_json::to_vec(&calibration)?),
+            "physically_calibrated": snapshot.kinect.geometry_calibration.is_some_and(|value| value.calibrated),
+        }),
+    )?;
+    metadata.insert("calibration".to_string(), calibration_metadata.clone());
+
+    if export_depth {
+        if let (Some(depth), Some(calibration)) = (
+            snapshot_depth_image(snapshot),
+            snapshot.kinect.geometry_calibration,
+        ) {
+            let rel = capture_asset_path("pointcloud", index, "ply");
+            let intrinsics = CameraIntrinsics {
+                fx: calibration.depth.fx,
+                fy: calibration.depth.fy,
+                cx: calibration.depth.cx,
+                cy: calibration.depth.cy,
+            };
+            let vertices = write_pointcloud_ply(
+                &root.join(&rel),
+                &depth,
+                intrinsics,
+                snapshot.kinect.max_depth_m.max(8.0),
+                1,
+            )?;
+            assets.pointcloud = Some(rel.clone());
+            metadata.insert(
+                "pointcloud".to_string(),
+                written_asset_metadata(
+                    root,
+                    &rel,
+                    capture_t_ms,
+                    Some(snapshot.kinect.captured_at_ms),
+                    serde_json::json!({
+                        "format": "ply_ascii", "vertices": vertices, "stride": 1,
+                        "calibration_identity": calibration_metadata["identity"],
+                        "derived_from": assets.depth,
+                    }),
+                )?,
+            );
+        } else {
+            metadata.insert(
+                "pointcloud".to_string(),
+                unavailable_asset_metadata(
+                    capture_t_ms,
+                    "point cloud requires a raw depth frame and explicit calibration",
+                ),
             );
         }
     }
@@ -491,6 +1027,64 @@ pub fn export_snapshot_assets(
         assets,
         metadata: Value::Object(metadata),
     })
+}
+
+fn write_json_asset(path: &Path, value: &impl Serialize) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std_fs::create_dir_all(parent)?;
+    }
+    std_fs::write(path, serde_json::to_vec_pretty(value)?)?;
+    Ok(())
+}
+
+fn written_asset_metadata(
+    root: &Path,
+    rel: &str,
+    capture_t_ms: u64,
+    producer_t_ms: Option<u64>,
+    details: Value,
+) -> Result<Value> {
+    let path = root.join(rel);
+    let bytes = std_fs::metadata(&path)?.len();
+    let timing = producer_t_ms.map_or("unknown", |producer| {
+        if capture_t_ms == 0 {
+            "unknown"
+        } else if producer > capture_t_ms {
+            "future"
+        } else if capture_t_ms.saturating_sub(producer) > ASSET_LATE_AFTER_MS {
+            "late"
+        } else {
+            "on_time"
+        }
+    });
+    let mut value = details.as_object().cloned().unwrap_or_default();
+    value.insert("status".to_string(), Value::String("written".to_string()));
+    value.insert("path".to_string(), Value::String(rel.to_string()));
+    value.insert("capture_t_ms".to_string(), Value::from(capture_t_ms));
+    value.insert(
+        "producer_t_ms".to_string(),
+        producer_t_ms.map(Value::from).unwrap_or(Value::Null),
+    );
+    value.insert("timing".to_string(), Value::String(timing.to_string()));
+    value.insert("bytes".to_string(), Value::from(bytes));
+    value.insert("sha256".to_string(), Value::String(sha256_file(&path)?));
+    Ok(Value::Object(value))
+}
+
+fn unavailable_asset_metadata(capture_t_ms: u64, reason: &str) -> Value {
+    serde_json::json!({
+        "status": "unavailable",
+        "capture_t_ms": capture_t_ms,
+        "reason": reason,
+    })
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    Ok(sha256_bytes(&std_fs::read(path)?))
 }
 
 pub fn snapshot_depth_image(snapshot: &WorldSnapshot) -> Option<DepthImage> {
@@ -658,36 +1252,8 @@ pub async fn update_manifest(root: &Path, manifest: &CaptureManifest) -> Result<
 
 fn snapshot_rgb8(snapshot: &WorldSnapshot) -> Option<(u32, u32, Vec<u8>)> {
     if let Some(frame) = &snapshot.eye_frame {
-        match frame.format {
-            EyeFrameFormat::Rgb8
-                if frame.bytes.len() == frame.width as usize * frame.height as usize * 3 =>
-            {
-                return Some((frame.width, frame.height, frame.bytes.clone()));
-            }
-            EyeFrameFormat::Bgr8
-                if frame.bytes.len() == frame.width as usize * frame.height as usize * 3 =>
-            {
-                let mut rgb = frame.bytes.clone();
-                for pixel in rgb.chunks_exact_mut(3) {
-                    pixel.swap(0, 2);
-                }
-                return Some((frame.width, frame.height, rgb));
-            }
-            EyeFrameFormat::Gray8
-                if frame.bytes.len() == frame.width as usize * frame.height as usize =>
-            {
-                let mut rgb = Vec::with_capacity(frame.bytes.len() * 3);
-                for value in &frame.bytes {
-                    rgb.extend_from_slice(&[*value, *value, *value]);
-                }
-                return Some((frame.width, frame.height, rgb));
-            }
-            EyeFrameFormat::Yuyv422
-                if frame.bytes.len() == frame.width as usize * frame.height as usize * 2 =>
-            {
-                return Some((frame.width, frame.height, yuyv422_to_rgb(&frame.bytes)));
-            }
-            _ => {}
+        if let Some(rgb) = eye_frame_rgb8(frame) {
+            return Some(rgb);
         }
     }
 
@@ -699,6 +1265,40 @@ fn snapshot_rgb8(snapshot: &WorldSnapshot) -> Option<(u32, u32, Vec<u8>)> {
         rgb.extend_from_slice(&[byte, byte, byte]);
     }
     Some((width, 1, rgb))
+}
+
+fn eye_frame_rgb8(frame: &pete_now::EyeFrame) -> Option<(u32, u32, Vec<u8>)> {
+    match frame.format {
+        EyeFrameFormat::Rgb8
+            if frame.bytes.len() == frame.width as usize * frame.height as usize * 3 =>
+        {
+            Some((frame.width, frame.height, frame.bytes.clone()))
+        }
+        EyeFrameFormat::Bgr8
+            if frame.bytes.len() == frame.width as usize * frame.height as usize * 3 =>
+        {
+            let mut rgb = frame.bytes.clone();
+            for pixel in rgb.chunks_exact_mut(3) {
+                pixel.swap(0, 2);
+            }
+            Some((frame.width, frame.height, rgb))
+        }
+        EyeFrameFormat::Gray8
+            if frame.bytes.len() == frame.width as usize * frame.height as usize =>
+        {
+            let mut rgb = Vec::with_capacity(frame.bytes.len() * 3);
+            for value in &frame.bytes {
+                rgb.extend_from_slice(&[*value, *value, *value]);
+            }
+            Some((frame.width, frame.height, rgb))
+        }
+        EyeFrameFormat::Yuyv422
+            if frame.bytes.len() == frame.width as usize * frame.height as usize * 2 =>
+        {
+            Some((frame.width, frame.height, yuyv422_to_rgb(&frame.bytes)))
+        }
+        _ => None,
+    }
 }
 
 fn yuyv422_to_rgb(bytes: &[u8]) -> Vec<u8> {

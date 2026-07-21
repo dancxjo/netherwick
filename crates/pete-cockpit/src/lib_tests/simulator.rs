@@ -459,6 +459,7 @@ fn parses_capabilities_without_body_specific_api() {
     assert_eq!(caps.verbs, ["arm", "stop", "cmd_vel"]);
     assert_eq!(caps.events, ["boot", "safety_tripped"]);
     assert_eq!(caps.limits.max_linear_mm_s, 500);
+    assert_eq!(caps.independent_watchdog, None);
 }
 
 #[test]
@@ -485,6 +486,25 @@ fn parses_json_capability_limits() {
             max_ttl_ms: 900,
         }
     );
+    assert_eq!(caps.independent_watchdog, None);
+}
+
+#[test]
+fn parses_explicit_independent_watchdog_capability() {
+    let compact = parse_capabilities(
+        3,
+        "OK 3 CAPABILITIES body_kind=create_oi drive=differential verbs=cmd_vel sensors= outputs=drive safety=heartbeat events=boot independent_watchdog=false limits=max_linear_mm_s:50",
+    )
+    .unwrap();
+    assert_eq!(compact.independent_watchdog, Some(false));
+
+    let json = parse_json_capabilities(&serde_json::json!({
+        "body_kind": "create_oi",
+        "drive": "differential",
+        "independent_watchdog": true
+    }))
+    .unwrap();
+    assert_eq!(json.independent_watchdog, Some(true));
 }
 
 #[test]

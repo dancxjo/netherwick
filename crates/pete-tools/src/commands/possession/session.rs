@@ -1,3 +1,12 @@
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BrainstemMotionSafety {
+    independent_watchdog: bool,
+    capability_source: &'static str,
+    safety_class: &'static str,
+    motion_surface: &'static str,
+    operator_acknowledged: bool,
+}
+
 async fn run_robot(args: RobotArgs) -> Result<()> {
     let env_report = collect_hardware_env_report().await;
     let lidar_device = selected_lidar_device(
@@ -35,6 +44,20 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     let brainstem_capabilities = cockpit
         .get_capabilities()
         .context("failed to read the brainstem capability contract")?;
+    let motion_safety = brainstem_motion_safety(
+        &brainstem_capabilities,
+        args.cockpit,
+        is_mock_body,
+        args.wheels_off_floor,
+        args.acknowledge_no_independent_watchdog,
+    );
+    validate_autonomous_motion_safety(robot_mode, args.autonomous_motion, &motion_safety)?;
+    if !motion_safety.independent_watchdog {
+        eprintln!(
+            "reduced brainstem safety: no independent watchdog; motion_surface={}; a whole-Pi freeze can leave the last Create drive command active",
+            motion_safety.motion_surface
+        );
+    }
     establish_create_sensor_stream(cockpit.as_mut(), !is_mock_body)?;
     if args.recovery_smoke {
         if robot_mode != RobotMode::Slow {
@@ -76,8 +99,19 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             source: "real_robot".to_string(),
             tick_ms: Some(args.tick_ms),
             control_state: (robot_mode == RobotMode::Slow).then(|| "active".to_string()),
-            control_detail: (robot_mode == RobotMode::Slow)
-                .then(|| "brainstem possession active".to_string()),
+            control_detail: (robot_mode == RobotMode::Slow).then(|| {
+                if motion_safety.independent_watchdog {
+                    "brainstem possession active; independent watchdog".to_string()
+                } else {
+                    format!(
+                        "reduced safety: no independent watchdog; {}",
+                        motion_safety.motion_surface.replace('_', " ")
+                    )
+                }
+            }),
+            safety_class: Some(motion_safety.safety_class.to_string()),
+            independent_watchdog: Some(motion_safety.independent_watchdog),
+            motion_surface: Some(motion_safety.motion_surface.to_string()),
         });
         live_state.update_scene_metadata(LiveSceneMetadata {
             arena: None,
@@ -372,6 +406,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         active_sensor_count,
         init_body.as_ref(),
         &brainstem_capabilities,
+        &motion_safety,
     );
     let mut runner = RealRobotRunner::new(robot_mode, cockpit, sensors, runtime)
         .with_frame_processor(real_robot_frame_processor(&mut frame_processor_warnings).await)
@@ -391,6 +426,8 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
                 CaptureWriter::create(path, CaptureSource::RealRobot, Some(args.tick_ms)).await?;
             writer.manifest_mut().firmware_identity =
                 brainstem_firmware_identity(runner.cockpit.client_mut().as_mut());
+            writer.manifest_mut().brainstem_safety =
+                Some(brainstem_motion_safety_metadata(&motion_safety));
             writer.manifest_mut().notes.push(
                 "raw RGB, depth, and audio assets are exported when present; paths are relative to the capture root"
                     .to_string(),
@@ -593,6 +630,69 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     Ok(())
 }
 
+fn brainstem_motion_safety(
+    capabilities: &pete_cockpit::CockpitCapabilities,
+    backend: CockpitBackendArg,
+    is_mock_body: bool,
+    wheels_off_floor: bool,
+    operator_acknowledged: bool,
+) -> BrainstemMotionSafety {
+    let (independent_watchdog, capability_source) = match capabilities.independent_watchdog {
+        Some(available) => (available, "advertised"),
+        None if backend == CockpitBackendArg::Local => (false, "legacy-local-inference"),
+        None if backend != CockpitBackendArg::Sim && !is_mock_body => {
+            (true, "legacy-pico-inference")
+        }
+        None => (true, "simulation"),
+    };
+    BrainstemMotionSafety {
+        independent_watchdog,
+        capability_source,
+        safety_class: if independent_watchdog {
+            "independent-watchdog"
+        } else {
+            "reduced-shared-host"
+        },
+        motion_surface: if wheels_off_floor {
+            "wheels_off_floor"
+        } else {
+            "physical_floor"
+        },
+        operator_acknowledged,
+    }
+}
+
+fn validate_autonomous_motion_safety(
+    robot_mode: RobotMode,
+    autonomous_motion: bool,
+    safety: &BrainstemMotionSafety,
+) -> Result<()> {
+    if robot_mode == RobotMode::Slow
+        && autonomous_motion
+        && !safety.independent_watchdog
+        && safety.motion_surface == "physical_floor"
+        && !safety.operator_acknowledged
+    {
+        anyhow::bail!(
+            "refusing physical-floor autonomous motion: this brainstem has no independent watchdog; use --wheels-off-floor or explicitly acknowledge the residual whole-Pi freeze hazard with --acknowledge-no-independent-watchdog"
+        );
+    }
+    Ok(())
+}
+
+fn brainstem_motion_safety_metadata(safety: &BrainstemMotionSafety) -> serde_json::Value {
+    serde_json::json!({
+        "class": safety.safety_class,
+        "independent_watchdog": safety.independent_watchdog,
+        "capability_source": safety.capability_source,
+        "motion_surface": safety.motion_surface,
+        "operator_acknowledged": safety.operator_acknowledged,
+        "residual_failure_mode": (!safety.independent_watchdog).then_some(
+            "whole-Pi freeze can leave the last Create drive command active"
+        ),
+    })
+}
+
 struct RobotExitFinalization {
     control_result: Result<()>,
     shutdown_result: Result<()>,
@@ -716,13 +816,21 @@ async fn append_real_robot_snapshot(
     tick: &RuntimeTick,
 ) -> Result<()> {
     writer
-        .append_snapshot_with_exported_assets(
+        .append_snapshot_with_exported_assets_and_context(
             tick.frame.now.t_ms,
             snapshot.clone(),
             Vec::new(),
             true,
             true,
             true,
+            CaptureExportContext {
+                imu_selection: tick
+                    .frame
+                    .now
+                    .extensions
+                    .get("sensor.imu_selection")
+                    .cloned(),
+            },
         )
         .await
 }

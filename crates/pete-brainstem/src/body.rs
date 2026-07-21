@@ -119,6 +119,7 @@ fn rpi5_create_oi_capabilities() -> BrainstemCapabilities {
         max_angular_mrad_s: CAPABILITY_MAX_ANGULAR_MRAD_S,
         min_ttl_ms: CAPABILITY_MIN_TTL_MS,
         max_ttl_ms: CAPABILITY_MAX_TTL_MS,
+        independent_watchdog: false,
         driver: BodyDriverCapabilities {
             modes: CREATE_SUPPORTED_MODES,
             sensor_packets: CREATE_SUPPORTED_SENSOR_PACKETS,
@@ -151,6 +152,7 @@ fn create_oi_capabilities() -> BrainstemCapabilities {
         max_angular_mrad_s: CAPABILITY_MAX_ANGULAR_MRAD_S,
         min_ttl_ms: CAPABILITY_MIN_TTL_MS,
         max_ttl_ms: CAPABILITY_MAX_TTL_MS,
+        independent_watchdog: true,
         driver: BodyDriverCapabilities {
             modes: CREATE_SUPPORTED_MODES,
             sensor_packets: CREATE_SUPPORTED_SENSOR_PACKETS,
@@ -184,5 +186,16 @@ mod tests {
 
         assert!(capabilities.outputs.contains(&"power_toggle"));
         assert!(capabilities.driver.has_power_toggle);
+        assert!(capabilities.independent_watchdog);
+    }
+}
+
+#[cfg(all(test, feature = "rpi5"))]
+mod rpi5_tests {
+    use super::current_capabilities;
+
+    #[test]
+    fn direct_rpi_contract_reports_no_independent_watchdog() {
+        assert!(!current_capabilities().independent_watchdog);
     }
 }

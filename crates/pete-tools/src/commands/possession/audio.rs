@@ -142,6 +142,7 @@ fn robot_initialization_metadata(
     active_sensor_count: usize,
     init_body: Option<&BodySense>,
     brainstem_capabilities: &pete_cockpit::CockpitCapabilities,
+    motion_safety: &BrainstemMotionSafety,
 ) -> serde_json::Value {
     let body_status = if is_mock_body {
         "mock Create body connected".to_string()
@@ -159,6 +160,7 @@ fn robot_initialization_metadata(
         "mode": mode,
         "body": body_status,
         "brainstem_capabilities": brainstem_capabilities,
+        "brainstem_safety": brainstem_motion_safety_metadata(motion_safety),
         "battery_percent": init_body.map(|body| {
             (body.battery_level.clamp(0.0, 1.0) * 100.0).round() as u32
         }),

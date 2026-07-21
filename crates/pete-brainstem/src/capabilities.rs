@@ -23,6 +23,7 @@ pub struct BrainstemCapabilities {
     pub max_angular_mrad_s: i16,
     pub min_ttl_ms: u32,
     pub max_ttl_ms: u32,
+    pub independent_watchdog: bool,
     #[allow(dead_code)]
     pub driver: BodyDriverCapabilities,
 }
@@ -56,8 +57,11 @@ pub fn render_json<'a>(
     build_identity::write_json(&mut response, build_identity::CURRENT).ok()?;
     write!(
         response,
-        ",\"body\":\"{}\",\"body_kind\":\"{}\",\"drive\":\"{}\",",
-        capabilities.body_name, capabilities.body_kind, capabilities.drive
+        ",\"body\":\"{}\",\"body_kind\":\"{}\",\"drive\":\"{}\",\"independent_watchdog\":{},",
+        capabilities.body_name,
+        capabilities.body_kind,
+        capabilities.drive,
+        capabilities.independent_watchdog
     )
     .ok()?;
     write_json_str_array(&mut response, "verbs", capabilities.verbs).ok()?;
@@ -108,7 +112,8 @@ pub fn write_compact<const N: usize>(
     write_csv(response, capabilities.events)?;
     write!(
         response,
-        " limits=max_linear_mm_s:{},max_angular_mrad_s:{},min_ttl_ms:{},max_ttl_ms:{} max_tones={} song_slots={} feedback_slots={} sensor_packets={}",
+        " independent_watchdog={} limits=max_linear_mm_s:{},max_angular_mrad_s:{},min_ttl_ms:{},max_ttl_ms:{} max_tones={} song_slots={} feedback_slots={} sensor_packets={}",
+        capabilities.independent_watchdog,
         capabilities.max_linear_mm_s,
         capabilities.max_angular_mrad_s,
         capabilities.min_ttl_ms,

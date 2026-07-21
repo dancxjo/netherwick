@@ -845,13 +845,21 @@ where
             events_written = events_written.saturating_add(1);
         }
         writer
-            .append_snapshot_with_exported_assets(
+            .append_snapshot_with_exported_assets_and_context(
                 snapshot.body.last_update_ms,
                 snapshot,
                 Vec::new(),
                 args.export_rgb,
                 args.export_depth,
                 args.export_audio,
+                CaptureExportContext {
+                    imu_selection: tick
+                        .frame
+                        .now
+                        .extensions
+                        .get("sensor.imu_selection")
+                        .cloned(),
+                },
             )
             .await?;
         tokio::time::sleep(Duration::from_millis(args.tick_ms)).await;
@@ -1012,6 +1020,23 @@ async fn inspect_capture(args: InspectCaptureArgs) -> Result<()> {
     }
     for detail in &report.asset_details {
         println!("    {detail}");
+    }
+    println!("  asset stream health:");
+    for stream in &report.asset_streams {
+        println!(
+            "    {}: count {}, producer {:?}..{:?}, bytes {}, missing_intervals {:?}, unavailable {}, late {}, partial {}, dropped {}, checksum_failures {}",
+            stream.kind,
+            stream.count,
+            stream.first_producer_ms,
+            stream.last_producer_ms,
+            stream.bytes,
+            stream.missing_intervals,
+            stream.unavailable,
+            stream.late,
+            stream.partial,
+            stream.dropped,
+            stream.checksum_failures,
+        );
     }
     println!("  warnings: {}", report.warnings.len());
     for warning in &report.warnings {

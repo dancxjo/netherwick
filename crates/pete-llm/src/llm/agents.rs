@@ -126,9 +126,7 @@ impl OllamaLlmAgent {
             model,
             prompt,
             stream: true,
-            options: OllamaGenerateOptions {
-                temperature: self.config.temperature,
-            },
+            options: OllamaGenerateOptions::from(&self.config),
         };
         let response = self
             .client
@@ -468,6 +466,23 @@ struct OllamaGenerateRequest<'a> {
 #[derive(Serialize)]
 struct OllamaGenerateOptions {
     temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_ctx: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_predict: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_thread: Option<u32>,
+}
+
+impl From<&LlmConfig> for OllamaGenerateOptions {
+    fn from(config: &LlmConfig) -> Self {
+        Self {
+            temperature: config.temperature,
+            num_ctx: config.num_ctx,
+            num_predict: config.num_predict,
+            num_thread: config.num_thread,
+        }
+    }
 }
 
 #[derive(Deserialize)]

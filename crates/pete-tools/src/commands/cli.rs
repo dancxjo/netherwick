@@ -592,14 +592,17 @@ struct RobotArgs {
     /// Permit executive-selected actions to drive physical wheels in regular possession mode.
     #[arg(long)]
     autonomous_motion: bool,
+    /// Acknowledge that direct-RPi floor motion can persist through a whole-Pi freeze.
+    #[arg(long, conflicts_with = "wheels_off_floor")]
+    acknowledge_no_independent_watchdog: bool,
     /// Run the guarded physical bump-to-recovery possession smoke test and exit.
     #[arg(long)]
     recovery_smoke: bool,
     /// Calibrate IMU down from gravity, then run a tiny in-place spin probe and exit.
     #[arg(long)]
     orientation_probe: bool,
-    /// Confirm that physical drive wheels are clear of the floor for a motion smoke test.
-    #[arg(long, requires = "recovery_smoke")]
+    /// Confirm that physical drive wheels are clear of the floor.
+    #[arg(long)]
     wheels_off_floor: bool,
     #[arg(long, default_value_t = 250)]
     reconnect_initial_backoff_ms: u64,

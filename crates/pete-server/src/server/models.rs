@@ -169,6 +169,12 @@ pub struct SceneSession {
     pub control_state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safety_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub independent_watchdog: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion_surface: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

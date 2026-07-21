@@ -145,6 +145,7 @@ impl SimCockpit {
                 .into_iter()
                 .map(ToOwned::to_owned)
                 .collect(),
+                independent_watchdog: Some(true),
                 limits: CockpitLimits {
                     max_linear_mm_s: 500,
                     max_angular_mrad_s: 4_000,

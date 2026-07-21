@@ -1,7 +1,7 @@
 use super::{
     boot_identity_mismatch, bootsel_host, evolution_dataset_files, long_option_value,
     neat_generation_limit, possession_sense_args, possession_sense_overrides, prefixed_value,
-    terminal_title_text, Cli, PossessionSenseProfile,
+    rpi5_motion_surface_args, terminal_title_text, Cli, PossessionSenseProfile,
 };
 use clap::Parser;
 use std::fs;
@@ -118,4 +118,18 @@ fn possession_profiles_keep_body_only_off_and_sensorium_opted_in() {
         &["--llm-config".to_owned(), "config.toml".to_owned()]
     )
     .is_empty());
+}
+
+#[test]
+fn rpi5_possession_defaults_to_wheels_off_floor_until_hazard_is_acknowledged() {
+    assert_eq!(
+        rpi5_motion_surface_args("local", &[]),
+        ["--wheels-off-floor"]
+    );
+    assert!(rpi5_motion_surface_args(
+        "local",
+        &["--acknowledge-no-independent-watchdog".to_owned()]
+    )
+    .is_empty());
+    assert!(rpi5_motion_surface_args("wifi", &[]).is_empty());
 }

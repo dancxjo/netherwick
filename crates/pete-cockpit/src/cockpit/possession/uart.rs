@@ -355,6 +355,8 @@ fn parse_capabilities(seq: u32, response: &str) -> Result<CockpitCapabilities> {
         outputs: csv_for(rest, "outputs"),
         safety: csv_for(rest, "safety"),
         events: csv_for(rest, "events"),
+        independent_watchdog: value_for(rest, "independent_watchdog")
+            .and_then(|value| value.parse().ok()),
         limits: parse_compact_limits(rest),
     })
 }
@@ -629,6 +631,9 @@ fn parse_json_capabilities(value: &serde_json::Value) -> Result<CockpitCapabilit
         outputs: json_string_array(value, "outputs"),
         safety: json_string_array(value, "safety"),
         events: json_string_array(value, "events"),
+        independent_watchdog: value
+            .get("independent_watchdog")
+            .and_then(serde_json::Value::as_bool),
         limits: parse_json_limits(value),
     })
 }

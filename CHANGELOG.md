@@ -28,6 +28,20 @@ All notable changes are grouped by date.
   perception, canonical social/temporal/epistemic state, sleep interruption,
   asynchronous cognition delay, and forebrain failure, with a `just
   social-exam` operator command and optional JSON report.
+- Add `independent_watchdog` brainstem capability negotiation and runtime safety
+  metadata, then enforce reduced-motion gating in physical possession unless
+  `--wheels-off-floor` or explicit `--acknowledge-no-independent-watchdog` is
+  provided for direct-RPi floor operation.
+- Add explicit Ollama resource-bounds propagation (`num_ctx`, `num_predict`,
+  `num_thread`) from `LlmConfig` into Ollama generate/chat requests and capture it
+  in the possession runtime test coverage.
+- Add capture manifest/asset health reporting and raw stream diagnostics:
+  background capture-writer queueing with drop accounting, per-stream metadata with
+  capture/producer timing, write checksums, and CLI inspection output for counts,
+  unavailable/late/partial/dropped/failed statuses.
+- Add capture stream expansion to include optional `camera`, `lidar`, `imu`,
+  `transcript`, and `calibration` assets plus `camera`/`calibration` provenance,
+  while keeping `capture schema v2` compatibility through manifest and frame metadata.
 
 ### Fixed
 
@@ -128,6 +142,9 @@ All notable changes are grouped by date.
 - Propagate optional live control intent (`control_state`, `control_detail`) through
   scene session contracts and UI dashboards so live mode and 3D views display the
   current control posture alongside mode, scenario, and training labels.
+- Ready: Persist IMU stream sample diagnostics (`sample`, age, candidate metadata)
+  in telemetry and improve possession recovery safety defaults so local direct-RPi
+  sessions default to reduced motion surface unless explicitly opted out.
 
 ### Auto-sync (2026-07-15)
 

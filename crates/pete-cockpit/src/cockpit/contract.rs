@@ -223,6 +223,12 @@ pub struct CockpitCapabilities {
     pub outputs: Vec<String>,
     pub safety: Vec<String>,
     pub events: Vec<String>,
+    /// Whether motion supervision survives failure of the possessor's host.
+    ///
+    /// `None` preserves compatibility with pre-migration brainstem contracts;
+    /// physical launchers resolve that legacy value from their selected backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub independent_watchdog: Option<bool>,
     #[serde(default)]
     pub limits: CockpitLimits,
 }

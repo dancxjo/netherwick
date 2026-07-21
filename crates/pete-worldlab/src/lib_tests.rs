@@ -21,6 +21,10 @@ fn capture_manifest_round_trips() {
         notes: vec!["small and sturdy".to_string()],
         machine: None,
         firmware_identity: Some(serde_json::json!({"build_id": "0.1.7+g1a2b3c4"})),
+        brainstem_safety: Some(serde_json::json!({
+            "class": "independent-watchdog",
+            "independent_watchdog": true
+        })),
         command_args: Vec::new(),
         device_availability: Value::Null,
         streams: CaptureStreams::default(),
@@ -29,6 +33,7 @@ fn capture_manifest_round_trips() {
         warnings: Vec::new(),
         asset_layout: default_asset_layout(),
         scenario: None,
+        writer_health: CaptureWriterHealth::default(),
     };
 
     let encoded = serde_json::to_string(&manifest).unwrap();
@@ -71,6 +76,7 @@ fn frame_asset_references_serialize() {
             audio: None,
             pointcloud: Some("assets/pointcloud/000001.ply".to_string()),
             perception: None,
+            ..CaptureFrameAssets::default()
         },
         stream_metadata: Some(serde_json::json!({"rgb": {"width": 2, "height": 2}})),
     };
@@ -195,6 +201,116 @@ async fn capture_writer_writes_manifest_and_frames() {
         .await
         .unwrap();
     assert_eq!(frames.lines().count(), 1);
+}
+
+#[tokio::test]
+async fn background_writer_exports_timestamped_checksummed_raw_streams() {
+    let dir = tempdir().unwrap();
+    let mut writer = CaptureWriter::create(dir.path(), CaptureSource::RealRobot, Some(100))
+        .await
+        .unwrap();
+    let mut snapshot = WorldSnapshot::default();
+    snapshot.eye_frame = Some(pete_now::EyeFrame {
+        captured_at_ms: 990,
+        rgbd_frame_id: Some("rgbd-1".to_string()),
+        device_timestamp_ms: Some(12),
+        width: 2,
+        height: 1,
+        format: EyeFrameFormat::Rgb8,
+        bytes: vec![255, 0, 0, 0, 255, 0],
+        source: Some("test-camera".to_string()),
+    });
+    snapshot.kinect.depth_width = 2;
+    snapshot.kinect.depth_height = 1;
+    snapshot.kinect.depth_m = vec![1.0, 2.0];
+    snapshot.kinect.captured_at_ms = 992;
+    snapshot.kinect.geometry_calibration = Some(pete_now::DepthGeometryCalibration {
+        calibrated: true,
+        depth: pete_now::CameraIntrinsics {
+            width: 2,
+            height: 1,
+            fx: 2.0,
+            fy: 2.0,
+            cx: 0.5,
+            cy: 0.0,
+            distortion: [0.0; 5],
+        },
+        depth_scale: 1.0,
+        ..pete_now::DepthGeometryCalibration::default()
+    });
+    snapshot.range.captured_at_ms = 995;
+    snapshot.range.beams = vec![0.5, 0.75];
+    snapshot.range.beam_time_offsets_ms = vec![-10, 0];
+    snapshot.range.source = Some("lfcd2".to_string());
+    snapshot.imu.captured_at_ms = 996;
+    snapshot.imu.orientation = vec![0.0, 0.0];
+    snapshot.ear_pcm = Some(PcmAudioFrame {
+        captured_at_ms: 997,
+        sample_rate_hz: 16_000,
+        channels: 1,
+        samples: vec![1, -1, 2, -2],
+    });
+
+    writer
+        .append_snapshot_with_exported_assets_and_context(
+            1_000,
+            snapshot,
+            Vec::new(),
+            true,
+            true,
+            true,
+            CaptureExportContext {
+                imu_selection: Some(serde_json::json!({
+                    "selected_source": "test-imu",
+                    "candidates": [{"source_id": "test-imu", "sample": {"captured_at_ms": 996}}]
+                })),
+            },
+        )
+        .await
+        .unwrap();
+    let manifest = writer.finish().await.unwrap();
+    let reader = CaptureReader::open(dir.path()).await.unwrap();
+    let frames = reader.read_frames().await.unwrap();
+    let frame = &frames[0];
+
+    assert_eq!(manifest.writer_health.submitted_frames, 1);
+    assert_eq!(manifest.writer_health.written_frames, 1);
+    assert_eq!(manifest.writer_health.dropped_frames, 0);
+    for kind in [
+        "rgb",
+        "camera",
+        "depth",
+        "lidar",
+        "imu",
+        "audio",
+        "calibration",
+        "pointcloud",
+    ] {
+        let metadata = &frame.stream_metadata.as_ref().unwrap()[kind];
+        assert_eq!(metadata["status"], "written", "{kind}");
+        assert_eq!(metadata["capture_t_ms"], 1_000, "{kind}");
+        assert!(metadata["bytes"].as_u64().unwrap_or_default() > 0, "{kind}");
+        assert_eq!(
+            metadata["sha256"].as_str().unwrap_or_default().len(),
+            64,
+            "{kind}"
+        );
+    }
+    assert!(frame
+        .assets
+        .lidar
+        .as_ref()
+        .is_some_and(|path| dir.path().join(path).exists()));
+    assert!(frame
+        .assets
+        .imu
+        .as_ref()
+        .is_some_and(|path| dir.path().join(path).exists()));
+    assert!(frame
+        .assets
+        .pointcloud
+        .as_ref()
+        .is_some_and(|path| dir.path().join(path).exists()));
 }
 
 #[tokio::test]

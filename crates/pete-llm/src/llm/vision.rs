@@ -259,9 +259,7 @@ impl LiveImageEnricher {
                 content: IMAGE_CAPTION_PROMPT,
                 images: vec![image_base64],
             }],
-            options: OllamaGenerateOptions {
-                temperature: self.config.temperature,
-            },
+            options: OllamaGenerateOptions::from(&self.config),
         };
         let response: OllamaChatResponse = self
             .client

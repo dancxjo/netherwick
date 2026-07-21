@@ -503,6 +503,7 @@ impl Cockpit for CountingCockpit {
             outputs: Vec::new(),
             safety: Vec::new(),
             events: Vec::new(),
+            independent_watchdog: Some(true),
             limits: pete_cockpit::CockpitLimits {
                 max_linear_mm_s: 500,
                 max_angular_mrad_s: 4_000,
@@ -634,6 +635,7 @@ impl Cockpit for LatchedStatusCockpit {
             outputs: Vec::new(),
             safety: Vec::new(),
             events: Vec::new(),
+            independent_watchdog: Some(true),
             limits: pete_cockpit::CockpitLimits {
                 max_linear_mm_s: 500,
                 max_angular_mrad_s: 4_000,
@@ -795,6 +797,7 @@ impl Cockpit for ActiveBumpRecoveryCockpit {
             outputs: Vec::new(),
             safety: Vec::new(),
             events: Vec::new(),
+            independent_watchdog: Some(true),
             limits: pete_cockpit::CockpitLimits {
                 max_linear_mm_s: 500,
                 max_angular_mrad_s: 4_000,

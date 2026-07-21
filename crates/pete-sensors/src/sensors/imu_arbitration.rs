@@ -361,6 +361,7 @@ impl ImuArbiter {
                     "available": state.available,
                     "healthy": metadata.is_some_and(|metadata| metadata.healthy),
                     "last_sample_timestamp_ms": sample.map(|sample| sample.captured_at_ms),
+                    "sample": sample,
                     "sample_age_ms": sample.map(|sample| now_ms.saturating_sub(sample.captured_at_ms)),
                     "producer_reported_sample_age_ms": metadata.and_then(|metadata| metadata.reported_sample_age_ms),
                     "fresh": sample.is_some_and(|sample| sample.captured_at_ms <= now_ms.saturating_add(IMU_FUTURE_TOLERANCE_MS) && now_ms.saturating_sub(sample.captured_at_ms) <= IMU_FRESH_MS),

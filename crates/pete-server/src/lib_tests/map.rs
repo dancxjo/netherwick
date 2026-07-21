@@ -139,6 +139,9 @@ async fn live_scene_returns_body_pose_and_range_beams() {
         tick_ms: Some(100),
         control_state: None,
         control_detail: None,
+        safety_class: None,
+        independent_watchdog: None,
+        motion_surface: None,
     });
     state.update_training_status(LiveTrainingStatus {
         training_mode: "collecting".to_string(),

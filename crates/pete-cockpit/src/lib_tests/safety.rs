@@ -239,6 +239,7 @@ fn body_toml_capabilities() -> CockpitCapabilities {
             .into_iter()
             .map(ToOwned::to_owned)
             .collect(),
+        independent_watchdog: Some(true),
         limits: CockpitLimits {
             max_linear_mm_s: limits["max_linear_mm_s"]
                 .as_integer()

@@ -129,6 +129,60 @@ fn local_cockpit_uses_the_rpi5_brainstem_address_not_a_serial_device() {
     );
 }
 
+#[test]
+fn direct_rpi_autonomous_floor_motion_requires_the_specific_hazard_acknowledgement() {
+    let mut capabilities = LocalSimCockpit::new().get_capabilities().unwrap();
+    capabilities.independent_watchdog = Some(false);
+    let unacknowledged = brainstem_motion_safety(
+        &capabilities,
+        CockpitBackendArg::Local,
+        false,
+        false,
+        false,
+    );
+    let error = validate_autonomous_motion_safety(RobotMode::Slow, true, &unacknowledged)
+        .expect_err("ordinary autonomous-motion configuration must not bypass the gate");
+    assert!(error.to_string().contains("no independent watchdog"));
+
+    let acknowledged = BrainstemMotionSafety {
+        operator_acknowledged: true,
+        ..unacknowledged.clone()
+    };
+    validate_autonomous_motion_safety(RobotMode::Slow, true, &acknowledged).unwrap();
+
+    let wheels_off_floor = BrainstemMotionSafety {
+        motion_surface: "wheels_off_floor",
+        ..unacknowledged
+    };
+    validate_autonomous_motion_safety(RobotMode::Slow, true, &wheels_off_floor).unwrap();
+}
+
+#[test]
+fn pre_migration_contracts_preserve_pico_acceptance_but_fail_closed_for_local_rpi() {
+    let mut capabilities = LocalSimCockpit::new().get_capabilities().unwrap();
+    capabilities.independent_watchdog = None;
+
+    let pico = brainstem_motion_safety(
+        &capabilities,
+        CockpitBackendArg::Wifi,
+        false,
+        false,
+        false,
+    );
+    assert!(pico.independent_watchdog);
+    assert_eq!(pico.capability_source, "legacy-pico-inference");
+
+    let direct = brainstem_motion_safety(
+        &capabilities,
+        CockpitBackendArg::Local,
+        false,
+        false,
+        false,
+    );
+    assert!(!direct.independent_watchdog);
+    assert_eq!(direct.capability_source, "legacy-local-inference");
+}
+
 #[tokio::test]
 async fn possession_mode_never_falls_back_when_brainstem_is_missing() {
     let result = open_robot_cockpit_or_fallback(

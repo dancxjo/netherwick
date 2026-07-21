@@ -532,6 +532,7 @@ impl Cockpit for SimCockpit {
                 .map(str::to_string)
                 .collect(),
             events: Vec::new(),
+            independent_watchdog: Some(true),
             limits: pete_cockpit::CockpitLimits {
                 max_linear_mm_s: 500,
                 max_angular_mrad_s: 4_000,

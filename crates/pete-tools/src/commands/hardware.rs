@@ -1127,7 +1127,23 @@ struct CaptureInspectionReport {
     event_count: usize,
     asset_counts: Vec<(String, usize)>,
     asset_details: Vec<String>,
+    asset_streams: Vec<AssetStreamInspection>,
     warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AssetStreamInspection {
+    kind: String,
+    count: usize,
+    bytes: u64,
+    first_producer_ms: Option<u64>,
+    last_producer_ms: Option<u64>,
+    missing_intervals: Vec<(u64, u64)>,
+    unavailable: usize,
+    late: usize,
+    partial: usize,
+    checksum_failures: usize,
+    dropped: u64,
 }
 
 async fn inspect_capture_report(path: impl AsRef<Path>) -> Result<CaptureInspectionReport> {
@@ -1153,6 +1169,16 @@ async fn inspect_capture_report(path: impl AsRef<Path>) -> Result<CaptureInspect
     } else {
         reader.manifest().streams.clone()
     };
+    let asset_streams = inspect_asset_streams(&path, &frames, &reader.manifest().writer_health);
+    let mut warnings = reader.manifest().warnings.clone();
+    for stream in &asset_streams {
+        if stream.checksum_failures > 0 {
+            warnings.push(format!(
+                "{} asset checksum failures: {}",
+                stream.kind, stream.checksum_failures
+            ));
+        }
+    }
     Ok(CaptureInspectionReport {
         path: path.clone(),
         frame_count: frames.len(),
@@ -1164,8 +1190,110 @@ async fn inspect_capture_report(path: impl AsRef<Path>) -> Result<CaptureInspect
         event_count,
         asset_counts: asset_counts(&path),
         asset_details: asset_details(&frames),
-        warnings: reader.manifest().warnings.clone(),
+        asset_streams,
+        warnings,
     })
+}
+
+fn inspect_asset_streams(
+    root: &Path,
+    frames: &[pete_worldlab::CaptureFrameRecord],
+    health: &pete_worldlab::CaptureWriterHealth,
+) -> Vec<AssetStreamInspection> {
+    const KINDS: [&str; 10] = [
+        "rgb", "camera", "depth", "lidar", "imu", "audio", "transcript",
+        "calibration", "pointcloud", "perception",
+    ];
+    KINDS
+        .into_iter()
+        .map(|kind| {
+            let mut report = AssetStreamInspection {
+                kind: kind.to_string(),
+                dropped: health.dropped_assets.get(kind).copied().unwrap_or(0),
+                ..AssetStreamInspection::default()
+            };
+            let mut missing_start = None;
+            let mut previous_index = None;
+            for frame in frames {
+                if let Some(previous) = previous_index {
+                    if frame.index > previous + 1 && missing_start.is_none() {
+                        missing_start = Some(previous + 1);
+                    }
+                }
+                previous_index = Some(frame.index);
+                let value = frame
+                    .stream_metadata
+                    .as_ref()
+                    .and_then(Value::as_object)
+                    .and_then(|metadata| metadata.get(kind))
+                    .and_then(Value::as_object);
+                let status = value
+                    .and_then(|value| value.get("status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("missing");
+                if status == "written" {
+                    report.count = report.count.saturating_add(1);
+                    report.bytes = report.bytes.saturating_add(
+                        value.and_then(|value| value.get("bytes"))
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                    );
+                    if let Some(producer_ms) = value
+                        .and_then(|value| value.get("producer_t_ms"))
+                        .and_then(Value::as_u64)
+                    {
+                        report.first_producer_ms = Some(
+                            report.first_producer_ms.map_or(producer_ms, |first| first.min(producer_ms)),
+                        );
+                        report.last_producer_ms = Some(
+                            report.last_producer_ms.map_or(producer_ms, |last| last.max(producer_ms)),
+                        );
+                    }
+                    if value
+                        .and_then(|value| value.get("timing"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|timing| timing == "late" || timing == "future")
+                    {
+                        report.late = report.late.saturating_add(1);
+                    }
+                    let checksum_matches = value
+                        .and_then(|value| {
+                            Some((
+                                value.get("path")?.as_str()?,
+                                value.get("sha256")?.as_str()?,
+                            ))
+                        })
+                        .is_some_and(|(path, expected)| capture_sha256(&root.join(path)).as_deref() == Some(expected));
+                    if !checksum_matches {
+                        report.checksum_failures = report.checksum_failures.saturating_add(1);
+                    }
+                    if let Some(start) = missing_start.take() {
+                        report.missing_intervals.push((start, frame.index.saturating_sub(1)));
+                    }
+                } else {
+                    if missing_start.is_none() {
+                        missing_start = Some(frame.index);
+                    }
+                    match status {
+                        "unavailable" => report.unavailable = report.unavailable.saturating_add(1),
+                        "partial" | "error" => report.partial = report.partial.saturating_add(1),
+                        _ => {}
+                    }
+                }
+            }
+            if let (Some(start), Some(last)) = (missing_start, previous_index) {
+                report.missing_intervals.push((start, last));
+            }
+            report
+        })
+        .collect()
+}
+
+fn capture_sha256(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    fs::read(path)
+        .ok()
+        .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
 }
 
 fn asset_details(frames: &[pete_worldlab::CaptureFrameRecord]) -> Vec<String> {
@@ -1226,7 +1354,10 @@ fn asset_details(frames: &[pete_worldlab::CaptureFrameRecord]) -> Vec<String> {
 }
 
 fn asset_counts(root: &Path) -> Vec<(String, usize)> {
-    ["rgb", "depth", "audio", "pointcloud"]
+    [
+        "rgb", "camera", "depth", "lidar", "imu", "audio", "transcript",
+        "calibration", "pointcloud", "perception",
+    ]
         .into_iter()
         .map(|kind| {
             let path = root.join("assets").join(kind);

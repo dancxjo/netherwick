@@ -118,6 +118,24 @@ fn default_llm_config_uses_local_ollama() {
 
     assert_eq!(config.provider, LlmProvider::Ollama);
     assert_eq!(config.endpoint, "http://127.0.0.1:11434");
+    assert_eq!(config.num_ctx, None);
+    assert_eq!(config.num_predict, None);
+    assert_eq!(config.num_thread, None);
+}
+
+#[test]
+fn ollama_request_options_carry_configured_resource_bounds() {
+    let config = LlmConfig {
+        num_ctx: Some(2_048),
+        num_predict: Some(128),
+        num_thread: Some(2),
+        ..LlmConfig::default()
+    };
+
+    let options = serde_json::to_value(OllamaGenerateOptions::from(&config)).unwrap();
+    assert_eq!(options["num_ctx"], 2_048);
+    assert_eq!(options["num_predict"], 128);
+    assert_eq!(options["num_thread"], 2);
 }
 
 #[tokio::test]
