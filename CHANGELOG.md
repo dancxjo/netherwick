@@ -60,6 +60,9 @@ All notable changes are grouped by date.
 - Add a live-map trust banner on the 2D trace view that displays projection
   alignment, geometry trust, navigation gating, and projected-cell counts
   while rendering projected cells with separate stable/unstable styling.
+- Extend live-map endpoint and browser contract tests to validate projected-cell
+  trust metadata, depth-based projection behavior, and the new `map-trust`
+  rendering path in the 2D map page.
 - Derive `Clone`, `Debug`, `PartialEq`, `Serialize`, and `Deserialize` for
   `EmbodiedDemo` so demo embeddings can be copied, compared, and serialized
   consistently through experience tooling.
