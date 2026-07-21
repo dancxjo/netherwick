@@ -101,6 +101,8 @@ impl CognitiveProvider for ImmediateSceneProvider {
 
 fn tiny_eye_frame() -> EyeFrame {
     EyeFrame {
+        rgbd_frame_id: None,
+        device_timestamp_ms: None,
         captured_at_ms: 10,
         width: 1,
         height: 1,

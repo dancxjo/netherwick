@@ -37,6 +37,8 @@ impl ObjectDetector for StaticObjectDetector {
 #[test]
 fn frame_processor_vectorizes_detected_faces_into_face_collection() {
     let frame = EyeFrame {
+        rgbd_frame_id: None,
+        device_timestamp_ms: None,
         captured_at_ms: 42,
         width: 1,
         height: 1,
@@ -63,6 +65,8 @@ fn frame_processor_vectorizes_detected_faces_into_face_collection() {
 #[test]
 fn frame_processor_vectorizes_detected_objects_into_object_collection() {
     let frame = EyeFrame {
+        rgbd_frame_id: None,
+        device_timestamp_ms: None,
         captured_at_ms: 42,
         width: 1,
         height: 1,
@@ -386,48 +390,84 @@ fn converts_mpu6050_raw_samples_to_imu_sense() {
 }
 
 #[test]
-fn mpu6050_orientation_is_zeroed_to_first_flat_sample() {
-    let mut zero = None;
-    let baseline_gravity =
-        test_gravity_for_roll_pitch(120.0_f32.to_radians(), 62.0_f32.to_radians());
-    let mut first = ImuSense {
-        orientation: vec![120.0_f32.to_radians(), 62.0_f32.to_radians()],
-        acceleration: vec![baseline_gravity.x, baseline_gravity.y, baseline_gravity.z],
-        ..ImuSense::default()
-    };
-    zero_mpu6050_orientation_to_flat(&mut first, &mut zero);
-    assert!(first.orientation[0].abs() < 0.0001);
-    assert!(first.orientation[1].abs() < 0.0001);
+fn mpu6050_filter_calibrates_bias_and_uses_gyro_when_acceleration_is_untrusted() {
+    let mut filter = Mpu6050OrientationFilter::new([0.0; 3], true);
+    let mut filtered = ImuSense::default();
+    for index in 0..MPU6050_GYRO_BIAS_SAMPLES {
+        filtered = filter.update(ImuSense {
+            captured_at_ms: u64::from(index) * 10,
+            acceleration: vec![0.0, 0.0, 1.0],
+            angular_velocity: vec![0.01, 0.0, 0.0],
+            ..ImuSense::default()
+        });
+    }
+    assert!(filtered.gyro_bias_calibrated);
+    assert!(filtered.mounting_calibrated);
+    assert!(filtered.orientation_confidence > 0.9);
 
-    let expected_roll = 5.0_f32.to_radians();
-    let expected_pitch = (-10.0_f32).to_radians();
-    let expected_leveled_gravity = test_gravity_for_roll_pitch(expected_roll, expected_pitch);
-    let next_gravity =
-        rotate_vec3_between_unit_vectors(expected_leveled_gravity, test_z_axis(), baseline_gravity);
-    let mut next = ImuSense {
-        orientation: vec![0.0, 0.0],
-        acceleration: vec![next_gravity.x, next_gravity.y, next_gravity.z],
+    let moving = filter.update(ImuSense {
+        captured_at_ms: 600,
+        acceleration: vec![1.0, 0.0, 1.0],
+        angular_velocity: vec![0.51, 0.0, 0.0],
         ..ImuSense::default()
-    };
-    zero_mpu6050_orientation_to_flat(&mut next, &mut zero);
-    assert!((next.orientation[0] - expected_roll).abs() < 0.0001);
-    assert!((next.orientation[1] - expected_pitch).abs() < 0.0001);
+    });
+    assert!(moving.orientation[0] > 0.04);
+    assert_eq!(
+        moving.orientation_source.as_deref(),
+        Some("mpu6050_complementary_accel_gyro")
+    );
 }
 
-fn test_gravity_for_roll_pitch(roll_rad: f32, pitch_rad: f32) -> Vec3Unit {
-    Vec3Unit {
-        x: -pitch_rad.sin(),
-        y: roll_rad.sin() * pitch_rad.cos(),
-        z: roll_rad.cos() * pitch_rad.cos(),
-    }
-}
+#[test]
+fn now_builder_interpolates_pose_and_imu_to_depth_exposure() {
+    let mut builder = NowBuilder::new();
+    let mut first_body = BodySense::default();
+    first_body.last_update_ms = 100;
+    builder
+        .build(
+            100,
+            first_body,
+            vec![SensePacket::Imu(ImuSense {
+                captured_at_ms: 100,
+                orientation: vec![0.0, 0.0],
+                ..ImuSense::default()
+            })],
+        )
+        .unwrap();
 
-fn test_z_axis() -> Vec3Unit {
-    Vec3Unit {
-        x: 0.0,
-        y: 0.0,
-        z: 1.0,
-    }
+    let mut second_body = BodySense::default();
+    second_body.last_update_ms = 200;
+    second_body.odometry.x_m = 1.0;
+    second_body.odometry.heading_rad = std::f32::consts::FRAC_PI_2;
+    let now = builder
+        .build(
+            200,
+            second_body,
+            vec![
+                SensePacket::Imu(ImuSense {
+                    captured_at_ms: 200,
+                    orientation: vec![0.2, -0.2],
+                    ..ImuSense::default()
+                }),
+                SensePacket::Kinect(KinectSense {
+                    schema_version: 2,
+                    captured_at_ms: 150,
+                    depth_m: vec![1.0],
+                    depth_width: 1,
+                    depth_height: 1,
+                    depth_fx: 1.0,
+                    depth_fy: 1.0,
+                    ..KinectSense::default()
+                }),
+            ],
+        )
+        .unwrap();
+    let alignment = now.kinect.fusion_alignment.expect("fusion alignment");
+    assert!((alignment.pose.x_m - 0.5).abs() < 0.001);
+    assert!((alignment.pose.heading_rad - std::f32::consts::FRAC_PI_4).abs() < 0.001);
+    assert!((alignment.imu.orientation[0] - 0.1).abs() < 0.001);
+    assert_eq!(alignment.pose_sample_skew_ms, 50);
+    assert_eq!(alignment.imu_sample_skew_ms, 50);
 }
 
 #[test]

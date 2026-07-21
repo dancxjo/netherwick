@@ -120,8 +120,6 @@ pub enum YawSource {
     Unavailable,
 }
 
-const MAX_TRUSTED_GRAVITY_TILT_RAD: f32 = std::f32::consts::FRAC_PI_4;
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VoxelPoint {
     pub key: VoxelKey,
@@ -142,6 +140,14 @@ pub struct VoxelPointCloud {
     pub observations: u64,
     pub raw_points_seen: u64,
     pub orientation_status: OrientationStatus,
+    /// True when every retained 3D observation has been rebuilt through the
+    /// current non-trivial pose-graph correction.
+    #[serde(default)]
+    pub pose_graph_corrections_applied: bool,
+    #[serde(skip)]
+    retained_observations: Vec<PointCloudObservation>,
+    #[serde(skip)]
+    last_pose_graph_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_kinect_capture_ms: Option<TimeMs>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -163,6 +169,8 @@ pub struct PointCloudConfig {
     pub transient_after_ms: TimeMs,
     pub camera_height_m: f32,
     pub camera_forward_m: f32,
+    #[serde(default)]
+    pub camera_left_m: f32,
     #[serde(default)]
     pub camera_pitch_rad: f32,
     #[serde(default)]
@@ -620,6 +628,7 @@ impl Default for PointCloudConfig {
             transient_after_ms: 5_000,
             camera_height_m: 0.18,
             camera_forward_m: 0.0,
+            camera_left_m: 0.0,
             camera_pitch_rad: 0.0,
             camera_roll_rad: 0.0,
             camera_yaw_rad: 0.0,

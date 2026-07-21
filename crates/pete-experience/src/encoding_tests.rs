@@ -920,6 +920,8 @@ async fn duplicate_image_frames_do_not_repeat_embeddings() {
 fn primary_sensation_from_now_preserves_raw_visual_bytes() {
     let mut now = Now::blank(200, BodySense::default());
     now.eye_frame = Some(pete_now::EyeFrame {
+        rgbd_frame_id: None,
+        device_timestamp_ms: None,
         captured_at_ms: 190,
         width: 2,
         height: 2,
@@ -1011,6 +1013,8 @@ fn experience_fuser_links_sensations_impressions_and_summary() {
 fn primary_sensations_from_now_lifts_live_sensor_surfaces() {
     let mut now = Now::blank(200, BodySense::default());
     now.eye_frame = Some(pete_now::EyeFrame {
+        rgbd_frame_id: None,
+        device_timestamp_ms: None,
         captured_at_ms: 190,
         width: 32,
         height: 24,

@@ -258,6 +258,7 @@ impl VirtualWorld {
             orientation: vec![0.0, 0.0, body.odometry.heading_rad],
             acceleration: vec![body.velocity.forward_m_s, 0.0, 0.0],
             angular_velocity: vec![0.0, 0.0, body.velocity.turn_rad_s],
+            ..ImuSense::default()
         };
         state.snapshot.gps = Some(GpsSense {
             schema_version: 1,
@@ -555,6 +556,8 @@ fn project_blank_eye_frame(body: &BodySense) -> EyeFrame {
     EyeFrame {
         source: Some("rust-sim-blank".to_string()),
         captured_at_ms: body.last_update_ms,
+        rgbd_frame_id: None,
+        device_timestamp_ms: None,
         width: EYE_WIDTH as u32,
         height: EYE_HEIGHT as u32,
         format: EyeFrameFormat::Rgb8,

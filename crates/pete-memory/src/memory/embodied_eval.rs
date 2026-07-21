@@ -156,6 +156,8 @@ pub fn deterministic_embodied_fixture_now(t_ms: u64, pose_offset_m: f32) -> Now 
 
     let mut now = Now::blank(t_ms, body);
     now.eye_frame = Some(EyeFrame {
+        rgbd_frame_id: None,
+        device_timestamp_ms: None,
         captured_at_ms: t_ms.saturating_sub(12),
         width: 12,
         height: 8,
@@ -705,4 +707,3 @@ fn update_action_outcome(
     const MAX_ACTION_OUTCOMES: usize = 8;
     outcomes.truncate(MAX_ACTION_OUTCOMES);
 }
-

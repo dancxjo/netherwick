@@ -12,14 +12,20 @@ pub fn transform_point_to_world(
             camera_point_to_robot(point, config)
         }
     };
-    let robot = apply_roll_pitch(robot, orientation);
     let yaw = orientation.yaw_rad.unwrap_or(pose.heading_rad);
-    let sin = yaw.sin();
-    let cos = yaw.cos();
+    let world = pete_now::DepthGeometry::base_point_to_world(
+        [robot.x_m, robot.y_m, robot.z_m],
+        Pose2 {
+            heading_rad: yaw,
+            ..pose
+        },
+        orientation.roll_rad,
+        orientation.pitch_rad,
+    );
     Point3D {
-        x_m: pose.x_m + robot.x_m * cos - robot.y_m * sin,
-        y_m: pose.y_m + robot.x_m * sin + robot.y_m * cos,
-        z_m: robot.z_m,
+        x_m: world[0],
+        y_m: world[1],
+        z_m: world[2],
     }
 }
 
@@ -28,26 +34,10 @@ pub fn orientation_from_snapshot(snapshot: &WorldSnapshot) -> OrientationEstimat
 }
 
 pub fn orientation_from_imu(imu: &ImuSense, odometry_heading_rad: f32) -> OrientationEstimate {
-    let finite = |index: usize| {
-        imu.orientation
-            .get(index)
-            .copied()
-            .filter(|value| value.is_finite())
-    };
-    let (roll, pitch, imu_yaw) = match imu.orientation.len() {
-        0 => (None, None, None),
-        1 => (None, None, None),
-        2 => (finite(0), finite(1), None),
-        _ => (finite(0), finite(1), finite(2)),
-    };
-    let roll_pitch_plausible = roll
-        .map(|value| value.abs() <= MAX_TRUSTED_GRAVITY_TILT_RAD)
-        .unwrap_or(true)
-        && pitch
-            .map(|value| value.abs() <= MAX_TRUSTED_GRAVITY_TILT_RAD)
-            .unwrap_or(true);
-    let trusted_roll = roll.filter(|_| roll_pitch_plausible);
-    let trusted_pitch = pitch.filter(|_| roll_pitch_plausible);
+    let trusted = pete_now::trusted_imu_orientation(imu);
+    let trusted_roll = trusted.roll_rad;
+    let trusted_pitch = trusted.pitch_rad;
+    let imu_yaw = trusted.yaw_rad;
     OrientationEstimate {
         roll_rad: trusted_roll,
         pitch_rad: trusted_pitch,
@@ -75,7 +65,7 @@ fn camera_point_to_robot(point: Point3D, config: PointCloudConfig) -> Point3D {
     );
     Point3D {
         x_m: rotated.x_m + config.camera_forward_m,
-        y_m: rotated.y_m,
+        y_m: rotated.y_m + config.camera_left_m,
         z_m: rotated.z_m + config.camera_height_m,
     }
 }
@@ -123,27 +113,6 @@ fn range_endpoint_in_robot(
         y_m: rotated.y_m + extrinsics.left_m,
         z_m: rotated.z_m + extrinsics.height_m,
     }
-}
-
-fn apply_roll_pitch(point: Point3D, orientation: OrientationEstimate) -> Point3D {
-    let mut rotated = point;
-    if let Some(roll) = orientation.roll_rad {
-        let (sin, cos) = roll.sin_cos();
-        rotated = Point3D {
-            x_m: rotated.x_m,
-            y_m: rotated.y_m * cos - rotated.z_m * sin,
-            z_m: rotated.y_m * sin + rotated.z_m * cos,
-        };
-    }
-    if let Some(pitch) = orientation.pitch_rad {
-        let (sin, cos) = pitch.sin_cos();
-        rotated = Point3D {
-            x_m: rotated.x_m * cos + rotated.z_m * sin,
-            y_m: rotated.y_m,
-            z_m: -rotated.x_m * sin + rotated.z_m * cos,
-        };
-    }
-    rotated
 }
 
 fn orientation_status(orientation: OrientationEstimate) -> OrientationStatus {

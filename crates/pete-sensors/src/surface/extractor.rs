@@ -463,7 +463,19 @@ impl SurfaceExtractor {
         robot_pose: Pose2,
         t_ms: u64,
     ) -> SurfaceExtractorOutput {
-        let raw_cloud = depth_to_world_points(kinect, robot_pose, &self.config);
+        self.process_with_orientation(kinect, robot_pose, None, None, t_ms)
+    }
+
+    pub fn process_with_orientation(
+        &mut self,
+        kinect: &KinectSense,
+        robot_pose: Pose2,
+        roll_rad: Option<f32>,
+        pitch_rad: Option<f32>,
+        t_ms: u64,
+    ) -> SurfaceExtractorOutput {
+        let raw_cloud =
+            depth_to_world_points(kinect, robot_pose, roll_rad, pitch_rad, &self.config);
         let downsampled = voxel_downsample(&raw_cloud, self.config.voxel_size_m);
         self.temporal_clouds.push_back(downsampled.clone());
         while self.temporal_clouds.len() > self.config.temporal_frames.max(1) {

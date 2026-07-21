@@ -382,6 +382,8 @@ pub async fn demo_embodied_experience(now_ms: TimeMs) -> Result<EmbodiedDemo> {
     }
     let mut now = Now::blank(now_ms, BodySense::default());
     now.eye_frame = Some(pete_now::EyeFrame {
+        rgbd_frame_id: None,
+        device_timestamp_ms: None,
         captured_at_ms: now_ms,
         width: 64,
         height: 48,

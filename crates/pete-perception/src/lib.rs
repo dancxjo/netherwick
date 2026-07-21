@@ -1,5 +1,5 @@
 use pete_core::TimeMs;
-use pete_now::KinectSense;
+use pete_now::{DepthGeometry, KinectSense};
 use pete_sensors::{EyeFrameFormat, WorldSnapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -92,6 +92,7 @@ impl PerceptionFrame {
         max_points: usize,
     ) -> Option<Self> {
         let projection = DepthProjection::from_kinect(&snapshot.kinect)?;
+        let geometry = DepthGeometry::from_kinect(&snapshot.kinect)?;
         let rgb = RgbImageView::from_snapshot(snapshot);
         let min_depth_m = positive_or(snapshot.kinect.min_depth_m, 0.1);
         let max_depth_m = positive_or(snapshot.kinect.max_depth_m, 8.0);
@@ -101,9 +102,17 @@ impl PerceptionFrame {
             .len()
             .div_ceil(max_points.max(1))
             .max(1);
-        let pose = snapshot.body.odometry;
-        let yaw = pose.heading_rad;
-        let (sin_yaw, cos_yaw) = yaw.sin_cos();
+        let alignment = snapshot.kinect.fusion_alignment.as_ref();
+        if snapshot.kinect.schema_version >= 2 && alignment.is_none() {
+            return None;
+        }
+        let pose = alignment
+            .map(|alignment| alignment.pose)
+            .unwrap_or(snapshot.body.odometry);
+        let imu = alignment
+            .map(|alignment| &alignment.imu)
+            .unwrap_or(&snapshot.imu);
+        let orientation = pete_now::trusted_imu_orientation(imu);
         let mut skipped_depth_count = 0usize;
         let mut clipped_depth_count = 0usize;
         let mut points = Vec::new();
@@ -121,17 +130,20 @@ impl PerceptionFrame {
 
             let u = index % projection.width;
             let v = index / projection.width;
-            let camera_point = PointXyz {
-                x_m: (u as f32 - projection.cx) * depth_m / projection.fx.max(f32::EPSILON),
-                y_m: (v as f32 - projection.cy) * depth_m / projection.fy.max(f32::EPSILON),
-                z_m: depth_m,
+            let camera = geometry.depth_pixel_to_camera(u as f32, v as f32, depth_m)?;
+            let camera_point = point_xyz(camera);
+            let base = if snapshot.kinect.geometry_calibration.is_some() {
+                geometry.depth_point_to_base(camera)
+            } else {
+                [camera[2], -camera[0], -camera[1]]
             };
-            let robot_point = camera_point_to_robot(camera_point);
-            let world_point = PointXyz {
-                x_m: pose.x_m + robot_point.x_m * cos_yaw - robot_point.y_m * sin_yaw,
-                y_m: pose.y_m + robot_point.x_m * sin_yaw + robot_point.y_m * cos_yaw,
-                z_m: robot_point.z_m,
-            };
+            let robot_point = point_xyz(base);
+            let world_point = point_xyz(DepthGeometry::base_point_to_world(
+                base,
+                pose,
+                orientation.roll_rad,
+                orientation.pitch_rad,
+            ));
 
             points.push(PointSample {
                 depth: DepthSample {
@@ -140,9 +152,17 @@ impl PerceptionFrame {
                     v: v as u32,
                     depth_m,
                 },
-                rgb: rgb
-                    .as_ref()
-                    .and_then(|rgb| rgb.sample_scaled(u, v, projection.width, projection.height)),
+                rgb: rgb.as_ref().and_then(|rgb| {
+                    if snapshot.kinect.geometry_calibration.is_some() {
+                        geometry.depth_point_to_rgb_pixel(camera).and_then(|pixel| {
+                            rgb.sample(pixel[0].round() as usize, pixel[1].round() as usize)
+                        })
+                    } else if snapshot.kinect.schema_version < 2 {
+                        rgb.sample_scaled(u, v, projection.width, projection.height)
+                    } else {
+                        None
+                    }
+                }),
                 camera_point,
                 robot_point,
                 world_point,
@@ -174,9 +194,10 @@ impl PerceptionFrame {
                 "max_sparse_points": max_points.max(1),
                 "skipped_depth_count": skipped_depth_count,
                 "clipped_depth_count": clipped_depth_count,
-                "rgb_mapped": rgb.is_some(),
-                "robot_transform": "camera_z_forward_x_left_y_down_to_robot_x_forward_y_left_z_up_no_extrinsics",
-                "world_transform": "odometry_xy_yaw"
+                "rgb_mapped": rgb.is_some() && snapshot.kinect.geometry_calibration.is_some(),
+                "rgbd_frame_id": snapshot.kinect.rgbd_frame_id,
+                "robot_transform": if snapshot.kinect.geometry_calibration.is_some() { "calibrated_depth_to_base_6dof" } else { "legacy_optical_to_base" },
+                "world_transform": "exposure_aligned_pose_and_trusted_imu_roll_pitch"
             }),
         })
     }
@@ -198,11 +219,11 @@ fn positive_or(value: f32, fallback: f32) -> f32 {
     }
 }
 
-fn camera_point_to_robot(point: PointXyz) -> PointXyz {
+fn point_xyz(point: [f32; 3]) -> PointXyz {
     PointXyz {
-        x_m: point.z_m,
-        y_m: -point.x_m,
-        z_m: -point.y_m,
+        x_m: point[0],
+        y_m: point[1],
+        z_m: point[2],
     }
 }
 
@@ -253,7 +274,23 @@ struct RgbImageView<'a> {
 
 impl<'a> RgbImageView<'a> {
     fn from_snapshot(snapshot: &'a WorldSnapshot) -> Option<Self> {
-        let frame = snapshot.eye_frame.as_ref()?;
+        let frame = snapshot
+            .kinect
+            .color_frame
+            .as_ref()
+            .filter(|frame| {
+                frame.rgbd_frame_id.is_some()
+                    && frame.rgbd_frame_id == snapshot.kinect.rgbd_frame_id
+                    && frame
+                        .captured_at_ms
+                        .abs_diff(snapshot.kinect.captured_at_ms)
+                        <= 50
+            })
+            .or_else(|| {
+                (snapshot.kinect.schema_version < 2)
+                    .then_some(snapshot.eye_frame.as_ref())
+                    .flatten()
+            })?;
         let width = usize::try_from(frame.width).ok()?;
         let height = usize::try_from(frame.height).ok()?;
         let expected = match &frame.format {
@@ -294,6 +331,9 @@ impl<'a> RgbImageView<'a> {
     }
 
     fn sample(&self, u: usize, v: usize) -> Option<RgbSample> {
+        if u >= self.width || v >= self.height {
+            return None;
+        }
         let pixel = v.checked_mul(self.width)?.checked_add(u)?;
         let rgb = match &self.format {
             EyeFrameFormat::Rgb8 => {
@@ -384,6 +424,8 @@ mod tests {
             ..KinectSense::default()
         };
         snapshot.eye_frame = Some(EyeFrame {
+            rgbd_frame_id: None,
+            device_timestamp_ms: None,
             width: 2,
             height: 2,
             format: EyeFrameFormat::Rgb8,

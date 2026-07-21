@@ -137,6 +137,8 @@ pub enum SensePacket {
 pub struct NowBuilder {
     last_snapshot: WorldSnapshot,
     last_updates: SensorUpdateTimes,
+    pose_history: VecDeque<(TimeMs, Pose2)>,
+    imu_history: VecDeque<ImuSense>,
 }
 
 #[derive(Clone, Default)]
@@ -232,8 +234,14 @@ impl NowBuilder {
         mut body: BodySense,
         packets: Vec<SensePacket>,
     ) -> Result<Now> {
-        body.last_update_ms = body.last_update_ms.max(t_ms);
-        self.last_updates.body = Some(body.last_update_ms);
+        let body_sample_ms = if body.last_update_ms == 0 {
+            t_ms
+        } else {
+            body.last_update_ms
+        };
+        body.last_update_ms = body_sample_ms;
+        self.last_updates.body = Some(body_sample_ms);
+        push_timestamped_pose(&mut self.pose_history, body_sample_ms, body.odometry);
         self.last_snapshot.body = body;
         self.last_snapshot.extensions.clear();
         let mut saw_range_packet = false;
@@ -246,8 +254,13 @@ impl NowBuilder {
                 }
                 SensePacket::EyeFrame(frame) => {
                     self.last_snapshot.eye.frames = vec![bytes_to_unit_signal(&frame.bytes)];
+                    let captured_at_ms = frame.captured_at_ms;
                     self.last_snapshot.eye_frame = Some(frame);
-                    self.last_updates.eye = Some(t_ms);
+                    self.last_updates.eye = Some(if captured_at_ms > 0 {
+                        captured_at_ms
+                    } else {
+                        t_ms
+                    });
                 }
                 SensePacket::Ear(ear) => {
                     self.last_snapshot.ear = ear;
@@ -258,20 +271,37 @@ impl NowBuilder {
                     self.last_snapshot.ear_pcm = Some(frame);
                     self.last_updates.ear = Some(t_ms);
                 }
-                SensePacket::Range(range) => {
+                SensePacket::Range(mut range) => {
+                    align_range_beam_poses(&mut range, &self.pose_history);
+                    let captured_at_ms = range.captured_at_ms;
                     self.last_snapshot.range = range;
-                    self.last_updates.range = Some(t_ms);
+                    self.last_updates.range = Some(if captured_at_ms > 0 {
+                        captured_at_ms
+                    } else {
+                        t_ms
+                    });
                     saw_range_packet = true;
                 }
                 SensePacket::Imu(imu) => {
+                    push_timestamped_imu(&mut self.imu_history, &imu, t_ms);
+                    let captured_at_ms = imu.captured_at_ms;
                     self.last_snapshot.imu = imu;
-                    self.last_updates.imu = Some(t_ms);
+                    self.last_updates.imu = Some(if captured_at_ms > 0 {
+                        captured_at_ms
+                    } else {
+                        t_ms
+                    });
                 }
                 SensePacket::Gps(gps) => {
                     self.last_snapshot.gps = Some(gps);
                     self.last_updates.gps = Some(t_ms);
                 }
                 SensePacket::Kinect(kinect) => {
+                    let captured_at_ms = kinect.captured_at_ms;
+                    if let Some(color_frame) = kinect.color_frame.clone() {
+                        self.last_updates.eye = Some(color_frame.captured_at_ms);
+                        self.last_snapshot.eye_frame = Some(color_frame);
+                    }
                     if !saw_range_packet {
                         if let Some(range) = range_from_kinect_depth(&kinect) {
                             self.last_snapshot.range = range;
@@ -279,7 +309,11 @@ impl NowBuilder {
                         }
                     }
                     self.last_snapshot.kinect = kinect;
-                    self.last_updates.kinect = Some(t_ms);
+                    self.last_updates.kinect = Some(if captured_at_ms > 0 {
+                        captured_at_ms
+                    } else {
+                        t_ms
+                    });
                 }
                 SensePacket::Face(face) => {
                     self.last_snapshot.face = face;
@@ -299,6 +333,12 @@ impl NowBuilder {
             }
         }
 
+        if self.last_snapshot.kinect.captured_at_ms > 0 {
+            let captured_at_ms = self.last_snapshot.kinect.captured_at_ms;
+            self.last_snapshot.kinect.fusion_alignment =
+                fusion_alignment_at(&self.pose_history, &self.imu_history, captured_at_ms);
+        }
+
         let mut now = self.last_snapshot.to_now(t_ms);
         now.extensions.insert(
             "sensor_status".to_string(),
@@ -313,6 +353,199 @@ impl NowBuilder {
     pub fn snapshot(&self) -> WorldSnapshot {
         self.last_snapshot.clone()
     }
+}
+
+fn push_timestamped_pose(history: &mut VecDeque<(TimeMs, Pose2)>, t_ms: TimeMs, pose: Pose2) {
+    if history
+        .back()
+        .is_some_and(|(last_t_ms, last_pose)| *last_t_ms == t_ms && *last_pose == pose)
+    {
+        return;
+    }
+    history.push_back((t_ms, pose));
+    while history.len() > FUSION_HISTORY_LIMIT {
+        history.pop_front();
+    }
+}
+
+fn push_timestamped_imu(history: &mut VecDeque<ImuSense>, imu: &ImuSense, fallback_t_ms: TimeMs) {
+    let mut sample = imu.clone();
+    if sample.captured_at_ms == 0 {
+        sample.captured_at_ms = fallback_t_ms;
+    }
+    if history
+        .back()
+        .is_some_and(|last| last.captured_at_ms == sample.captured_at_ms)
+    {
+        history.pop_back();
+    }
+    history.push_back(sample);
+    while history.len() > FUSION_HISTORY_LIMIT {
+        history.pop_front();
+    }
+}
+
+fn fusion_alignment_at(
+    poses: &VecDeque<(TimeMs, Pose2)>,
+    imus: &VecDeque<ImuSense>,
+    target_ms: TimeMs,
+) -> Option<KinectFusionAlignment> {
+    let (pose, pose_skew, pose_span) = interpolate_pose(poses, target_ms)?;
+    let (imu, imu_skew, imu_span) = interpolate_imu(imus, target_ms)?;
+    if pose_skew > MAX_FUSION_SAMPLE_SKEW_MS || imu_skew > MAX_FUSION_SAMPLE_SKEW_MS {
+        return None;
+    }
+    let worst_skew = pose_skew.max(imu_skew) as f32;
+    Some(KinectFusionAlignment {
+        pose,
+        imu,
+        captured_at_ms: target_ms,
+        pose_sample_skew_ms: pose_skew,
+        imu_sample_skew_ms: imu_skew,
+        pose_bracket_span_ms: pose_span,
+        imu_bracket_span_ms: imu_span,
+        confidence: (1.0 - worst_skew / MAX_FUSION_SAMPLE_SKEW_MS as f32).clamp(0.0, 1.0),
+    })
+}
+
+fn interpolate_pose(
+    history: &VecDeque<(TimeMs, Pose2)>,
+    target_ms: TimeMs,
+) -> Option<(Pose2, u64, u64)> {
+    let samples = history.iter().copied().collect::<Vec<_>>();
+    let (before, after) = bracketing_samples(&samples, target_ms, |sample| sample.0)?;
+    let (before_t, before_pose) = before;
+    let (after_t, after_pose) = after;
+    let span = after_t.abs_diff(before_t);
+    let nearest = target_ms
+        .abs_diff(before_t)
+        .min(target_ms.abs_diff(after_t));
+    let alpha = interpolation_alpha(before_t, after_t, target_ms);
+    Some((
+        Pose2 {
+            x_m: lerp(before_pose.x_m, after_pose.x_m, alpha),
+            y_m: lerp(before_pose.y_m, after_pose.y_m, alpha),
+            heading_rad: lerp_angle(before_pose.heading_rad, after_pose.heading_rad, alpha),
+        },
+        nearest,
+        span,
+    ))
+}
+
+fn interpolate_imu(
+    history: &VecDeque<ImuSense>,
+    target_ms: TimeMs,
+) -> Option<(ImuSense, u64, u64)> {
+    let samples = history.iter().cloned().collect::<Vec<_>>();
+    let (before, after) = bracketing_samples(&samples, target_ms, |sample| sample.captured_at_ms)?;
+    let span = after.captured_at_ms.abs_diff(before.captured_at_ms);
+    let nearest = target_ms
+        .abs_diff(before.captured_at_ms)
+        .min(target_ms.abs_diff(after.captured_at_ms));
+    let alpha = interpolation_alpha(before.captured_at_ms, after.captured_at_ms, target_ms);
+    let mut imu = before.clone();
+    imu.captured_at_ms = target_ms;
+    imu.orientation = interpolate_vector(&before.orientation, &after.orientation, alpha, true);
+    imu.acceleration = interpolate_vector(&before.acceleration, &after.acceleration, alpha, false);
+    imu.angular_velocity = interpolate_vector(
+        &before.angular_velocity,
+        &after.angular_velocity,
+        alpha,
+        false,
+    );
+    imu.orientation_confidence = lerp(
+        before.orientation_confidence,
+        after.orientation_confidence,
+        alpha,
+    );
+    imu.gyro_bias_calibrated = before.gyro_bias_calibrated && after.gyro_bias_calibrated;
+    imu.mounting_calibrated = before.mounting_calibrated && after.mounting_calibrated;
+    Some((imu, nearest, span))
+}
+
+fn bracketing_samples<T: Clone>(
+    samples: &[T],
+    target_ms: TimeMs,
+    timestamp: impl Fn(&T) -> TimeMs,
+) -> Option<(T, T)> {
+    let before = samples
+        .iter()
+        .filter(|sample| timestamp(sample) <= target_ms)
+        .max_by_key(|sample| timestamp(sample));
+    let after = samples
+        .iter()
+        .filter(|sample| timestamp(sample) >= target_ms)
+        .min_by_key(|sample| timestamp(sample));
+    match (before, after) {
+        (Some(before), Some(after)) => Some((before.clone(), after.clone())),
+        (Some(sample), None) | (None, Some(sample)) => Some((sample.clone(), sample.clone())),
+        (None, None) => None,
+    }
+}
+
+fn interpolation_alpha(before_ms: u64, after_ms: u64, target_ms: u64) -> f32 {
+    if before_ms == after_ms {
+        0.0
+    } else {
+        (target_ms.saturating_sub(before_ms) as f32 / after_ms.abs_diff(before_ms) as f32)
+            .clamp(0.0, 1.0)
+    }
+}
+
+fn interpolate_vector(before: &[f32], after: &[f32], alpha: f32, angular: bool) -> Vec<f32> {
+    before
+        .iter()
+        .zip(after)
+        .map(|(before, after)| {
+            if angular {
+                lerp_angle(*before, *after, alpha)
+            } else {
+                lerp(*before, *after, alpha)
+            }
+        })
+        .collect()
+}
+
+fn lerp(before: f32, after: f32, alpha: f32) -> f32 {
+    before + (after - before) * alpha
+}
+
+fn lerp_angle(before: f32, after: f32, alpha: f32) -> f32 {
+    let delta = (after - before + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
+        - std::f32::consts::PI;
+    before + delta * alpha
+}
+
+fn align_range_beam_poses(range: &mut RangeSense, poses: &VecDeque<(TimeMs, Pose2)>) {
+    if range.captured_at_ms == 0
+        || range.beam_time_offsets_ms.len() != range.beams.len()
+        || range.beams.is_empty()
+    {
+        return;
+    }
+    let aligned = range
+        .beam_time_offsets_ms
+        .iter()
+        .map(|offset_ms| {
+            let beam_t_ms = if *offset_ms >= 0 {
+                range.captured_at_ms.saturating_add(*offset_ms as u64)
+            } else {
+                range
+                    .captured_at_ms
+                    .saturating_sub(offset_ms.unsigned_abs() as u64)
+            };
+            interpolate_pose(poses, beam_t_ms)
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(aligned) = aligned else {
+        return;
+    };
+    let max_skew = aligned.iter().map(|(_, skew, _)| *skew).max().unwrap_or(0);
+    if max_skew > MAX_FUSION_SAMPLE_SKEW_MS {
+        return;
+    }
+    range.beam_poses = aligned.into_iter().map(|(pose, _, _)| pose).collect();
+    range.beam_pose_max_skew_ms = Some(max_skew);
 }
 
 fn range_from_kinect_depth(kinect: &KinectSense) -> Option<RangeSense> {
@@ -370,6 +603,7 @@ fn range_from_kinect_depth_with_config(
         frame: None,
         source: Some("kinect_depth_legacy_range".to_string()),
         extrinsics: None,
+        ..RangeSense::default()
     })
 }
 
@@ -463,6 +697,7 @@ fn range_from_depth_image(
         frame: Some("robot_base".to_string()),
         source: Some("kinect_depth_image".to_string()),
         extrinsics: None,
+        ..RangeSense::default()
     })
 }
 
@@ -516,6 +751,7 @@ fn range_from_compact_depth(
         frame: Some("robot_base".to_string()),
         source: Some("kinect_compact_depth".to_string()),
         extrinsics: None,
+        ..RangeSense::default()
     })
 }
 

@@ -752,6 +752,7 @@ fn tilted_lidar_ground_returns_feed_3d_cloud_but_not_planar_obstacles() {
             pitch_rad: std::f32::consts::FRAC_PI_4,
             ..RangeExtrinsics::default()
         }),
+        ..RangeSense::default()
     };
     let observation = pointcloud_observation_from_range(
         &range,
@@ -827,6 +828,8 @@ fn pointcloud_projection_samples_rgb_eye_frame_by_depth_pixel() {
     let mut snapshot = kinect_snapshot_at(0.0, 0.0, 0.0, vec![1.0, 1.0, 1.0, 1.0], 2, 2);
     snapshot.eye_frame = Some(EyeFrame {
         captured_at_ms: 123,
+        rgbd_frame_id: None,
+        device_timestamp_ms: None,
         width: 2,
         height: 2,
         format: EyeFrameFormat::Rgb8,
@@ -849,6 +852,150 @@ fn pointcloud_projection_samples_rgb_eye_frame_by_depth_pixel() {
     assert_eq!(observation.points[1].color_rgb, Some([0, 255, 0]));
     assert_eq!(observation.points[2].color_rgb, Some([0, 0, 255]));
     assert_eq!(observation.points[3].color_rgb, Some([255, 255, 0]));
+}
+
+#[test]
+fn current_depth_uses_its_atomic_rgbd_pair_not_cached_eye_frame() {
+    let calibration = pete_now::DepthGeometryCalibration {
+        calibrated: true,
+        depth: pete_now::CameraIntrinsics {
+            width: 1,
+            height: 1,
+            fx: 1.0,
+            fy: 1.0,
+            ..pete_now::CameraIntrinsics::default()
+        },
+        rgb: Some(pete_now::CameraIntrinsics {
+            width: 1,
+            height: 1,
+            fx: 1.0,
+            fy: 1.0,
+            ..pete_now::CameraIntrinsics::default()
+        }),
+        depth_scale: 1.0,
+        depth_to_rgb: Some(pete_now::RigidTransform3::default()),
+        depth_to_base: pete_now::RigidTransform3 {
+            rotation_rpy_rad: [
+                -std::f32::consts::FRAC_PI_2,
+                0.0,
+                -std::f32::consts::FRAC_PI_2,
+            ],
+            ..pete_now::RigidTransform3::default()
+        },
+        ..pete_now::DepthGeometryCalibration::default()
+    };
+    let paired = EyeFrame {
+        captured_at_ms: 150,
+        rgbd_frame_id: Some("rgbd-150".to_string()),
+        device_timestamp_ms: Some(10),
+        width: 1,
+        height: 1,
+        format: EyeFrameFormat::Rgb8,
+        bytes: vec![255, 0, 0],
+        source: Some("paired".to_string()),
+    };
+    let mut snapshot = WorldSnapshot::default();
+    snapshot.eye_frame = Some(EyeFrame {
+        captured_at_ms: 100,
+        rgbd_frame_id: Some("rgbd-100".to_string()),
+        device_timestamp_ms: Some(9),
+        width: 1,
+        height: 1,
+        format: EyeFrameFormat::Rgb8,
+        bytes: vec![0, 0, 255],
+        source: Some("cached-old".to_string()),
+    });
+    snapshot.kinect = KinectSense {
+        schema_version: 2,
+        captured_at_ms: 150,
+        rgbd_frame_id: Some("rgbd-150".to_string()),
+        color_frame: Some(paired),
+        fusion_alignment: Some(pete_now::KinectFusionAlignment {
+            captured_at_ms: 150,
+            confidence: 1.0,
+            imu: ImuSense {
+                schema_version: 1,
+                orientation: vec![0.0, 0.0],
+                ..ImuSense::default()
+            },
+            ..pete_now::KinectFusionAlignment::default()
+        }),
+        depth_m: vec![1.0],
+        depth_width: 1,
+        depth_height: 1,
+        depth_fx: 1.0,
+        depth_fy: 1.0,
+        min_depth_m: 0.1,
+        max_depth_m: 8.0,
+        geometry_calibration: Some(calibration),
+        ..KinectSense::default()
+    };
+
+    let observation =
+        pointcloud_observation_from_snapshot(&snapshot, 200, PointCloudConfig::default())
+            .expect("paired RGB-D observation");
+    assert_eq!(observation.points[0].color_rgb, Some([255, 0, 0]));
+    assert_eq!(observation.t_ms, 150);
+}
+
+#[test]
+fn pose_graph_correction_rebuilds_retained_voxel_observations() {
+    let mut cloud = VoxelPointCloud::new(PointCloudConfig {
+        voxel_size_m: 0.1,
+        ..PointCloudConfig::default()
+    });
+    cloud.integrate_observation(PointCloudObservation {
+        frame: PointCloudFrame::RobotBase,
+        pose: PoseEstimate {
+            pose: pose(1.0, 0.0, 0.0),
+            confidence: 1.0,
+            covariance: [0.0; 3],
+            source: "raw_odometry".to_string(),
+            t_ms: 100,
+        },
+        orientation: OrientationEstimate::default(),
+        points: vec![PointCloudPoint {
+            position: Point3D::default(),
+            color_rgb: None,
+            confidence: 1.0,
+            depth_index: None,
+            depth_uv: None,
+            depth_image_size: None,
+            source_frame_id: Some("depth-100".to_string()),
+        }],
+        source: "kinect_depth".to_string(),
+        t_ms: 100,
+        metadata: serde_json::Value::Null,
+    });
+    assert!(cloud.voxels.contains_key(&VoxelKey { x: 10, y: 0, z: 0 }));
+
+    let mut map = LocalMap::default();
+    map.pose_graph.nodes.push(PoseNode {
+        id: "live-pose-0".to_string(),
+        pose_estimate: PoseEstimate {
+            pose: pose(0.0, 0.0, 0.0),
+            confidence: 1.0,
+            covariance: [0.0; 3],
+            source: "optimized".to_string(),
+            t_ms: 100,
+        },
+        t_ms: 100,
+        source_frame_id: Some("depth-100".to_string()),
+    });
+    map.submaps.push(OccupancySubmap {
+        id: "submap-0".to_string(),
+        node_id: "live-pose-0".to_string(),
+        local_pose: pose(1.0, 0.0, 0.0),
+        range_beams: Vec::new(),
+        t_ms: 100,
+        source_frame_id: Some("depth-100".to_string()),
+    });
+    map.pose_graph_optimization.max_node_update_m = 1.0;
+
+    assert!(cloud.rebuild_from_pose_graph(&map));
+    assert!(cloud.pose_graph_corrections_applied);
+    assert!(cloud.voxels.contains_key(&VoxelKey { x: 0, y: 0, z: 0 }));
+    assert!(!cloud.voxels.contains_key(&VoxelKey { x: 10, y: 0, z: 0 }));
 }
 
 #[test]

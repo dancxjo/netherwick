@@ -1,16 +1,22 @@
-#[cfg(any(feature = "face", feature = "linux-hardware", test))]
+#[cfg(any(
+    feature = "face",
+    feature = "linux-hardware",
+    feature = "kinect-freenect",
+    test
+))]
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
 use pete_actions::{ActionPrimitive, LlmActionProposal};
 use pete_body::BodySense;
+use pete_core::Pose2;
 use pete_now::{
-    AsrSense, EarSense, ExtensionSense, EyeSense, FaceSense, GpsSense, ImuSense, KinectSense,
-    ObjectClass, ObjectObservation, ObjectObservationSource, ObjectSense, RangeExtrinsics,
-    RangeSense, TranscriptCandidateEvent, TranscriptCandidateTracker, TranscriptStabilityState,
-    VectorArtifact, VoiceSense, FACE_VECTOR_COLLECTION, IMAGE_DESCRIPTION_VECTOR_COLLECTION,
-    IMAGE_VECTOR_COLLECTION, OBJECT_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION,
-    TRANSCRIPT_VECTOR_COLLECTION,
+    AsrSense, EarSense, ExtensionSense, EyeSense, FaceSense, GpsSense, ImuSense,
+    KinectFusionAlignment, KinectSense, ObjectClass, ObjectObservation, ObjectObservationSource,
+    ObjectSense, RangeExtrinsics, RangeSense, TranscriptCandidateEvent, TranscriptCandidateTracker,
+    TranscriptStabilityState, VectorArtifact, VoiceSense, FACE_VECTOR_COLLECTION,
+    IMAGE_DESCRIPTION_VECTOR_COLLECTION, IMAGE_VECTOR_COLLECTION, OBJECT_VECTOR_COLLECTION,
+    SCENE_VECTOR_COLLECTION, TRANSCRIPT_VECTOR_COLLECTION,
 };
 use pete_now::{Now, PredictionSense, SurpriseSense};
 use serde::{Deserialize, Serialize};
@@ -34,6 +40,9 @@ pub use surface::{
 };
 
 type TimeMs = u64;
+
+const FUSION_HISTORY_LIMIT: usize = 256;
+const MAX_FUSION_SAMPLE_SKEW_MS: u64 = 200;
 
 #[cfg(feature = "linux-hardware")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};

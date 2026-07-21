@@ -3,13 +3,14 @@ use std::collections::BTreeMap;
 use pete_actions::{ActionPrimitive, ReignInput, ReignMode};
 use pete_body::BodySense;
 use pete_core::{
-    Feature, FeatureModality, FeatureRegistry, FeatureType, Pose3, Provenance, VectorRef,
+    Feature, FeatureModality, FeatureRegistry, FeatureType, Pose2, Pose3, Provenance, VectorRef,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 pub mod beliefs;
+pub mod depth_geometry;
 pub mod epistemic;
 pub mod semantic;
 pub mod social;
@@ -24,6 +25,10 @@ pub use beliefs::{
     LocalGeometrySnapshot, MotivationSummary, OrganismId, ProcessId, ReachabilityEstimate,
     SelfBodyBelief, SelfModelSnapshot, SessionId, StuckTrapKind, WorldEntity, WorldEntityKind,
     WorldModelSnapshot, WorldModelUpdateContext, WorldModelUpdater, WorldPose,
+};
+pub use depth_geometry::{
+    CameraIntrinsics, DepthCalibrationValidation, DepthGeometry, DepthGeometryCalibration,
+    RigidTransform3,
 };
 pub use epistemic::{
     BeliefRef, EpistemicActionKind, EpistemicAffordance, EpistemicAttempt, EpistemicMetrics,
@@ -129,6 +134,13 @@ pub enum EyeFrameFormat {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EyeFrame {
     pub captured_at_ms: u64,
+    /// Shared identifier when this image was captured as part of an RGB-D pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rgbd_frame_id: Option<String>,
+    /// Device clock value retained for calibration/debugging. `captured_at_ms`
+    /// is the corresponding timestamp mapped into the host clock domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_timestamp_ms: Option<u32>,
     pub width: u32,
     pub height: u32,
     pub format: EyeFrameFormat,
@@ -565,6 +577,15 @@ pub struct RangeSense {
     pub nearest_m: Option<f32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub beam_angles_rad: Vec<f32>,
+    /// Per-beam exposure offsets relative to `captured_at_ms`. Full rotating
+    /// scans use negative offsets for beams captured before scan completion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub beam_time_offsets_ms: Vec<i32>,
+    /// Body poses interpolated to each beam exposure by the aggregation layer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub beam_poses: Vec<Pose2>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beam_pose_max_skew_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -599,6 +620,50 @@ pub struct ImuSense {
     pub acceleration: Vec<f32>,
     /// Angular velocity in radians per second, `[x, y, z]`.
     pub angular_velocity: Vec<f32>,
+    /// Confidence of the filtered orientation in the range 0..=1.
+    #[serde(default)]
+    pub orientation_confidence: f32,
+    /// True only after gyro bias has been estimated from stationary samples.
+    #[serde(default)]
+    pub gyro_bias_calibrated: bool,
+    /// True only when the IMU-to-base mounting transform was explicitly supplied.
+    #[serde(default)]
+    pub mounting_calibrated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orientation_source: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TrustedImuOrientation {
+    pub roll_rad: Option<f32>,
+    pub pitch_rad: Option<f32>,
+    pub yaw_rad: Option<f32>,
+    pub trusted: bool,
+}
+
+pub fn trusted_imu_orientation(imu: &ImuSense) -> TrustedImuOrientation {
+    let finite = |index: usize| {
+        imu.orientation
+            .get(index)
+            .copied()
+            .filter(|v| v.is_finite())
+    };
+    let roll = finite(0);
+    let pitch = finite(1);
+    let yaw = finite(2);
+    let filter_trusted = imu.schema_version < 2
+        || (imu.mounting_calibrated
+            && imu.gyro_bias_calibrated
+            && imu.orientation_confidence >= 0.5);
+    let plausible = filter_trusted
+        && roll.is_some_and(|value| value.abs() <= std::f32::consts::FRAC_PI_4)
+        && pitch.is_some_and(|value| value.abs() <= std::f32::consts::FRAC_PI_4);
+    TrustedImuOrientation {
+        roll_rad: plausible.then_some(roll).flatten(),
+        pitch_rad: plausible.then_some(pitch).flatten(),
+        yaw_rad: yaw,
+        trusted: plausible,
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -819,11 +884,38 @@ pub struct KinectSkeletonSense {
     pub joints: Vec<KinectJointSense>,
 }
 
+/// Body and orientation state interpolated to a depth exposure time.
+///
+/// This is produced by the sensor aggregation boundary, where timestamped
+/// histories are available. Mapping consumers must prefer it to the latest
+/// body/IMU values in the surrounding snapshot.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct KinectFusionAlignment {
+    pub pose: Pose2,
+    pub imu: ImuSense,
+    pub captured_at_ms: u64,
+    pub pose_sample_skew_ms: u64,
+    pub imu_sample_skew_ms: u64,
+    pub pose_bracket_span_ms: u64,
+    pub imu_bracket_span_ms: u64,
+    pub confidence: f32,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct KinectSense {
     pub schema_version: u32,
     #[serde(default)]
     pub captured_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rgbd_frame_id: Option<String>,
+    /// The color image paired with this exact depth capture. Consumers must
+    /// not colorize current depth from the independently cached eye frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_frame: Option<EyeFrame>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_timestamp_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fusion_alignment: Option<KinectFusionAlignment>,
     pub color_features: Vec<Vec<f32>>,
     pub depth_m: Vec<f32>,
     #[serde(default)]
@@ -838,6 +930,14 @@ pub struct KinectSense {
     pub depth_cx: f32,
     #[serde(default)]
     pub depth_cy: f32,
+    /// Brown-Conrady coefficients `[k1, k2, p1, p2, k3]` for the depth lens.
+    #[serde(default)]
+    pub depth_distortion: [f32; 5],
+    /// Device-specific metric and RGB-D calibration. Nominal intrinsics may be
+    /// present with `calibrated=false`; physical accuracy gates must require a
+    /// measured calibration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_calibration: Option<DepthGeometryCalibration>,
     #[serde(default)]
     pub min_depth_m: f32,
     #[serde(default)]

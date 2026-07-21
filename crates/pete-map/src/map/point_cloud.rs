@@ -8,6 +8,9 @@ impl VoxelPointCloud {
             observations: 0,
             raw_points_seen: 0,
             orientation_status: OrientationStatus::default(),
+            pose_graph_corrections_applied: false,
+            retained_observations: Vec::new(),
+            last_pose_graph_revision: None,
             last_kinect_capture_ms: None,
             last_range_capture_ms: None,
         }
@@ -57,6 +60,16 @@ impl VoxelPointCloud {
     }
 
     pub fn integrate_observation(&mut self, observation: PointCloudObservation) {
+        self.retained_observations.push(observation.clone());
+        if self.retained_observations.len() > 256 {
+            self.retained_observations.remove(0);
+        }
+        self.pose_graph_corrections_applied = false;
+        self.last_pose_graph_revision = None;
+        self.integrate_observation_points(&observation);
+    }
+
+    fn integrate_observation_points(&mut self, observation: &PointCloudObservation) {
         self.observations = self.observations.saturating_add(1);
         self.orientation_status = orientation_status(observation.orientation);
         self.raw_points_seen = self
@@ -81,6 +94,66 @@ impl VoxelPointCloud {
         }
         self.decay_stale(observation.t_ms);
         self.bound_growth();
+    }
+
+    /// Rebuild retained sensor-frame observations using optimized graph poses.
+    /// Returns true only when every retained observation could be associated
+    /// with a corrected graph node.
+    pub fn rebuild_from_pose_graph(&mut self, map: &LocalMap) -> bool {
+        let revision = pose_graph_revision(map);
+        if self.pose_graph_corrections_applied && self.last_pose_graph_revision == Some(revision) {
+            return true;
+        }
+        let correction_required = map.pose_graph_optimization.max_node_update_m > 0.001;
+        if !correction_required {
+            self.pose_graph_corrections_applied = true;
+            self.last_pose_graph_revision = Some(revision);
+            return true;
+        }
+        if self.retained_observations.is_empty() || map.pose_graph.nodes.is_empty() {
+            self.pose_graph_corrections_applied = false;
+            return false;
+        }
+        let mut rebuilt = Vec::with_capacity(self.retained_observations.len());
+        for original in &self.retained_observations {
+            let Some(node) = map
+                .pose_graph
+                .nodes
+                .iter()
+                .min_by_key(|node| node.t_ms.abs_diff(original.t_ms))
+                .filter(|node| node.t_ms.abs_diff(original.t_ms) <= 1_000)
+            else {
+                self.pose_graph_corrections_applied = false;
+                return false;
+            };
+            let raw_node_pose = map
+                .submaps
+                .iter()
+                .find(|submap| submap.node_id == node.id)
+                .map(|submap| submap.local_pose)
+                .unwrap_or(original.pose.pose);
+            let mut corrected = original.clone();
+            corrected.pose.pose = apply_pose_graph_correction(
+                original.pose.pose,
+                raw_node_pose,
+                node.pose_estimate.pose,
+            );
+            if corrected.orientation.yaw_source == YawSource::OdometryHeading {
+                corrected.orientation.yaw_rad = Some(corrected.pose.pose.heading_rad);
+            }
+            corrected.pose.source = "pose_graph_corrected".to_string();
+            rebuilt.push(corrected);
+        }
+        self.voxels.clear();
+        self.observations = 0;
+        self.raw_points_seen = 0;
+        self.orientation_status = OrientationStatus::default();
+        for observation in &rebuilt {
+            self.integrate_observation_points(observation);
+        }
+        self.pose_graph_corrections_applied = true;
+        self.last_pose_graph_revision = Some(revision);
+        true
     }
 
     pub fn decay_stale(&mut self, now_ms: TimeMs) {
@@ -173,4 +246,43 @@ impl VoxelPointCloud {
             self.voxels.remove(&key);
         }
     }
+}
+
+fn apply_pose_graph_correction(
+    observation: Pose2,
+    raw_node: Pose2,
+    corrected_node: Pose2,
+) -> Pose2 {
+    let relative_x = observation.x_m - raw_node.x_m;
+    let relative_y = observation.y_m - raw_node.y_m;
+    let (raw_sin, raw_cos) = raw_node.heading_rad.sin_cos();
+    let local_x = raw_cos * relative_x + raw_sin * relative_y;
+    let local_y = -raw_sin * relative_x + raw_cos * relative_y;
+    let (corrected_sin, corrected_cos) = corrected_node.heading_rad.sin_cos();
+    Pose2 {
+        x_m: corrected_node.x_m + corrected_cos * local_x - corrected_sin * local_y,
+        y_m: corrected_node.y_m + corrected_sin * local_x + corrected_cos * local_y,
+        heading_rad: corrected_node.heading_rad
+            + (observation.heading_rad - raw_node.heading_rad + std::f32::consts::PI)
+                .rem_euclid(std::f32::consts::TAU)
+            - std::f32::consts::PI,
+    }
+}
+
+fn pose_graph_revision(map: &LocalMap) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    hash ^= u64::from(map.pose_graph_optimization.max_node_update_m.to_bits());
+    hash = hash.wrapping_mul(0x100000001b3);
+    for node in &map.pose_graph.nodes {
+        for value in [
+            node.t_ms,
+            u64::from(node.pose_estimate.pose.x_m.to_bits()),
+            u64::from(node.pose_estimate.pose.y_m.to_bits()),
+            u64::from(node.pose_estimate.pose.heading_rad.to_bits()),
+        ] {
+            hash ^= value;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    hash
 }

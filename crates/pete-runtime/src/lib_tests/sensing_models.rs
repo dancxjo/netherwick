@@ -74,6 +74,8 @@ async fn no_accelerator_preserves_local_beliefs_and_never_blocks_tick() {
         source: ObjectObservationSource::Sim,
     });
     now.eye_frame = Some(EyeFrame {
+        rgbd_frame_id: None,
+        device_timestamp_ms: None,
         captured_at_ms: 10,
         width: 1,
         height: 1,
@@ -167,12 +169,7 @@ fn pre_pose_brainstem_odometry_contract_remains_accepted() {
 #[test]
 fn legacy_physical_pose_adapter_integrates_distance_after_turn_in_world_y() {
     let mut adapter = PhysicalPoseAdapter::default();
-    let samples = [
-        (0, 0),
-        (1_000, 0),
-        (1_000, 1_571),
-        (2_000, 1_571),
-    ];
+    let samples = [(0, 0), (1_000, 0), (1_000, 1_571), (2_000, 1_571)];
     let mut body = BodySense::default();
     for (distance_mm, heading_mrad) in samples {
         let status = CockpitStatus {

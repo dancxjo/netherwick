@@ -113,6 +113,8 @@ pub struct FreenectKinectProvider {
     pending: VecDeque<SensePacket>,
     last_rgb_error: Option<String>,
     rgb_adjustment: KinectRgbAdjustment,
+    clock: FreenectClockAligner,
+    geometry_calibration: Option<pete_now::DepthGeometryCalibration>,
 }
 
 #[cfg(feature = "kinect-freenect")]
@@ -127,6 +129,8 @@ impl FreenectKinectProvider {
             pending: VecDeque::new(),
             last_rgb_error: None,
             rgb_adjustment: KinectRgbAdjustment::default(),
+            clock: FreenectClockAligner::default(),
+            geometry_calibration: load_kinect_geometry_calibration()?,
         })
     }
 
@@ -161,10 +165,29 @@ impl SenseProducer for FreenectKinectProvider {
                 return Err(error);
             }
         };
+        let depth_captured_at_ms = self
+            .clock
+            .host_time(depth.device_timestamp_ms, depth.received_at_ms);
+        let frame_id = format!("kinect-rgbd-{}", depth.device_timestamp_ms);
+        let mut paired_color = None;
         match read_freenect_rgb_frame(self.index, self.rgb_adjustment) {
-            Ok(rgb_frame) => {
+            Ok(mut rgb_frame) => {
+                rgb_frame.frame.captured_at_ms = self
+                    .clock
+                    .host_time(rgb_frame.device_timestamp_ms, rgb_frame.received_at_ms);
+                rgb_frame.frame.device_timestamp_ms = Some(rgb_frame.device_timestamp_ms);
+                let skew_ms = depth_captured_at_ms.abs_diff(rgb_frame.frame.captured_at_ms);
+                if skew_ms <= MAX_FREENECT_RGBD_SKEW_MS {
+                    rgb_frame.frame.rgbd_frame_id = Some(frame_id.clone());
+                    paired_color = Some(rgb_frame.frame.clone());
+                    self.pending
+                        .push_back(SensePacket::EyeFrame(rgb_frame.frame));
+                } else {
+                    eprintln!(
+                        "Kinect RGB frame rejected: RGB-D device-clock skew {skew_ms} ms exceeds {MAX_FREENECT_RGBD_SKEW_MS} ms"
+                    );
+                }
                 self.last_rgb_error = None;
-                self.pending.push_back(SensePacket::EyeFrame(rgb_frame));
             }
             Err(error) => {
                 let error = error.to_string();
@@ -176,16 +199,38 @@ impl SenseProducer for FreenectKinectProvider {
                 self.last_rgb_error = Some(error);
             }
         }
+        let depth_intrinsics = self
+            .geometry_calibration
+            .map(|calibration| calibration.depth);
         Ok(SensePacket::Kinect(KinectSense {
-            schema_version: 1,
-            captured_at_ms: depth.captured_at_ms,
+            schema_version: 2,
+            captured_at_ms: depth_captured_at_ms,
+            rgbd_frame_id: Some(frame_id),
+            color_frame: paired_color,
+            device_timestamp_ms: Some(depth.device_timestamp_ms),
             depth_m: depth.depth_m,
-            depth_width: FREENECT_DEPTH_WIDTH as u32,
-            depth_height: FREENECT_DEPTH_HEIGHT as u32,
-            depth_fx: KINECT_V1_DEPTH_FX,
-            depth_fy: KINECT_V1_DEPTH_FY,
-            depth_cx: KINECT_V1_DEPTH_CX,
-            depth_cy: KINECT_V1_DEPTH_CY,
+            depth_width: depth_intrinsics
+                .map(|intrinsics| intrinsics.width)
+                .unwrap_or(FREENECT_DEPTH_WIDTH as u32),
+            depth_height: depth_intrinsics
+                .map(|intrinsics| intrinsics.height)
+                .unwrap_or(FREENECT_DEPTH_HEIGHT as u32),
+            depth_fx: depth_intrinsics
+                .map(|intrinsics| intrinsics.fx)
+                .unwrap_or(KINECT_V1_DEPTH_FX),
+            depth_fy: depth_intrinsics
+                .map(|intrinsics| intrinsics.fy)
+                .unwrap_or(KINECT_V1_DEPTH_FY),
+            depth_cx: depth_intrinsics
+                .map(|intrinsics| intrinsics.cx)
+                .unwrap_or(KINECT_V1_DEPTH_CX),
+            depth_cy: depth_intrinsics
+                .map(|intrinsics| intrinsics.cy)
+                .unwrap_or(KINECT_V1_DEPTH_CY),
+            depth_distortion: depth_intrinsics
+                .map(|intrinsics| intrinsics.distortion)
+                .unwrap_or_default(),
+            geometry_calibration: self.geometry_calibration,
             min_depth_m: 0.4,
             max_depth_m: 8.0,
             depth_coordinate_system: Some("kinect_depth_image".to_string()),
@@ -195,9 +240,61 @@ impl SenseProducer for FreenectKinectProvider {
 }
 
 #[cfg(feature = "kinect-freenect")]
+fn load_kinect_geometry_calibration() -> Result<Option<pete_now::DepthGeometryCalibration>> {
+    let Ok(path) = std::env::var("PETE_KINECT_CALIBRATION_JSON") else {
+        return Ok(None);
+    };
+    let calibration: pete_now::DepthGeometryCalibration = serde_json::from_slice(
+        &std::fs::read(&path)
+            .with_context(|| format!("failed to read Kinect calibration {path}"))?,
+    )
+    .with_context(|| format!("failed to parse Kinect calibration {path}"))?;
+    if calibration.depth.width != FREENECT_DEPTH_WIDTH as u32
+        || calibration.depth.height != FREENECT_DEPTH_HEIGHT as u32
+        || calibration.depth.fx <= 0.0
+        || calibration.depth.fy <= 0.0
+    {
+        anyhow::bail!("Kinect calibration must provide finite positive 640x480 depth intrinsics");
+    }
+    Ok(Some(calibration))
+}
+
+#[cfg(feature = "kinect-freenect")]
 struct FreenectDepthFrame {
-    captured_at_ms: TimeMs,
+    device_timestamp_ms: u32,
+    received_at_ms: TimeMs,
     depth_m: Vec<f32>,
+}
+
+#[cfg(feature = "kinect-freenect")]
+struct FreenectRgbFrame {
+    device_timestamp_ms: u32,
+    received_at_ms: TimeMs,
+    frame: EyeFrame,
+}
+
+#[cfg(feature = "kinect-freenect")]
+const MAX_FREENECT_RGBD_SKEW_MS: u64 = 50;
+
+#[cfg(feature = "kinect-freenect")]
+#[derive(Default)]
+struct FreenectClockAligner {
+    anchor: Option<(u32, TimeMs)>,
+}
+
+#[cfg(feature = "kinect-freenect")]
+impl FreenectClockAligner {
+    fn host_time(&mut self, device_timestamp_ms: u32, received_at_ms: TimeMs) -> TimeMs {
+        let (anchor_device_ms, anchor_host_ms) = *self
+            .anchor
+            .get_or_insert((device_timestamp_ms, received_at_ms));
+        let delta_ms = device_timestamp_ms.wrapping_sub(anchor_device_ms) as i32 as i64;
+        if delta_ms >= 0 {
+            anchor_host_ms.saturating_add(delta_ms as u64)
+        } else {
+            anchor_host_ms.saturating_sub(delta_ms.unsigned_abs())
+        }
+    }
 }
 
 #[cfg(feature = "kinect-freenect")]
@@ -221,7 +318,7 @@ fn read_freenect_depth_m(index: i32) -> Result<FreenectDepthFrame> {
     if depth_ptr.is_null() {
         anyhow::bail!("libfreenect returned a null Kinect depth frame for device index {index}");
     }
-    let captured_at_ms = unix_time_ms();
+    let received_at_ms = unix_time_ms();
     let depth_mm =
         unsafe { std::slice::from_raw_parts(depth_ptr as *const u16, FREENECT_DEPTH_PIXELS) };
     let depth_m = depth_mm
@@ -235,7 +332,8 @@ fn read_freenect_depth_m(index: i32) -> Result<FreenectDepthFrame> {
         })
         .collect();
     Ok(FreenectDepthFrame {
-        captured_at_ms,
+        device_timestamp_ms: timestamp,
+        received_at_ms,
         depth_m,
     })
 }
@@ -264,7 +362,10 @@ impl Default for KinectRgbAdjustment {
 }
 
 #[cfg(feature = "kinect-freenect")]
-fn read_freenect_rgb_frame(index: i32, adjustment: KinectRgbAdjustment) -> Result<EyeFrame> {
+fn read_freenect_rgb_frame(
+    index: i32,
+    adjustment: KinectRgbAdjustment,
+) -> Result<FreenectRgbFrame> {
     let mut video_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
     let mut timestamp = 0u32;
     let result = unsafe {
@@ -286,17 +387,23 @@ fn read_freenect_rgb_frame(index: i32, adjustment: KinectRgbAdjustment) -> Resul
     }
     let rgb = unsafe { std::slice::from_raw_parts(video_ptr as *const u8, FREENECT_RGB_BYTES) };
     let bytes = adjust_kinect_rgb(rgb, adjustment);
-    Ok(EyeFrame {
-        captured_at_ms: unix_time_ms(),
-        width: FREENECT_DEPTH_WIDTH as u32,
-        height: FREENECT_DEPTH_HEIGHT as u32,
-        format: EyeFrameFormat::Rgb8,
-        bytes,
-        source: Some(if adjustment.enabled {
-            "kinect-freenect-rgb-adjusted".to_string()
-        } else {
-            "kinect-freenect-rgb".to_string()
-        }),
+    Ok(FreenectRgbFrame {
+        device_timestamp_ms: timestamp,
+        received_at_ms: unix_time_ms(),
+        frame: EyeFrame {
+            captured_at_ms: 0,
+            rgbd_frame_id: None,
+            device_timestamp_ms: None,
+            width: FREENECT_DEPTH_WIDTH as u32,
+            height: FREENECT_DEPTH_HEIGHT as u32,
+            format: EyeFrameFormat::Rgb8,
+            bytes,
+            source: Some(if adjustment.enabled {
+                "kinect-freenect-rgb-adjusted".to_string()
+            } else {
+                "kinect-freenect-rgb".to_string()
+            }),
+        },
     })
 }
 

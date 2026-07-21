@@ -69,6 +69,8 @@ fn surface_compact_depth_calibration_changed(
 fn depth_to_world_points(
     kinect: &KinectSense,
     robot_pose: Pose2,
+    roll_rad: Option<f32>,
+    pitch_rad: Option<f32>,
     config: &SurfaceExtractorConfig,
 ) -> Vec<Point3> {
     if config.compact_depth_beam_count > 0
@@ -77,6 +79,9 @@ fn depth_to_world_points(
         return compact_depth_to_world_points(&kinect.depth_m, robot_pose, config);
     }
     let Some(frame) = DepthProjection::from_kinect(kinect, config) else {
+        return Vec::new();
+    };
+    let Some(geometry) = pete_now::DepthGeometry::from_kinect(kinect) else {
         return Vec::new();
     };
     let mut points = Vec::new();
@@ -89,15 +94,26 @@ fn depth_to_world_points(
         }
         let u = (index % frame.width) as f32;
         let v = (index / frame.width) as f32;
-        let z = *depth;
-        let camera = Vec3::new(
-            (u - frame.cx) * z / frame.fx,
-            (v - frame.cy) * z / frame.fy,
-            z,
+        let Some(camera_point) = geometry.depth_pixel_to_camera(u, v, *depth) else {
+            continue;
+        };
+        let robot = if kinect.geometry_calibration.is_some() {
+            let base = geometry.depth_point_to_base(camera_point);
+            Vec3::new(base[0], base[1], base[2])
+        } else {
+            camera_to_robot(
+                Vec3::new(camera_point[0], camera_point[1], camera_point[2]),
+                config,
+            )
+        };
+        let world = pete_now::DepthGeometry::base_point_to_world(
+            [robot.x, robot.y, robot.z],
+            robot_pose,
+            roll_rad,
+            pitch_rad,
         );
-        let robot = camera_to_robot(camera, config);
         points.push(Point3 {
-            position: robot_to_world(robot, robot_pose),
+            position: Vec3::new(world[0], world[1], world[2]),
         });
     }
     points
@@ -149,10 +165,6 @@ fn compact_depth_to_world_points(
 #[derive(Clone, Copy, Debug)]
 struct DepthProjection {
     width: usize,
-    fx: f32,
-    fy: f32,
-    cx: f32,
-    cy: f32,
     min_depth_m: f32,
     max_depth_m: f32,
 }
@@ -166,10 +178,6 @@ impl DepthProjection {
         }
         Some(Self {
             width,
-            fx: positive_or(kinect.depth_fx, 594.0),
-            fy: positive_or(kinect.depth_fy, 591.0),
-            cx: positive_or(kinect.depth_cx, (width as f32 - 1.0) * 0.5),
-            cy: positive_or(kinect.depth_cy, (height as f32 - 1.0) * 0.5),
             min_depth_m: positive_or(kinect.min_depth_m, config.min_depth_m),
             max_depth_m: positive_or(kinect.max_depth_m, config.max_depth_m),
         })

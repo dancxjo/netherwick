@@ -240,6 +240,8 @@ const LFCD2_BEAMS_PER_SCAN: usize = 360;
 const LFCD2_MIN_RANGE_M: f32 = 0.12;
 #[cfg(any(feature = "linux-hardware", test))]
 const LFCD2_MAX_RANGE_M: f32 = 3.5;
+#[cfg(any(feature = "linux-hardware", test))]
+const LFCD2_SCAN_DURATION_MS: i32 = 200;
 
 #[cfg(any(feature = "linux-hardware", test))]
 #[derive(Clone, Debug)]
@@ -329,15 +331,25 @@ impl Lfcd2Parser {
                 let beam_angles_rad = (0..LFCD2_BEAMS_PER_SCAN)
                     .map(|index| (index as f32).to_radians())
                     .collect();
+                let beam_time_offsets_ms = (0..LFCD2_BEAMS_PER_SCAN)
+                    .map(|output_index| {
+                        let raw_index = LFCD2_BEAMS_PER_SCAN - 1 - output_index;
+                        -LFCD2_SCAN_DURATION_MS
+                            + (raw_index as i32 * LFCD2_SCAN_DURATION_MS
+                                / (LFCD2_BEAMS_PER_SCAN as i32 - 1))
+                    })
+                    .collect();
                 return Some(RangeSense {
                     schema_version: 1,
                     captured_at_ms: unix_time_ms(),
                     beams,
                     nearest_m,
                     beam_angles_rad,
+                    beam_time_offsets_ms,
                     frame: Some("hls_lfcd2".to_string()),
                     source: Some("hls_lfcd2".to_string()),
                     extrinsics: Some(self.extrinsics),
+                    ..RangeSense::default()
                 });
             }
         }
@@ -383,7 +395,7 @@ pub struct ImuSenseProvider {
     #[cfg(feature = "linux-hardware")]
     imu: Mpu6050Imu,
     #[cfg(feature = "linux-hardware")]
-    flat_orientation_zero: Option<Mpu6050GravityBaseline>,
+    orientation_filter: Mpu6050OrientationFilter,
 }
 
 impl ImuSenseProvider {
@@ -392,7 +404,7 @@ impl ImuSenseProvider {
         {
             Ok(Self {
                 imu: Mpu6050Imu::new(device)?,
-                flat_orientation_zero: None,
+                orientation_filter: Mpu6050OrientationFilter::from_env()?,
             })
         }
         #[cfg(not(feature = "linux-hardware"))]
@@ -408,8 +420,7 @@ impl SenseProducer for ImuSenseProvider {
     async fn poll(&mut self) -> Result<SensePacket> {
         #[cfg(feature = "linux-hardware")]
         {
-            let mut sense = self.imu.read_sense()?;
-            zero_mpu6050_orientation_to_flat(&mut sense, &mut self.flat_orientation_zero);
+            let sense = self.orientation_filter.update(self.imu.read_sense()?);
             Ok(SensePacket::Imu(sense))
         }
         #[cfg(not(feature = "linux-hardware"))]
@@ -420,109 +431,161 @@ impl SenseProducer for ImuSenseProvider {
 }
 
 #[cfg(any(feature = "linux-hardware", test))]
-#[derive(Clone, Copy, Debug)]
-struct Mpu6050GravityBaseline {
-    gravity_unit: Vec3Unit,
+const MPU6050_GYRO_BIAS_SAMPLES: u32 = 50;
+
+#[cfg(any(feature = "linux-hardware", test))]
+#[derive(Clone, Debug)]
+struct Mpu6050OrientationFilter {
+    imu_to_base: pete_now::RigidTransform3,
+    mounting_calibrated: bool,
+    last_t_ms: Option<TimeMs>,
+    roll_rad: Option<f32>,
+    pitch_rad: Option<f32>,
+    gyro_bias_sum: [f32; 3],
+    gyro_bias: [f32; 3],
+    gyro_bias_samples: u32,
 }
 
 #[cfg(any(feature = "linux-hardware", test))]
-#[derive(Clone, Copy, Debug)]
-struct Vec3Unit {
-    x: f32,
-    y: f32,
-    z: f32,
-}
-
-#[cfg(any(feature = "linux-hardware", test))]
-fn zero_mpu6050_orientation_to_flat(
-    sense: &mut ImuSense,
-    flat_orientation_zero: &mut Option<Mpu6050GravityBaseline>,
-) {
-    let Some(gravity_unit) = normalized_mpu6050_gravity(sense) else {
-        return;
-    };
-    let baseline = flat_orientation_zero.get_or_insert(Mpu6050GravityBaseline { gravity_unit });
-    let leveled_gravity = rotate_gravity_to_flat_baseline(gravity_unit, baseline.gravity_unit);
-    let (roll, pitch) = roll_pitch_from_gravity(leveled_gravity);
-    if sense.orientation.len() < 2 {
-        sense.orientation.resize(2, 0.0);
-    }
-    sense.orientation[0] = roll;
-    sense.orientation[1] = pitch;
-}
-
-#[cfg(any(feature = "linux-hardware", test))]
-fn normalized_mpu6050_gravity(sense: &ImuSense) -> Option<Vec3Unit> {
-    let x = sense.acceleration.first().copied()?;
-    let y = sense.acceleration.get(1).copied()?;
-    let z = sense.acceleration.get(2).copied()?;
-    normalized_vec3(x, y, z)
-}
-
-#[cfg(any(feature = "linux-hardware", test))]
-fn normalized_vec3(x: f32, y: f32, z: f32) -> Option<Vec3Unit> {
-    if !(x.is_finite() && y.is_finite() && z.is_finite()) {
-        return None;
-    }
-    let norm = (x * x + y * y + z * z).sqrt();
-    if norm <= 0.001 {
-        return None;
-    }
-    Some(Vec3Unit {
-        x: x / norm,
-        y: y / norm,
-        z: z / norm,
-    })
-}
-
-#[cfg(any(feature = "linux-hardware", test))]
-fn rotate_gravity_to_flat_baseline(gravity: Vec3Unit, baseline: Vec3Unit) -> Vec3Unit {
-    const Z_UP: Vec3Unit = Vec3Unit {
-        x: 0.0,
-        y: 0.0,
-        z: 1.0,
-    };
-    rotate_vec3_between_unit_vectors(gravity, baseline, Z_UP)
-}
-
-#[cfg(any(feature = "linux-hardware", test))]
-fn rotate_vec3_between_unit_vectors(value: Vec3Unit, from: Vec3Unit, to: Vec3Unit) -> Vec3Unit {
-    let axis_x = from.y * to.z - from.z * to.y;
-    let axis_y = from.z * to.x - from.x * to.z;
-    let axis_z = from.x * to.y - from.y * to.x;
-    let sin_angle = (axis_x * axis_x + axis_y * axis_y + axis_z * axis_z).sqrt();
-    let cos_angle = (from.x * to.x + from.y * to.y + from.z * to.z).clamp(-1.0, 1.0);
-
-    if sin_angle <= 0.000001 {
-        if cos_angle > 0.0 {
-            return value;
-        }
-        return Vec3Unit {
-            x: value.x,
-            y: -value.y,
-            z: -value.z,
+impl Mpu6050OrientationFilter {
+    #[cfg(feature = "linux-hardware")]
+    fn from_env() -> Result<Self> {
+        let mounting_calibrated = std::env::var("PETE_IMU_MOUNT_CALIBRATED")
+            .ok()
+            .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"));
+        let rotation_rpy_rad = match std::env::var("PETE_IMU_TO_BASE_RPY_DEG") {
+            Ok(value) => parse_imu_mount_rpy_deg(&value)?,
+            Err(_) => [0.0; 3],
         };
+        Ok(Self::new(rotation_rpy_rad, mounting_calibrated))
     }
 
-    let ux = axis_x / sin_angle;
-    let uy = axis_y / sin_angle;
-    let uz = axis_z / sin_angle;
-    let cross_x = uy * value.z - uz * value.y;
-    let cross_y = uz * value.x - ux * value.z;
-    let cross_z = ux * value.y - uy * value.x;
-    let dot = ux * value.x + uy * value.y + uz * value.z;
-    let one_minus_cos = 1.0 - cos_angle;
+    fn new(rotation_rpy_rad: [f32; 3], mounting_calibrated: bool) -> Self {
+        Self {
+            imu_to_base: pete_now::RigidTransform3 {
+                rotation_rpy_rad,
+                ..pete_now::RigidTransform3::default()
+            },
+            mounting_calibrated,
+            last_t_ms: None,
+            roll_rad: None,
+            pitch_rad: None,
+            gyro_bias_sum: [0.0; 3],
+            gyro_bias: [0.0; 3],
+            gyro_bias_samples: 0,
+        }
+    }
 
-    Vec3Unit {
-        x: value.x * cos_angle + cross_x * sin_angle + ux * dot * one_minus_cos,
-        y: value.y * cos_angle + cross_y * sin_angle + uy * dot * one_minus_cos,
-        z: value.z * cos_angle + cross_z * sin_angle + uz * dot * one_minus_cos,
+    fn update(&mut self, mut sense: ImuSense) -> ImuSense {
+        let acceleration = transform_sensor_vector(self.imu_to_base, &sense.acceleration);
+        let angular_velocity = transform_sensor_vector(self.imu_to_base, &sense.angular_velocity);
+        let accel_norm = vector_norm(acceleration);
+        let gyro_norm = vector_norm(angular_velocity);
+        let stationary = (0.96..=1.04).contains(&accel_norm) && gyro_norm <= 0.08;
+        if stationary && self.gyro_bias_samples < MPU6050_GYRO_BIAS_SAMPLES {
+            for (sum, sample) in self.gyro_bias_sum.iter_mut().zip(angular_velocity) {
+                *sum += sample;
+            }
+            self.gyro_bias_samples += 1;
+            if self.gyro_bias_samples == MPU6050_GYRO_BIAS_SAMPLES {
+                for axis in 0..3 {
+                    self.gyro_bias[axis] =
+                        self.gyro_bias_sum[axis] / MPU6050_GYRO_BIAS_SAMPLES as f32;
+                }
+            }
+        }
+        let gyro = [
+            angular_velocity[0] - self.gyro_bias[0],
+            angular_velocity[1] - self.gyro_bias[1],
+            angular_velocity[2] - self.gyro_bias[2],
+        ];
+        let dt_s = self
+            .last_t_ms
+            .map(|last| sense.captured_at_ms.abs_diff(last) as f32 / 1000.0)
+            .unwrap_or(0.0)
+            .clamp(0.0, 0.1);
+        self.last_t_ms = Some(sense.captured_at_ms);
+        let accel_trusted = (0.90..=1.10).contains(&accel_norm);
+        let accel_orientation = accel_trusted.then(|| {
+            let roll = acceleration[1].atan2(acceleration[2]);
+            let pitch = (-acceleration[0]).atan2(
+                (acceleration[1] * acceleration[1] + acceleration[2] * acceleration[2]).sqrt(),
+            );
+            [roll, pitch]
+        });
+        let predicted_roll = self
+            .roll_rad
+            .unwrap_or_else(|| accel_orientation.map(|v| v[0]).unwrap_or(0.0))
+            + gyro[0] * dt_s;
+        let predicted_pitch = self
+            .pitch_rad
+            .unwrap_or_else(|| accel_orientation.map(|v| v[1]).unwrap_or(0.0))
+            + gyro[1] * dt_s;
+        let (roll, pitch) = if let Some([accel_roll, accel_pitch]) = accel_orientation {
+            let gyro_weight = if stationary { 0.96 } else { 0.985 };
+            (
+                blend_angle(predicted_roll, accel_roll, 1.0 - gyro_weight),
+                blend_angle(predicted_pitch, accel_pitch, 1.0 - gyro_weight),
+            )
+        } else {
+            (predicted_roll, predicted_pitch)
+        };
+        self.roll_rad = Some(roll);
+        self.pitch_rad = Some(pitch);
+        sense.schema_version = 2;
+        sense.orientation = vec![roll, pitch];
+        sense.acceleration = acceleration.to_vec();
+        sense.angular_velocity = gyro.to_vec();
+        sense.gyro_bias_calibrated = self.gyro_bias_samples >= MPU6050_GYRO_BIAS_SAMPLES;
+        sense.mounting_calibrated = self.mounting_calibrated;
+        sense.orientation_confidence = match (
+            sense.mounting_calibrated,
+            sense.gyro_bias_calibrated,
+            accel_trusted,
+        ) {
+            (true, true, true) => 0.95,
+            (true, true, false) => 0.70,
+            (true, false, true) => 0.45,
+            _ => 0.20,
+        };
+        sense.orientation_source = Some("mpu6050_complementary_accel_gyro".to_string());
+        sense
     }
 }
 
 #[cfg(any(feature = "linux-hardware", test))]
-fn roll_pitch_from_gravity(gravity: Vec3Unit) -> (f32, f32) {
-    let roll_rad = gravity.y.atan2(gravity.z);
-    let pitch_rad = (-gravity.x).atan2((gravity.y * gravity.y + gravity.z * gravity.z).sqrt());
-    (roll_rad, pitch_rad)
+#[cfg(feature = "linux-hardware")]
+fn parse_imu_mount_rpy_deg(value: &str) -> Result<[f32; 3]> {
+    let values = value
+        .split(',')
+        .map(|part| part.trim().parse::<f32>().map(f32::to_radians))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if values.len() != 3 || values.iter().any(|value| !value.is_finite()) {
+        anyhow::bail!("PETE_IMU_TO_BASE_RPY_DEG must contain three finite comma-separated values");
+    }
+    Ok([values[0], values[1], values[2]])
+}
+
+#[cfg(any(feature = "linux-hardware", test))]
+fn transform_sensor_vector(transform: pete_now::RigidTransform3, values: &[f32]) -> [f32; 3] {
+    if values.len() < 3 {
+        return [0.0; 3];
+    }
+    pete_now::RigidTransform3 {
+        translation_m: [0.0; 3],
+        ..transform
+    }
+    .transform_point([values[0], values[1], values[2]])
+}
+
+#[cfg(any(feature = "linux-hardware", test))]
+fn vector_norm(vector: [f32; 3]) -> f32 {
+    (vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]).sqrt()
+}
+
+#[cfg(any(feature = "linux-hardware", test))]
+fn blend_angle(predicted: f32, measured: f32, measured_weight: f32) -> f32 {
+    let delta = (measured - predicted + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
+        - std::f32::consts::PI;
+    predicted + delta * measured_weight
 }

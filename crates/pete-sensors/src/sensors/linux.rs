@@ -214,6 +214,8 @@ impl V4lCamera {
     pub fn capture_frame(&mut self) -> Result<EyeFrame> {
         let (bytes, _) = self.stream.next()?;
         Ok(EyeFrame {
+            rgbd_frame_id: None,
+            device_timestamp_ms: None,
             captured_at_ms: unix_time_ms(),
             width: self.format.width,
             height: self.format.height,
@@ -424,6 +426,7 @@ fn mpu6050_samples_to_imu(bytes: [u8; 14], captured_at_ms: TimeMs) -> ImuSense {
         orientation: vec![roll_rad, pitch_rad],
         acceleration: vec![accel_x, accel_y, accel_z],
         angular_velocity: vec![gyro_x, gyro_y, gyro_z],
+        ..ImuSense::default()
     }
 }
 

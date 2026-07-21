@@ -13,9 +13,19 @@ pub fn pointcloud_observations_from_snapshot(
     t_ms: TimeMs,
     config: PointCloudConfig,
 ) -> Vec<PointCloudObservation> {
-    let color = snapshot
-        .eye_frame
-        .as_ref()
+    let paired_color = snapshot.kinect.color_frame.as_ref().filter(|frame| {
+        frame
+            .captured_at_ms
+            .abs_diff(snapshot.kinect.captured_at_ms)
+            <= 50
+            && frame.rgbd_frame_id.is_some()
+            && frame.rgbd_frame_id == snapshot.kinect.rgbd_frame_id
+    });
+    let legacy_color = (snapshot.kinect.schema_version < 2)
+        .then_some(snapshot.eye_frame.as_ref())
+        .flatten();
+    let color = paired_color
+        .or(legacy_color)
         .and_then(DepthColorImage::from_eye_frame);
     let pose = snapshot.body.odometry;
     let orientation = orientation_from_snapshot(snapshot);
@@ -24,16 +34,29 @@ pub fn pointcloud_observations_from_snapshot(
         snapshot.body.velocity.turn_rad_s,
     );
     let mut observations = Vec::new();
-    if let Some(observation) = pointcloud_observation_from_kinect_with_color(
-        &snapshot.kinect,
-        pose,
-        orientation,
-        pose_confidence,
-        t_ms,
-        config,
-        color.as_ref(),
-    ) {
-        observations.push(observation);
+    let aligned = snapshot.kinect.fusion_alignment.as_ref();
+    if snapshot.kinect.schema_version < 2 || aligned.is_some() {
+        let kinect_pose = aligned.map(|aligned| aligned.pose).unwrap_or(pose);
+        let kinect_orientation = aligned
+            .map(|aligned| orientation_from_imu(&aligned.imu, aligned.pose.heading_rad))
+            .unwrap_or(orientation);
+        let kinect_confidence = aligned
+            .map(|aligned| pose_confidence * aligned.confidence)
+            .unwrap_or(pose_confidence);
+        let kinect_t_ms = (snapshot.kinect.captured_at_ms > 0)
+            .then_some(snapshot.kinect.captured_at_ms)
+            .unwrap_or(t_ms);
+        if let Some(observation) = pointcloud_observation_from_kinect_with_color(
+            &snapshot.kinect,
+            kinect_pose,
+            kinect_orientation,
+            kinect_confidence,
+            kinect_t_ms,
+            config,
+            color.as_ref(),
+        ) {
+            observations.push(observation);
+        }
     }
     if let Some(observation) = pointcloud_observation_from_range(
         &snapshot.range,
@@ -67,6 +90,7 @@ pub fn pointcloud_observation_from_range(
         .max(1);
     let source_frame_id =
         (range.captured_at_ms > 0).then(|| format!("range-{}", range.captured_at_ms));
+    let beam_poses = (range.beam_poses.len() == range.beams.len()).then_some(&range.beam_poses);
     let points = range
         .beams
         .iter()
@@ -81,8 +105,24 @@ pub fn pointcloud_observation_from_range(
             {
                 return None;
             }
+            let robot_point = range_endpoint_in_robot(*distance_m, *angle_rad, extrinsics);
+            let position = beam_poses
+                .map(|poses| {
+                    transform_point_to_world(
+                        robot_point,
+                        PointCloudFrame::RobotBase,
+                        poses[index],
+                        OrientationEstimate {
+                            yaw_rad: Some(poses[index].heading_rad),
+                            yaw_source: YawSource::OdometryHeading,
+                            ..OrientationEstimate::default()
+                        },
+                        config,
+                    )
+                })
+                .unwrap_or(robot_point);
             Some(PointCloudPoint {
-                position: range_endpoint_in_robot(*distance_m, *angle_rad, extrinsics),
+                position,
                 color_rgb: None,
                 confidence: pose_confidence,
                 depth_index: Some(index),
@@ -96,7 +136,11 @@ pub fn pointcloud_observation_from_range(
         return None;
     }
     Some(PointCloudObservation {
-        frame: PointCloudFrame::RobotBase,
+        frame: if beam_poses.is_some() {
+            PointCloudFrame::OdometryWorld
+        } else {
+            PointCloudFrame::RobotBase
+        },
         pose: PoseEstimate {
             pose,
             confidence: pose_confidence,
@@ -112,6 +156,8 @@ pub fn pointcloud_observation_from_range(
             "beam_count": range.beams.len(),
             "sample_stride": stride,
             "sensor_extrinsics": extrinsics,
+            "motion_deskewed": beam_poses.is_some(),
+            "beam_pose_max_skew_ms": range.beam_pose_max_skew_ms,
             "orientation": orientation,
         }),
     })
@@ -149,6 +195,8 @@ fn pointcloud_observation_from_kinect_with_color(
         return None;
     }
     let projection = DepthProjection::from_kinect(kinect)?;
+    let geometry = pete_now::DepthGeometry::from_kinect(kinect)?;
+    let calibrated_base = kinect.geometry_calibration.is_some();
     let stride = kinect
         .depth_m
         .len()
@@ -161,6 +209,27 @@ fn pointcloud_observation_from_kinect_with_color(
     let mut skipped_depth_count = 0usize;
     let mut clipped_depth_count = 0usize;
     let mut points = Vec::new();
+    let mut rgb_nearest_depth = BTreeMap::<(u32, u32), f32>::new();
+    if color.is_some() && kinect.geometry_calibration.is_some() {
+        for (index, depth) in kinect.depth_m.iter().enumerate().step_by(stride) {
+            if !depth.is_finite() || *depth < min_depth_m || *depth > max_depth_m {
+                continue;
+            }
+            let u = (index % projection.width) as f32;
+            let v = (index / projection.width) as f32;
+            let Some(camera_point) = geometry.depth_pixel_to_camera(u, v, *depth) else {
+                continue;
+            };
+            let Some(pixel) = geometry.depth_point_to_rgb_pixel(camera_point) else {
+                continue;
+            };
+            let key = (pixel[0].round() as u32, pixel[1].round() as u32);
+            rgb_nearest_depth
+                .entry(key)
+                .and_modify(|nearest| *nearest = nearest.min(camera_point[2]))
+                .or_insert(camera_point[2]);
+        }
+    }
     for (index, depth) in kinect.depth_m.iter().enumerate().step_by(stride) {
         if !depth.is_finite() || *depth <= 0.0 {
             skipped_depth_count = skipped_depth_count.saturating_add(1);
@@ -172,17 +241,34 @@ fn pointcloud_observation_from_kinect_with_color(
         }
         let u = (index % projection.width) as f32;
         let v = (index / projection.width) as f32;
-        let z_m = *depth;
-        let x_m = (u - projection.cx) * z_m / projection.fx.max(f32::EPSILON);
-        let y_m = (v - projection.cy) * z_m / projection.fy.max(f32::EPSILON);
+        let camera_point = geometry.depth_pixel_to_camera(u, v, *depth)?;
+        let [x_m, y_m, z_m] = if calibrated_base {
+            geometry.depth_point_to_base(camera_point)
+        } else {
+            camera_point
+        };
         let color_rgb = color
             .and_then(|color| {
-                color.sample_depth_pixel(
-                    index % projection.width,
-                    index / projection.width,
-                    projection.width,
-                    projection.height,
-                )
+                if kinect.geometry_calibration.is_some() {
+                    geometry
+                        .depth_point_to_rgb_pixel(camera_point)
+                        .filter(|pixel| {
+                            let key = (pixel[0].round() as u32, pixel[1].round() as u32);
+                            rgb_nearest_depth
+                                .get(&key)
+                                .is_some_and(|nearest| camera_point[2] <= *nearest + 0.02)
+                        })
+                        .and_then(|pixel| color.sample_projected(pixel))
+                } else if kinect.schema_version < 2 {
+                    color.sample_depth_pixel(
+                        index % projection.width,
+                        index / projection.width,
+                        projection.width,
+                        projection.height,
+                    )
+                } else {
+                    None
+                }
             })
             .or_else(|| depth_shade(z_m, max_depth_m));
         points.push(PointCloudPoint {
@@ -199,7 +285,11 @@ fn pointcloud_observation_from_kinect_with_color(
         return None;
     }
     Some(PointCloudObservation {
-        frame: projection.frame,
+        frame: if calibrated_base {
+            PointCloudFrame::RobotBase
+        } else {
+            projection.frame
+        },
         pose: PoseEstimate {
             pose,
             confidence: pose_confidence,
@@ -225,6 +315,9 @@ fn pointcloud_observation_from_kinect_with_color(
             "max_depth_m": max_depth_m,
             "skipped_depth_count": skipped_depth_count,
             "clipped_depth_count": clipped_depth_count,
+            "fusion_alignment": kinect.fusion_alignment,
+            "rgbd_frame_id": kinect.rgbd_frame_id,
+            "geometry_calibrated": kinect.geometry_calibration.is_some_and(|calibration| calibration.calibrated),
         }),
     })
 }
@@ -272,6 +365,17 @@ impl DepthColorImage {
             *self.rgb.get(offset + 1)?,
             *self.rgb.get(offset + 2)?,
         ])
+    }
+
+    fn sample_projected(&self, pixel: [f32; 2]) -> Option<[u8; 3]> {
+        if !(pixel[0].is_finite() && pixel[1].is_finite()) {
+            return None;
+        }
+        let x = pixel[0].round() as usize;
+        let y = pixel[1].round() as usize;
+        (x < self.width && y < self.height)
+            .then(|| self.sample(x, y))
+            .flatten()
     }
 }
 
