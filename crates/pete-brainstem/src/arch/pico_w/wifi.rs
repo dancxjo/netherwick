@@ -74,9 +74,9 @@ async fn start_wifi_ap(
     wifi_cs: Peri<'static, PIN_25>,
     wifi_clk: Peri<'static, PIN_29>,
 ) -> Option<(Stack<'static>, cyw43::Control<'static>)> {
-    let fw = aligned_bytes!("../../firmware/cyw43/43439A0.bin");
-    let clm = aligned_bytes!("../../firmware/cyw43/43439A0_clm.bin");
-    let nvram = aligned_bytes!("../../firmware/cyw43/nvram_rp2040.bin");
+    let fw = aligned_bytes!("../../../firmware/cyw43/43439A0.bin");
+    let clm = aligned_bytes!("../../../firmware/cyw43/43439A0_clm.bin");
+    let nvram = aligned_bytes!("../../../firmware/cyw43/nvram_rp2040.bin");
 
     let pwr = Output::new(wifi_power, Level::Low);
     let cs = Output::new(wifi_cs, Level::High);
