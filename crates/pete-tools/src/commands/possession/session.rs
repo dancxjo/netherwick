@@ -866,20 +866,27 @@ fn run_possession_shutdown_with_retry<C: Cockpit + ?Sized>(
     attempts: usize,
     delay: Duration,
 ) -> Result<()> {
-    retry_possession_shutdown_command(
+    let stop_result = retry_possession_shutdown_command(
         cockpit,
         "possession shutdown STOP",
         attempts,
         delay,
         Cockpit::stop,
-    )?;
-    retry_possession_shutdown_command(
+    );
+    let exorcize_result = retry_possession_shutdown_command(
         cockpit,
         "possession exorcize",
         attempts,
         delay,
         Cockpit::exorcize,
-    )
+    );
+    match (stop_result, exorcize_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(stop_error), Err(exorcize_error)) => anyhow::bail!(
+            "possession STOP and exorcize both failed: STOP: {stop_error:#}; exorcize: {exorcize_error:#}"
+        ),
+    }
 }
 
 fn retry_possession_shutdown_command<C, F>(

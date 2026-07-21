@@ -558,6 +558,27 @@ fn possession_shutdown_retries_plain_busy_stop_and_exorcize() {
     assert_eq!(cockpit.exorcize_attempts, 2);
 }
 
+#[test]
+fn possession_shutdown_attempts_exorcize_after_stop_failure() {
+    let mut cockpit = BusyShutdownCockpit {
+        stop_busy_remaining: 3,
+        exorcize_busy_remaining: 0,
+        stop_attempts: 0,
+        exorcize_attempts: 0,
+        status_reads: 0,
+        stopped: false,
+        exorcized: false,
+    };
+
+    let error = run_possession_shutdown_with_retry(&mut cockpit, 3, Duration::ZERO).unwrap_err();
+
+    assert!(error.to_string().contains("possession shutdown STOP"));
+    assert!(!cockpit.stopped);
+    assert!(cockpit.exorcized);
+    assert_eq!(cockpit.stop_attempts, 3);
+    assert_eq!(cockpit.exorcize_attempts, 1);
+}
+
 #[tokio::test]
 async fn possession_loop_error_still_shuts_down_and_finalizes_capture() {
     let temp_dir = temp_path("pete_possession_error_finalization");
