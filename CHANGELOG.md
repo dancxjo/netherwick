@@ -26,6 +26,8 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Connect the UDP cockpit socket to its configured brainstem peer so valid-looking
+  datagrams from unrelated local senders cannot be accepted as brainstem replies.
 - Ready: Make possession reconnect cancellation-aware during both connection
   attempts and exponential backoff, keep the dashboard in an explicit
   stopped/reconnecting state, and allow SIGINT/SIGTERM to close capture and
