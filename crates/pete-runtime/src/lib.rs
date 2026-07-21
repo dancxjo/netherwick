@@ -16821,8 +16821,8 @@ mod tests {
         )
     }
 
-    async fn finished_cognition_task(
-    ) -> JoinHandle<Result<(Option<Combobulation>, LlmTickResult)>> {
+    async fn finished_cognition_task() -> JoinHandle<Result<(Option<Combobulation>, LlmTickResult)>>
+    {
         let task = tokio::spawn(async {
             Ok((
                 None,
@@ -16965,6 +16965,170 @@ mod tests {
             .unwrap();
         assert!(runtime.cognition.pending.is_some());
         assert!(eligible.frame.now.world.self_model.service_state.services["rich_language"].busy);
+    }
+
+    #[tokio::test]
+    async fn paused_runtime_clock_does_not_expire_completed_cognition() {
+        let ledger = JsonlLedger::new("/tmp/pete-runtime-cognition-paused-clock-test");
+        let mut runtime = test_runtime(ledger, FixedConductor::new(ActionPrimitive::Stop));
+        runtime.cognition.pending = Some(PendingLlmCognition {
+            snapshot_ref: "paused-frame".to_string(),
+            requested_at_ms: 1_000,
+            deadline_ms: 1_000 + COGNITION_DEADLINE_MS,
+            task: finished_cognition_task().await,
+        });
+        let now = idle_now(1_000);
+        let (embodied, latent, futures, mut notes) = cognition_test_inputs();
+
+        let accepted = runtime
+            .advance_cognition(&now, &[], &embodied, &latent, &futures, "", &mut notes)
+            .await
+            .expect("paused deterministic time should accept a completed provider result");
+
+        assert_eq!(accepted.requested_at_ms, 1_000);
+        assert_eq!(accepted.observed_at_ms, 1_000);
+        assert!(matches!(
+            runtime.cognition.last_outcome.as_ref(),
+            Some(CognitionOutcome::Accepted)
+        ));
+    }
+
+    #[tokio::test]
+    async fn replayed_earlier_now_does_not_expire_completed_cognition() {
+        let ledger = JsonlLedger::new("/tmp/pete-runtime-cognition-replay-clock-test");
+        let mut runtime = test_runtime(ledger, FixedConductor::new(ActionPrimitive::Stop));
+        runtime.cognition.pending = Some(PendingLlmCognition {
+            snapshot_ref: "future-replay-frame".to_string(),
+            requested_at_ms: 5_000,
+            deadline_ms: 5_000 + COGNITION_DEADLINE_MS,
+            task: finished_cognition_task().await,
+        });
+        let replayed_now = idle_now(500);
+        let (embodied, latent, futures, mut notes) = cognition_test_inputs();
+
+        let accepted = runtime
+            .advance_cognition(
+                &replayed_now,
+                &[],
+                &embodied,
+                &latent,
+                &futures,
+                "",
+                &mut notes,
+            )
+            .await
+            .expect("a backwards replay clock should not invent elapsed runtime time");
+
+        assert_eq!(accepted.requested_at_ms, 5_000);
+        assert_eq!(accepted.observed_at_ms, 500);
+        assert!(matches!(
+            runtime.cognition.last_outcome.as_ref(),
+            Some(CognitionOutcome::Accepted)
+        ));
+    }
+
+    #[tokio::test]
+    async fn forward_clock_jump_expires_in_flight_cognition() {
+        let ledger = JsonlLedger::new("/tmp/pete-runtime-cognition-forward-jump-test");
+        let mut runtime = test_runtime(ledger, FixedConductor::new(ActionPrimitive::Stop));
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<()>();
+        runtime.cognition.pending = Some(PendingLlmCognition {
+            snapshot_ref: "pre-jump-frame".to_string(),
+            requested_at_ms: 1_000,
+            deadline_ms: 1_000 + COGNITION_DEADLINE_MS,
+            task: tokio::spawn(async move {
+                completion_rx.await.expect("completion sender retained");
+                Ok((None, LlmTickResult::default()))
+            }),
+        });
+        let jumped_now = idle_now(10_000);
+        let (embodied, latent, futures, mut notes) = cognition_test_inputs();
+
+        let accepted = runtime
+            .advance_cognition(
+                &jumped_now,
+                &[],
+                &embodied,
+                &latent,
+                &futures,
+                "",
+                &mut notes,
+            )
+            .await;
+
+        assert!(accepted.is_none());
+        assert!(matches!(
+            runtime.cognition.last_outcome.as_ref(),
+            Some(CognitionOutcome::Expired)
+        ));
+        tokio::task::yield_now().await;
+        assert!(
+            completion_tx.send(()).is_err(),
+            "expired task should be aborted"
+        );
+    }
+
+    #[tokio::test]
+    async fn very_slow_cognition_tick_rejects_result_completed_before_late_poll() {
+        let ledger = JsonlLedger::new("/tmp/pete-runtime-cognition-slow-tick-test");
+        let mut runtime = test_runtime(ledger, FixedConductor::new(ActionPrimitive::Stop));
+        runtime.cognition.pending = Some(PendingLlmCognition {
+            snapshot_ref: "slow-tick-frame".to_string(),
+            requested_at_ms: 1_000,
+            deadline_ms: 1_000 + COGNITION_DEADLINE_MS,
+            task: finished_cognition_task().await,
+        });
+        let late_now = idle_now(1_000 + COGNITION_DEADLINE_MS + 1);
+        let (embodied, latent, futures, mut notes) = cognition_test_inputs();
+
+        let accepted = runtime
+            .advance_cognition(&late_now, &[], &embodied, &latent, &futures, "", &mut notes)
+            .await;
+
+        assert!(accepted.is_none());
+        assert!(matches!(
+            runtime.cognition.last_outcome.as_ref(),
+            Some(CognitionOutcome::Expired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cognition_provider_completion_exactly_at_deadline_is_accepted() {
+        let ledger = JsonlLedger::new("/tmp/pete-runtime-cognition-deadline-boundary-test");
+        let mut runtime = test_runtime(ledger, FixedConductor::new(ActionPrimitive::Stop));
+        let requested_at_ms = 1_000;
+        let deadline_ms = requested_at_ms + COGNITION_DEADLINE_MS;
+        runtime.cognition.pending = Some(PendingLlmCognition {
+            snapshot_ref: "deadline-frame".to_string(),
+            requested_at_ms,
+            deadline_ms,
+            task: finished_cognition_task().await,
+        });
+        let deadline_now = idle_now(deadline_ms);
+        let (embodied, latent, futures, mut notes) = cognition_test_inputs();
+
+        let accepted = runtime
+            .advance_cognition(
+                &deadline_now,
+                &[],
+                &embodied,
+                &latent,
+                &futures,
+                "",
+                &mut notes,
+            )
+            .await
+            .expect("the deadline is inclusive");
+
+        assert_eq!(accepted.observed_at_ms, deadline_ms);
+        assert!(matches!(
+            runtime.cognition.last_outcome.as_ref(),
+            Some(CognitionOutcome::Accepted)
+        ));
+        assert_eq!(
+            runtime.cognition.last_sense.command_summary.as_deref(),
+            Some("completed cognition")
+        );
     }
 
     #[tokio::test]
