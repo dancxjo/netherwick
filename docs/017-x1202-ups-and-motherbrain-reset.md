@@ -10,6 +10,12 @@ critical samples on battery and treats a failed `systemctl poweroff` as a
 service failure so systemd restarts monitoring. This is deliberately separate
 from the brainstem's hard reset path.
 
+The supported X1202 scope is the installed Pi 5 pogo connection only: MAX17040G
+I2C on GPIO2/3, external-input presence on GPIO6, and charging enable on GPIO16.
+Do not add telemetry jumpers, soldered signal leads, or an X1202-to-brainstem
+connection. Pi RUN reset is a separate circuit and is never inferred from X1202
+telemetry.
+
 Install `configs/pete-ups-x1202.toml` as `/etc/pete/x1202.toml`. It explicitly
 configures the I2C device/address, gpiochip, line offsets, polarities, and
 startup charging state. Its shipped values describe the Geekworm
@@ -45,3 +51,23 @@ follows the graceful shutdown path.
 
 Hardware references: [Geekworm X1202](https://wiki.geekworm.com/X1202) and
 [X1202 GPIO assignments](https://wiki.geekworm.com/X1202_Hardware).
+
+## Evidence and consolidation policy
+
+Every `UpsTelemetry` sample records independent observation times for the fuel
+gauge, GPIO6, and the GPIO16 command, plus confidence; the assessment reports
+their ages. `battery_current_a` is always absent and
+`battery_current_observable` false for MAX17040G. The runtime never invents a
+current measurement. It may label battery charging `likely_charging` only from
+fresh external power, a fresh enable command, and a positive voltage/SOC trend;
+otherwise that inference is `unobservable` or `not_charging`.
+
+The real-robot runtime reads `/run/pete/ups.json` through a bounded optional read
+and combines it with a fresh complete Create OI packet. The resulting
+`power.consolidation_readiness` dashboard/capture record exposes voltage, SOC,
+GPIO6, GPIO16, Create dock/contact/IR/charging state, evidence ages, inference,
+confidence, and reasons. Consolidation requires independently fresh stopped,
+docked, Create-charging, external-power, charging-enable, no-motion-authority,
+and battery-policy gates. Losing GPIO6 or any required freshness pauses the
+coordinator in its current durable phase; it does not send a brainstem or motor
+command. Set `PETE_UPS_STATUS_PATH` only when testing an alternate status file.

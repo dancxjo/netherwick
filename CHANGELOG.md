@@ -6,6 +6,11 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Add a truthful pogo-only X1202/Create power evidence model with per-signal
+  ages/confidence, explicit absent-current semantics, trend-qualified charging
+  inference, independent consolidation gates, mid-cycle pause on power loss,
+  and dashboard/WorldLab capture exposure through the real runtime path.
+
 - Extend replay validation with a full-turn stationary-rotation evaluator
   (unwrapped heading, IMU agreement, axle translation, calibration remount and
   covariance gates, optional lidar) and return-to-start reports with physical

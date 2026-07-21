@@ -233,7 +233,9 @@ fn now_builder_exposes_power_evidence_in_dashboard_and_capture_snapshot() {
         "ages": {"external_power_ms": 12},
     });
     builder.set_power_assessment(Some(assessment.clone()));
-    let now = builder.build(1_000, BodySense::default(), Vec::new()).unwrap();
+    let now = builder
+        .build(1_000, BodySense::default(), Vec::new())
+        .unwrap();
     assert_eq!(now.extensions["power.consolidation_readiness"], assessment);
     assert_eq!(builder.snapshot().power_assessment, Some(assessment));
 }

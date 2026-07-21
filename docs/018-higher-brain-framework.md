@@ -158,11 +158,14 @@ validation never touches `current`. Arbitrary learned artifacts targeting
 
 ## Docked consolidation
 
-`ConsolidationCoordinator` persists one phase at a time. It refuses to start
+`ConsolidationCoordinator` persists one phase at a time. Its production
+`start_with_power_assessment` path refuses to start
 unless Create is stopped, docked, charging, has no active motion authority, and
-the UPS reports suitable external power. The X1202 adapter uses the existing
-`UpsTelemetry`; dock state remains a narrow `DockReadiness` interface until the
-physical X1202/Create integration is verified.
+fresh independent X1202 GPIO6/GPIO16/fuel-gauge and Create OI evidence satisfy
+the battery policy. The compatibility `start` interface remains for older
+callers, but it cannot represent evidence age and is not the physical acceptance
+path. `tick_with_power_assessment` rechecks evidence before every expensive
+phase and pauses in place when external power or charging evidence disappears.
 
 The cycle checkpoints an epoch, discovers an authorized compatible forebrain,
 transfers complete bundles, submits and waits for jobs, retrieves candidates,
