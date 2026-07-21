@@ -1,0 +1,17 @@
+pub const MODEL_REGISTRY: &[&str] = &[
+    "ExperienceEncoder",
+    "ExperienceDecoder",
+    "ExperienceAutoencoder",
+    "FuturePredictor",
+    "EyeNextPredictor",
+    "EarNextPredictor",
+    "DangerPredictor",
+    "ChargePredictor",
+    "ActionValueNet",
+    "SalienceNet",
+    "GoalArbiterNet",
+    "MemoryConsolidationNet",
+    "FaceFamiliarityNet",
+    "VoiceFamiliarityNet",
+    "ConductorNet",
+];
