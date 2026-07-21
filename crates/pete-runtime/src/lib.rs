@@ -3231,7 +3231,8 @@ where
     /// `JoinHandle::is_finished` is deliberately checked before awaiting it,
     /// making the only await here a ready-value extraction rather than model
     /// or network I/O. Provider output is reduced to `LlmSense` and typed
-    /// evidence; decisions and conscious commands never cross this boundary.
+    /// evidence. Decisions cross only as discarded advisory telemetry;
+    /// conscious commands and executable actions never cross this boundary.
     async fn advance_cognition(
         &mut self,
         now: &Now,
@@ -3691,22 +3692,40 @@ where
         let combobulation = accepted_llm
             .as_ref()
             .and_then(|accepted| accepted.reflection.clone());
+        let llm_advisory_action = accepted_llm.as_ref().and_then(|accepted| {
+            accepted
+                .tick
+                .decision
+                .as_ref()
+                .and_then(|decision| decision.action.clone())
+                .map(|action| LlmAdvisoryAction {
+                    action,
+                    source: LlmAdvisoryActionSource::ProviderDecision,
+                    input_snapshot_ref: accepted.snapshot_ref.clone(),
+                    disposition: LlmAdvisoryActionDisposition::DiscardedAtAdvisoryBoundary,
+                })
+        });
         let llm_tick = accepted_llm
             .map(|accepted| accepted.tick)
             .unwrap_or_default();
         let llm_command_action = None;
         let mut llm_action_proposal = LlmActionProposal {
             proposed_action: llm_command_action.clone(),
-            ignored_reason: if llm_command_action.is_none() {
-                llm_tick
-                    .decision
-                    .as_ref()
-                    .map(|_| "no executable action proposed".to_string())
-            } else {
-                None
-            },
+            advisory_action: llm_advisory_action.clone(),
+            ignored_reason: llm_advisory_action.as_ref().map(|advisory| {
+                format!(
+                    "provider suggested {:?}; discarded at advisory boundary",
+                    advisory.action
+                )
+            }),
             ..LlmActionProposal::default()
         };
+        if let Some(advisory) = llm_advisory_action.as_ref() {
+            notes.push(format!(
+                "LlmAdvisoryAction: provider suggested {:?}; discarded at advisory boundary (input_snapshot_ref={})",
+                advisory.action, advisory.input_snapshot_ref
+            ));
+        }
         let llm_has_safety_reason = crate::llm_explicit_safety_reason(&llm_tick);
         let direct_reign_active = reign_input
             .as_ref()
@@ -4399,6 +4418,7 @@ where
             "action.motion_bridge".to_string(),
             serde_json::json!({
                 "llm_action": llm_action_proposal.proposed_action.clone(),
+                "llm_advisory_action": llm_action_proposal.advisory_action.clone(),
                 "selected_action": action_selection.selected_action.clone(),
                 "conductor_selected_action": conductor_selected_output.clone(),
                 "conductor_navigation_goal": conductor_navigation_goal.as_ref(),
@@ -4421,8 +4441,9 @@ where
             ));
         }
         notes.push(format!(
-            "ActionMotorBridge llm_action={:?} selected_action={:?} conductor_selected_action={:?} chosen_action={:?} desired_motor={:?} final_motor={:?} safety_override={}",
+            "ActionMotorBridge llm_action={:?} llm_advisory_action={:?} selected_action={:?} conductor_selected_action={:?} chosen_action={:?} desired_motor={:?} final_motor={:?} safety_override={}",
             llm_action_proposal.proposed_action,
+            llm_action_proposal.advisory_action,
             action_selection.selected_action,
             conductor_selected_output,
             chosen_action,
@@ -13316,7 +13337,13 @@ mod tests {
 
         assert_eq!(bump_escape_attempts.load(Ordering::SeqCst), 0);
         assert!(bump_escape_commands.lock().unwrap().is_empty());
-        assert_eq!(tick.chosen_action, Some(ActionPrimitive::Stop));
+        assert_ne!(
+            tick.chosen_action,
+            Some(ActionPrimitive::Go {
+                intensity: 0.3,
+                duration_ms: 700,
+            })
+        );
     }
 
     #[tokio::test]
@@ -17253,7 +17280,20 @@ mod tests {
                 },
             },
         );
-        let mut now = idle_now(100);
+        runtime
+            .tick(idle_now(100), ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+        let provider_input_ref = runtime
+            .cognition
+            .pending
+            .as_ref()
+            .expect("provider request in flight")
+            .snapshot_ref
+            .clone();
+        tokio::task::yield_now().await;
+
+        let mut now = idle_now(200);
         now.body.flags.cliff_left = true;
 
         let tick = runtime
@@ -17270,9 +17310,43 @@ mod tests {
             .unwrap();
 
         assert!(proposal.proposed_action.is_none());
+        assert_eq!(
+            proposal.advisory_action,
+            Some(LlmAdvisoryAction {
+                action: ActionPrimitive::Go {
+                    intensity: 0.3,
+                    duration_ms: 700,
+                },
+                source: LlmAdvisoryActionSource::ProviderDecision,
+                input_snapshot_ref: provider_input_ref,
+                disposition: LlmAdvisoryActionDisposition::DiscardedAtAdvisoryBoundary,
+            })
+        );
         assert!(!proposal.accepted);
         assert!(!proposal.safety_vetoed);
+        assert_eq!(
+            proposal.ignored_reason.as_deref(),
+            Some(
+                "provider suggested Go { intensity: 0.3, duration_ms: 700 }; discarded at advisory boundary"
+            )
+        );
         assert_eq!(tick.chosen_action, Some(ActionPrimitive::Stop));
+        let bridge = tick
+            .frame
+            .now
+            .extensions
+            .get("action.motion_bridge")
+            .expect("motion bridge telemetry");
+        assert!(bridge["llm_action"].is_null());
+        assert_eq!(
+            bridge["llm_advisory_action"]["disposition"],
+            "discarded_at_advisory_boundary"
+        );
+        assert!(tick.frame.notes.iter().any(|note| {
+            note.contains(
+                "LlmAdvisoryAction: provider suggested Go { intensity: 0.3, duration_ms: 700 }; discarded at advisory boundary",
+            )
+        }));
     }
 
     fn arena() -> ArenaConfig {

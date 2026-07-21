@@ -15,7 +15,9 @@ use axum_server::tls_rustls::RustlsConfig;
 use base64::Engine;
 use image::codecs::png::PngEncoder;
 use image::{ColorType, ImageEncoder};
-use pete_actions::{ActionPrimitive, ReignCommand, ReignInput, ReignMode, ReignSource, TurnDir};
+use pete_actions::{
+    ActionPrimitive, LlmAdvisoryAction, ReignCommand, ReignInput, ReignMode, ReignSource, TurnDir,
+};
 use pete_behaviors::{BehaviorNodeState, BehaviorNodeUpdate, BehaviorRegime};
 use pete_cockpit::{MotionCommand, MotorCommand};
 use pete_core::TimeMs;
@@ -1369,6 +1371,7 @@ pub struct SceneAction {
     pub safety_override: bool,
     pub not_moving_reason: Option<String>,
     pub latest_llm_proposed_action: Option<ActionPrimitive>,
+    pub latest_llm_advisory_action: Option<LlmAdvisoryAction>,
     pub llm_action_accepted: Option<bool>,
     pub llm_action_safety_vetoed: Option<bool>,
     pub final_selected_action: Option<ActionPrimitive>,
@@ -4214,6 +4217,10 @@ fn scene_action_from_snapshot(snapshot: &WorldSnapshot) -> SceneAction {
             .llm_action_proposal
             .as_ref()
             .and_then(|proposal| proposal.proposed_action.clone()),
+        latest_llm_advisory_action: snapshot
+            .llm_action_proposal
+            .as_ref()
+            .and_then(|proposal| proposal.advisory_action.clone()),
         llm_action_accepted: snapshot
             .llm_action_proposal
             .as_ref()
@@ -10268,14 +10275,23 @@ mod tests {
             duration_ms: 1_000,
         });
         snapshot.llm_action_proposal = Some(pete_actions::LlmActionProposal {
-            proposed_action: Some(ActionPrimitive::Explore {
-                style: pete_actions::ExploreStyle::RandomWalk,
-                duration_ms: 1_000,
+            proposed_action: None,
+            advisory_action: Some(pete_actions::LlmAdvisoryAction {
+                action: ActionPrimitive::Go {
+                    intensity: 0.4,
+                    duration_ms: 800,
+                },
+                source: pete_actions::LlmAdvisoryActionSource::ProviderDecision,
+                input_snapshot_ref: "provider-input-1200".to_string(),
+                disposition:
+                    pete_actions::LlmAdvisoryActionDisposition::DiscardedAtAdvisoryBoundary,
             }),
-            accepted: true,
+            accepted: false,
             safety_vetoed: false,
             final_action: snapshot.final_selected_action.clone(),
-            ignored_reason: None,
+            ignored_reason: Some(
+                "provider suggested Go; discarded at advisory boundary".to_string(),
+            ),
             safety_reason: None,
         });
         snapshot.range.beams = vec![1.0, 2.0, 3.0];
@@ -10299,6 +10315,10 @@ mod tests {
             .llm_action_proposal
             .as_ref()
             .and_then(|proposal| proposal.proposed_action.clone());
+        let expected_llm_advisory_action = snapshot
+            .llm_action_proposal
+            .as_ref()
+            .and_then(|proposal| proposal.advisory_action.clone());
         let expected_final_action = snapshot.final_selected_action.clone();
         state.update(snapshot);
 
@@ -10315,8 +10335,16 @@ mod tests {
         assert_eq!(scene.body.y_m, 0.75);
         assert_eq!(scene.body.heading_rad, 1.25);
         assert_eq!(scene.action.latest_llm_proposed_action, expected_llm_action);
-        assert_eq!(scene.action.llm_action_accepted, Some(true));
+        assert_eq!(
+            scene.action.latest_llm_advisory_action,
+            expected_llm_advisory_action
+        );
+        assert_eq!(scene.action.llm_action_accepted, Some(false));
         assert_eq!(scene.action.llm_action_safety_vetoed, Some(false));
+        assert_eq!(
+            scene.action.llm_action_ignored_reason.as_deref(),
+            Some("provider suggested Go; discarded at advisory boundary")
+        );
         assert_eq!(scene.action.final_selected_action, expected_final_action);
         assert_eq!(scene.range.nearest_m, Some(1.0));
         assert_eq!(scene.range.beams.len(), 3);

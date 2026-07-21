@@ -6,6 +6,9 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Preserve provider-suggested cognition decisions as provenance-bearing,
+  non-executable advisory telemetry through runtime and scene snapshots when
+  they are discarded at the authority boundary.
 - Keep `rich_language` available while a healthy cognition request is in flight,
   and report request occupancy separately as `busy` instead of treating every
   pending request as a service outage; enforce a runtime-owned cooldown after
