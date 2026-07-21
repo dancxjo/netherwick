@@ -47,6 +47,16 @@
     }
 
     #[test]
+    fn embedded_browser_exposes_status_synced_silent_mode_toggle() {
+        let page = core::str::from_utf8(index_html()).expect("browser page must be UTF-8");
+
+        assert!(page.contains(r#"id="silent" type="checkbox">Silent mode"#));
+        assert!(page.contains("setEnabled('silent',canSession('set_silent'))"));
+        assert!(page.contains("sendCockpit({kind:'set_silent',silent})"));
+        assert!(page.contains("$('silent').checked=!!s.audio_silent"));
+    }
+
+    #[test]
     fn compact_get_events_requires_a_numeric_cursor() {
         assert!(matches!(
             parse_forebrain_uart_command("GET_EVENTS 103 491"),
