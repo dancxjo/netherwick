@@ -538,6 +538,41 @@ fn charging_or_home_base_contact_completes_dock_alignment_operation() {
     }
 }
 
+#[test]
+fn home_base_contact_does_not_complete_dock_alignment_skill_without_charging() {
+    let request = SkillRequest {
+        skill_id: SkillId::AlignWithDock,
+        maximum_duration_ms: 2_000,
+        ..SkillRequest::default()
+    };
+    let mut cockpit = SimCockpit::new().with_unscoped_bench_mode();
+    let events = cockpit.get_events_since(0).unwrap();
+    let mut runtime = PossessorSkillRuntime::default();
+    let mut status = SkillStatus::default();
+
+    for now_ms in (1..=1_301).step_by(100) {
+        (status, _) = possessor_test_step(
+            &mut runtime,
+            &mut cockpit,
+            &request,
+            &BodySense::default(),
+            true,
+            &events,
+            now_ms,
+        );
+        if status.phase == SkillPhase::Terminal {
+            break;
+        }
+    }
+
+    assert_eq!(status.phase, SkillPhase::Terminal);
+    assert_eq!(status.outcome, Some(SkillOutcome::PostconditionFailed));
+    assert!(status
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("fresh Create OI charging telemetry")));
+}
+
 fn poll_verify_charging(
     status_raw: &str,
     body_charging: bool,
