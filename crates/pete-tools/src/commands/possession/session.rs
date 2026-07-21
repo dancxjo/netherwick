@@ -568,24 +568,47 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
 
     let possession_cockpit = (robot_mode == RobotMode::Slow && possession_connected)
         .then(|| runner.cockpit.client_mut().as_mut());
-    let (exit_result, capture_summary) = finalize_robot_exit(
+    let finalization = finalize_robot_exit(
         control_result,
         possession_cockpit,
         capture,
         args.capture.as_deref(),
     )
     .await;
-    let transitions = ledger.transitions().await?;
-    exit_result?;
+    let capture_summary = finalization.capture_summary.clone();
+    let transitions_result = ledger.transitions().await;
+    let transition_count = transitions_result
+        .as_ref()
+        .map(|transitions| transitions.len())
+        .unwrap_or_default();
+    finalization.into_result(transitions_result.map(|_| ()))?;
     println!(
         "robot {:?} complete: {} ticks, ledger {}, {} transitions{}",
         robot_mode,
         runner.tick_count,
         args.ledger,
-        transitions.len(),
+        transition_count,
         capture_summary
     );
     Ok(())
+}
+
+struct RobotExitFinalization {
+    control_result: Result<()>,
+    shutdown_result: Result<()>,
+    capture_result: Result<()>,
+    capture_summary: String,
+}
+
+impl RobotExitFinalization {
+    fn into_result(self, ledger_result: Result<()>) -> Result<()> {
+        combine_robot_exit_results(
+            self.control_result,
+            self.shutdown_result,
+            self.capture_result,
+            ledger_result,
+        )
+    }
 }
 
 async fn finalize_robot_exit<C: Cockpit + ?Sized>(
@@ -593,7 +616,7 @@ async fn finalize_robot_exit<C: Cockpit + ?Sized>(
     possession_cockpit: Option<&mut C>,
     capture: Option<CaptureWriter>,
     capture_path: Option<&str>,
-) -> (Result<()>, String) {
+) -> RobotExitFinalization {
     let shutdown_result = possession_cockpit
         .map(run_acknowledged_possession_shutdown)
         .unwrap_or(Ok(()));
@@ -608,38 +631,50 @@ async fn finalize_robot_exit<C: Cockpit + ?Sized>(
         None => Ok(String::new()),
     };
     let capture_summary = capture_result.as_ref().cloned().unwrap_or_default();
-    let result = combine_robot_exit_results(
+    RobotExitFinalization {
         control_result,
         shutdown_result,
-        capture_result.map(|_| ()),
-    );
-    (result, capture_summary)
+        capture_result: capture_result.map(|_| ()),
+        capture_summary,
+    }
 }
 
 fn run_acknowledged_possession_shutdown<C: Cockpit + ?Sized>(cockpit: &mut C) -> Result<()> {
     // Preserve acknowledgement semantics: motion must be stopped before
     // surrendering the motherbrain gate. The brainstem continues owning and
     // supervising Create OI in Full mode.
-    run_possession_shutdown(cockpit)?;
-    let final_status = cockpit
+    let shutdown_result = run_possession_shutdown(cockpit);
+    let final_status_result = cockpit
         .get_status()
-        .context("possession final status was not acknowledged")?
-        .summary();
-    if final_status.active_motion == Some(true) {
-        anyhow::bail!(
-            "possession shutdown did not prove stopped: moving={:?} armed={:?}",
-            final_status.active_motion,
-            final_status.armed
-        );
+        .context("possession final status was not acknowledged")
+        .and_then(|status| {
+            let final_status = status.summary();
+            if final_status.active_motion == Some(true) {
+                anyhow::bail!(
+                    "possession shutdown did not prove stopped: moving={:?} armed={:?}",
+                    final_status.active_motion,
+                    final_status.armed
+                );
+            }
+            Ok(())
+        });
+    match (shutdown_result, final_status_result) {
+        (Ok(()), Ok(())) => {
+            println!("possession exorcize acknowledged: stopped=true possessed=false; brainstem OI supervision retained");
+            Ok(())
+        }
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(shutdown_error), Err(status_error)) => anyhow::bail!(
+            "possession shutdown and final status both failed: shutdown: {shutdown_error:#}; final status: {status_error:#}"
+        ),
     }
-    println!("possession exorcize acknowledged: stopped=true possessed=false; brainstem OI supervision retained");
-    Ok(())
 }
 
 fn combine_robot_exit_results(
     control_result: Result<()>,
     shutdown_result: Result<()>,
     capture_result: Result<()>,
+    ledger_result: Result<()>,
 ) -> Result<()> {
     let mut failures = Vec::new();
     if let Err(error) = control_result {
@@ -650,6 +685,9 @@ fn combine_robot_exit_results(
     }
     if let Err(error) = capture_result {
         failures.push(("capture finalization", error));
+    }
+    if let Err(error) = ledger_result {
+        failures.push(("ledger finalization", error));
     }
     match failures.len() {
         0 => Ok(()),

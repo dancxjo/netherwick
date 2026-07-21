@@ -579,6 +579,31 @@ fn possession_shutdown_attempts_exorcize_after_stop_failure() {
     assert_eq!(cockpit.exorcize_attempts, 1);
 }
 
+#[test]
+fn possession_shutdown_reads_final_status_after_stop_failure() {
+    let mut cockpit = BusyShutdownCockpit {
+        stop_busy_remaining: POSSESSION_SHUTDOWN_BUSY_RETRY_ATTEMPTS,
+        exorcize_busy_remaining: 0,
+        stop_attempts: 0,
+        exorcize_attempts: 0,
+        status_reads: 0,
+        stopped: false,
+        exorcized: false,
+    };
+
+    let error = run_acknowledged_possession_shutdown(&mut cockpit).unwrap_err();
+
+    assert!(error.to_string().contains("possession shutdown STOP"));
+    assert!(!cockpit.stopped);
+    assert!(cockpit.exorcized);
+    assert_eq!(
+        cockpit.stop_attempts,
+        POSSESSION_SHUTDOWN_BUSY_RETRY_ATTEMPTS
+    );
+    assert_eq!(cockpit.exorcize_attempts, 1);
+    assert_eq!(cockpit.status_reads, 1);
+}
+
 #[tokio::test]
 async fn possession_loop_error_still_shuts_down_and_finalizes_capture() {
     let temp_dir = temp_path("pete_possession_error_finalization");
@@ -595,13 +620,15 @@ async fn possession_loop_error_still_shuts_down_and_finalizes_capture() {
         exorcized: false,
     };
 
-    let (result, capture_summary) = finalize_robot_exit(
+    let finalization = finalize_robot_exit(
         Err(anyhow::anyhow!("injected possession tick failure")),
         Some(&mut cockpit),
         Some(writer),
         temp_dir.to_str(),
     )
     .await;
+    let capture_summary = finalization.capture_summary.clone();
+    let result = finalization.into_result(Ok(()));
 
     assert!(result
         .unwrap_err()
@@ -616,6 +643,22 @@ async fn possession_loop_error_still_shuts_down_and_finalizes_capture() {
     let manifest = CaptureReader::open(&temp_dir).await.unwrap().manifest().clone();
     assert!(manifest.ended_at_ms.is_some());
     let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn ledger_failure_does_not_mask_primary_possession_error() {
+    let error = combine_robot_exit_results(
+        Err(anyhow::anyhow!("injected possession tick failure")),
+        Ok(()),
+        Ok(()),
+        Err(anyhow::anyhow!("injected ledger read failure")),
+    )
+    .unwrap_err()
+    .to_string();
+
+    let control_position = error.find("injected possession tick failure").unwrap();
+    let ledger_position = error.find("injected ledger read failure").unwrap();
+    assert!(control_position < ledger_position, "{error}");
 }
 
 #[test]
