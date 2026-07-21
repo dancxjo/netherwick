@@ -1,4 +1,3 @@
-
 use super::*;
 use pete_now::{EyeFrame, EyeFrameFormat, KinectSense, RangeSense};
 

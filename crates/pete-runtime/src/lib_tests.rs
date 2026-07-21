@@ -1,4 +1,3 @@
-
 use super::*;
 use pete_actions::{ChirpPattern, ReignCommand, ReignMode, ReignSource};
 use pete_autonomic::SimpleSafety;

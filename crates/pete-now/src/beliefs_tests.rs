@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::{ObjectObservation, ObjectSense, TypedTimestamp, VectorArtifact};
 use pete_actions::{ReignCommand, ReignMode, ReignSource};

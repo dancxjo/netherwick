@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::{BeliefMeta, BeliefSourceKind, ReachabilityEstimate};
 use pete_body::BodySense;

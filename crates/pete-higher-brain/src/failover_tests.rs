@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn identities() -> (HostIdentity, HostIdentity) {

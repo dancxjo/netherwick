@@ -1,4 +1,3 @@
-
 use super::*;
 use pete_core::Pose2;
 use pete_map::{

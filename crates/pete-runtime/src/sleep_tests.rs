@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn safe_input(now_ms: u64) -> SleepTickInput {
