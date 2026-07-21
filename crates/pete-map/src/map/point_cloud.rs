@@ -116,28 +116,29 @@ impl VoxelPointCloud {
         }
         let mut rebuilt = Vec::with_capacity(self.retained_observations.len());
         for original in &self.retained_observations {
-            let Some(node) = map
-                .pose_graph
-                .nodes
+            // Submaps retain both the node association chosen at capture time and
+            // the observation offset from that node. Re-derive neither from the
+            // optimized graph: a later node may now be closer in time or space.
+            let Some(submap) = map
+                .submaps
                 .iter()
-                .min_by_key(|node| node.t_ms.abs_diff(original.t_ms))
-                .filter(|node| node.t_ms.abs_diff(original.t_ms) <= 1_000)
+                .min_by_key(|submap| submap.t_ms.abs_diff(original.t_ms))
+                .filter(|submap| submap.t_ms.abs_diff(original.t_ms) <= 1_000)
             else {
                 self.pose_graph_corrections_applied = false;
                 return false;
             };
-            let raw_node_pose = map
-                .submaps
+            let Some(node) = map
+                .pose_graph
+                .nodes
                 .iter()
-                .find(|submap| submap.node_id == node.id)
-                .map(|submap| submap.local_pose)
-                .unwrap_or(original.pose.pose);
+                .find(|node| node.id == submap.node_id)
+            else {
+                self.pose_graph_corrections_applied = false;
+                return false;
+            };
             let mut corrected = original.clone();
-            corrected.pose.pose = apply_pose_graph_correction(
-                original.pose.pose,
-                raw_node_pose,
-                node.pose_estimate.pose,
-            );
+            corrected.pose.pose = apply_pose_delta(node.pose_estimate.pose, submap.local_pose);
             if corrected.orientation.yaw_source == YawSource::OdometryHeading {
                 corrected.orientation.yaw_rad = Some(corrected.pose.pose.heading_rad);
             }
@@ -245,27 +246,6 @@ impl VoxelPointCloud {
         for (key, _, _) in candidates.into_iter().take(remove_count) {
             self.voxels.remove(&key);
         }
-    }
-}
-
-fn apply_pose_graph_correction(
-    observation: Pose2,
-    raw_node: Pose2,
-    corrected_node: Pose2,
-) -> Pose2 {
-    let relative_x = observation.x_m - raw_node.x_m;
-    let relative_y = observation.y_m - raw_node.y_m;
-    let (raw_sin, raw_cos) = raw_node.heading_rad.sin_cos();
-    let local_x = raw_cos * relative_x + raw_sin * relative_y;
-    let local_y = -raw_sin * relative_x + raw_cos * relative_y;
-    let (corrected_sin, corrected_cos) = corrected_node.heading_rad.sin_cos();
-    Pose2 {
-        x_m: corrected_node.x_m + corrected_cos * local_x - corrected_sin * local_y,
-        y_m: corrected_node.y_m + corrected_sin * local_x + corrected_cos * local_y,
-        heading_rad: corrected_node.heading_rad
-            + (observation.heading_rad - raw_node.heading_rad + std::f32::consts::PI)
-                .rem_euclid(std::f32::consts::TAU)
-            - std::f32::consts::PI,
     }
 }
 

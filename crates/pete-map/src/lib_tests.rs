@@ -939,63 +939,120 @@ fn current_depth_uses_its_atomic_rgbd_pair_not_cached_eye_frame() {
 }
 
 #[test]
-fn pose_graph_correction_rebuilds_retained_voxel_observations() {
-    let mut cloud = VoxelPointCloud::new(PointCloudConfig {
-        voxel_size_m: 0.1,
-        ..PointCloudConfig::default()
-    });
-    cloud.integrate_observation(PointCloudObservation {
-        frame: PointCloudFrame::RobotBase,
-        pose: PoseEstimate {
-            pose: pose(1.0, 0.0, 0.0),
-            confidence: 1.0,
-            covariance: [0.0; 3],
-            source: "raw_odometry".to_string(),
-            t_ms: 100,
-        },
-        orientation: OrientationEstimate::default(),
-        points: vec![PointCloudPoint {
-            position: Point3D::default(),
-            color_rgb: None,
-            confidence: 1.0,
-            depth_index: None,
-            depth_uv: None,
-            depth_image_size: None,
-            source_frame_id: Some("depth-100".to_string()),
-        }],
-        source: "kinect_depth".to_string(),
-        t_ms: 100,
-        metadata: serde_json::Value::Null,
-    });
-    assert!(cloud.voxels.contains_key(&VoxelKey { x: 10, y: 0, z: 0 }));
-
-    let mut map = LocalMap::default();
-    map.pose_graph.nodes.push(PoseNode {
-        id: "live-pose-0".to_string(),
-        pose_estimate: PoseEstimate {
-            pose: pose(0.0, 0.0, 0.0),
-            confidence: 1.0,
-            covariance: [0.0; 3],
-            source: "optimized".to_string(),
-            t_ms: 100,
-        },
-        t_ms: 100,
-        source_frame_id: Some("depth-100".to_string()),
-    });
-    map.submaps.push(OccupancySubmap {
-        id: "submap-0".to_string(),
-        node_id: "live-pose-0".to_string(),
-        local_pose: pose(1.0, 0.0, 0.0),
-        range_beams: Vec::new(),
-        t_ms: 100,
-        source_frame_id: Some("depth-100".to_string()),
-    });
-    map.pose_graph_optimization.max_node_update_m = 1.0;
+fn pose_graph_rebuild_applies_corrected_node_to_zero_local_offset() {
+    let mut cloud = test_point_cloud();
+    integrate_test_cloud_observation(&mut cloud, pose(1.0, 0.0, 0.0), Point3D::default(), 100);
+    let map = corrected_point_cloud_map(
+        vec![point_cloud_pose_node(
+            "live-pose-0",
+            pose(0.8, 0.0, 0.0),
+            100,
+        )],
+        vec![point_cloud_submap(
+            "submap-0",
+            "live-pose-0",
+            pose(0.0, 0.0, 0.0),
+            100,
+        )],
+    );
 
     assert!(cloud.rebuild_from_pose_graph(&map));
-    assert!(cloud.pose_graph_corrections_applied);
-    assert!(cloud.voxels.contains_key(&VoxelKey { x: 0, y: 0, z: 0 }));
-    assert!(!cloud.voxels.contains_key(&VoxelKey { x: 10, y: 0, z: 0 }));
+    assert_cloud_points_near(&cloud, &[(0.8, 0.0)]);
+}
+
+#[test]
+fn pose_graph_rebuild_preserves_node_relative_translation() {
+    let mut cloud = test_point_cloud();
+    integrate_test_cloud_observation(&mut cloud, pose(1.25, 0.5, 0.0), Point3D::default(), 100);
+    let map = corrected_point_cloud_map(
+        vec![point_cloud_pose_node(
+            "live-pose-0",
+            pose(0.8, -0.2, 0.0),
+            100,
+        )],
+        vec![point_cloud_submap(
+            "submap-0",
+            "live-pose-0",
+            pose(0.25, 0.5, 0.0),
+            100,
+        )],
+    );
+
+    assert!(cloud.rebuild_from_pose_graph(&map));
+    assert_cloud_points_near(&cloud, &[(1.05, 0.3)]);
+}
+
+#[test]
+fn pose_graph_rebuild_preserves_node_relative_heading() {
+    let mut cloud = test_point_cloud();
+    integrate_test_cloud_observation(
+        &mut cloud,
+        pose(0.0, 0.0, 0.35),
+        Point3D {
+            x_m: 1.0,
+            y_m: 0.0,
+            z_m: 0.0,
+        },
+        100,
+    );
+    let map = corrected_point_cloud_map(
+        vec![point_cloud_pose_node(
+            "live-pose-0",
+            pose(0.0, 0.0, 0.5),
+            100,
+        )],
+        vec![point_cloud_submap(
+            "submap-0",
+            "live-pose-0",
+            pose(0.0, 0.0, 0.25),
+            100,
+        )],
+    );
+
+    assert!(cloud.rebuild_from_pose_graph(&map));
+    assert_cloud_points_near(&cloud, &[(0.75_f32.cos(), 0.75_f32.sin())]);
+}
+
+#[test]
+fn pose_graph_rebuild_uses_submap_owner_for_frame_between_nodes() {
+    let mut cloud = test_point_cloud();
+    integrate_test_cloud_observation(&mut cloud, pose(1.5, 0.0, 0.0), Point3D::default(), 200);
+    let map = corrected_point_cloud_map(
+        vec![
+            point_cloud_pose_node("live-pose-0", pose(0.5, 0.0, 0.0), 100),
+            point_cloud_pose_node("live-pose-1", pose(4.0, 0.0, 0.0), 250),
+        ],
+        vec![point_cloud_submap(
+            "submap-0",
+            "live-pose-0",
+            pose(0.5, 0.0, 0.0),
+            200,
+        )],
+    );
+
+    assert!(cloud.rebuild_from_pose_graph(&map));
+    assert_cloud_points_near(&cloud, &[(1.0, 0.0)]);
+}
+
+#[test]
+fn pose_graph_rebuild_uses_each_observation_offset_for_shared_node() {
+    let mut cloud = test_point_cloud();
+    integrate_test_cloud_observation(&mut cloud, pose(1.0, 0.0, 0.0), Point3D::default(), 100);
+    integrate_test_cloud_observation(&mut cloud, pose(2.0, 0.0, 0.0), Point3D::default(), 200);
+    let map = corrected_point_cloud_map(
+        vec![point_cloud_pose_node(
+            "live-pose-0",
+            pose(0.5, 0.0, 0.0),
+            100,
+        )],
+        vec![
+            point_cloud_submap("submap-0", "live-pose-0", pose(0.0, 0.0, 0.0), 100),
+            point_cloud_submap("submap-1", "live-pose-0", pose(1.0, 0.0, 0.0), 200),
+        ],
+    );
+
+    assert!(cloud.rebuild_from_pose_graph(&map));
+    assert_cloud_points_near(&cloud, &[(0.5, 0.0), (1.5, 0.0)]);
 }
 
 #[test]
@@ -1254,6 +1311,95 @@ fn pose_graph_optimizer_reduces_loop_closure_error() {
     assert!(graph.nodes[2].pose_estimate.pose.x_m < 2.4);
     assert_eq!(graph.nodes[0].pose_estimate.pose.x_m, 0.0);
     assert!(summary.active_edges >= 3);
+}
+
+fn test_point_cloud() -> VoxelPointCloud {
+    VoxelPointCloud::new(PointCloudConfig {
+        voxel_size_m: 0.05,
+        ..PointCloudConfig::default()
+    })
+}
+
+fn integrate_test_cloud_observation(
+    cloud: &mut VoxelPointCloud,
+    observation_pose: Pose2,
+    point: Point3D,
+    t_ms: TimeMs,
+) {
+    cloud.integrate_observation(PointCloudObservation {
+        frame: PointCloudFrame::RobotBase,
+        pose: PoseEstimate {
+            pose: observation_pose,
+            confidence: 1.0,
+            covariance: [0.0; 3],
+            source: "raw_odometry".to_string(),
+            t_ms,
+        },
+        orientation: OrientationEstimate::default(),
+        points: vec![PointCloudPoint {
+            position: point,
+            color_rgb: None,
+            confidence: 1.0,
+            depth_index: None,
+            depth_uv: None,
+            depth_image_size: None,
+            source_frame_id: Some(format!("depth-{t_ms}")),
+        }],
+        source: "kinect_depth".to_string(),
+        t_ms,
+        metadata: serde_json::Value::Null,
+    });
+}
+
+fn point_cloud_pose_node(id: &str, corrected_pose: Pose2, t_ms: TimeMs) -> PoseNode {
+    PoseNode {
+        id: id.to_string(),
+        pose_estimate: PoseEstimate {
+            pose: corrected_pose,
+            confidence: 1.0,
+            covariance: [0.0; 3],
+            source: "optimized".to_string(),
+            t_ms,
+        },
+        t_ms,
+        source_frame_id: None,
+    }
+}
+
+fn point_cloud_submap(id: &str, node_id: &str, local_pose: Pose2, t_ms: TimeMs) -> OccupancySubmap {
+    OccupancySubmap {
+        id: id.to_string(),
+        node_id: node_id.to_string(),
+        local_pose,
+        range_beams: Vec::new(),
+        t_ms,
+        source_frame_id: None,
+    }
+}
+
+fn corrected_point_cloud_map(nodes: Vec<PoseNode>, submaps: Vec<OccupancySubmap>) -> LocalMap {
+    let mut map = LocalMap::default();
+    map.pose_graph.nodes = nodes;
+    map.submaps = submaps;
+    map.pose_graph_optimization.max_node_update_m = 1.0;
+    map
+}
+
+fn assert_cloud_points_near(cloud: &VoxelPointCloud, expected_xy: &[(f32, f32)]) {
+    let actual = cloud.voxels.values().collect::<Vec<_>>();
+    assert_eq!(actual.len(), expected_xy.len());
+    for (point, (expected_x, expected_y)) in actual.into_iter().zip(expected_xy) {
+        assert!(
+            (point.position.x_m - expected_x).abs() < 0.001,
+            "expected x={expected_x}, got {}",
+            point.position.x_m
+        );
+        assert!(
+            (point.position.y_m - expected_y).abs() < 0.001,
+            "expected y={expected_y}, got {}",
+            point.position.y_m
+        );
+    }
 }
 
 fn pose(x_m: f32, y_m: f32, heading_rad: f32) -> Pose2 {
