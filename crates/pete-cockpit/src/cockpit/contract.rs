@@ -742,6 +742,13 @@ impl DockIrCue {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StatusSummary {
     pub raw: String,
+    /// Brainstem monotonic clock at status generation. This is not a host timestamp.
+    #[serde(default)]
+    pub uptime_ms: Option<u32>,
+    /// Firmware clock epoch. The host additionally advances its mapped epoch on reconnect
+    /// or detected uptime regression because the RP2040 value restarts at zero after boot.
+    #[serde(default)]
+    pub clock_epoch: Option<u32>,
     pub runtime_state: Option<String>,
     pub armed: Option<bool>,
     pub estop_latched: Option<bool>,
@@ -768,6 +775,8 @@ pub struct StatusSummary {
     pub active_motion: Option<bool>,
     pub event_next_seq: Option<u32>,
     pub body_packet_count: Option<u32>,
+    #[serde(default)]
+    pub body_packet_timestamp_ms: Option<u32>,
     pub body_packet_age_ms: Option<u32>,
     pub body_packet_complete: Option<bool>,
     #[serde(default)]
@@ -805,6 +814,8 @@ impl StatusSummary {
         };
         Self {
             raw: raw.to_owned(),
+            uptime_ms: number_for(raw, "uptime_ms"),
+            clock_epoch: number_for(raw, "clock_epoch"),
             runtime_state: value_for(raw, "runtime").map(ToOwned::to_owned),
             armed: bool_for(raw, "armed"),
             estop_latched: bool_for(raw, "estop"),
@@ -824,6 +835,7 @@ impl StatusSummary {
             active_motion: bool_for(raw, "active_cmd_vel"),
             event_next_seq: number_for(raw, "event_next_seq"),
             body_packet_count: packet_count,
+            body_packet_timestamp_ms: number_for(raw, "create_last_body_packet_ms"),
             body_packet_age_ms: packet_age_ms,
             body_packet_complete: Some(packet_count.unwrap_or(0) > 0),
             infrared_character: number_for(raw, "ir_byte").and_then(|value| value.try_into().ok()),
@@ -859,6 +871,8 @@ impl StatusSummary {
         });
         Self {
             raw: raw.to_owned(),
+            uptime_ms: json_u32_value(value, "uptime_ms"),
+            clock_epoch: json_u32_value(value, "clock_epoch"),
             runtime_state: json_str_value(value, "current_runtime_state")
                 .or_else(|| json_str_value(value, "runtime"))
                 .map(ToOwned::to_owned),
@@ -888,6 +902,8 @@ impl StatusSummary {
                 .map(|command| command == "drive"),
             event_next_seq: json_u32_value(value, "event_next_seq"),
             body_packet_count: packet_count,
+            body_packet_timestamp_ms: sensors
+                .and_then(|sensors| json_u32_value(sensors, "last_complete_packet_timestamp_ms")),
             body_packet_age_ms: packet_age_ms,
             body_packet_complete: Some(packet_count.unwrap_or(0) > 0),
             infrared_character: sensors
@@ -1063,6 +1079,8 @@ pub struct ImuSummary {
     pub health: Option<String>,
     pub sample_count: Option<u32>,
     pub sample_age_ms: Option<u32>,
+    /// Exact sample timestamp in the brainstem monotonic clock.
+    pub sample_timestamp_ms: Option<u32>,
     pub poll_period_ms: Option<u32>,
     pub yaw_mrad: Option<i32>,
     pub pitch_mrad: Option<i32>,
@@ -1076,6 +1094,10 @@ pub struct ImuSummary {
     pub impact_score_mm_s2: Option<u32>,
     pub motion_consistency: Option<String>,
     pub calibration: Option<String>,
+    pub orientation_confidence_permille: Option<u16>,
+    pub gyro_bias_calibrated: Option<bool>,
+    pub mounting_calibrated: Option<bool>,
+    pub orientation_source: Option<String>,
 }
 
 impl ImuSummary {
@@ -1086,6 +1108,7 @@ impl ImuSummary {
             sample_count: number_for(raw, "imu_samples")
                 .or_else(|| number_for(raw, "imu_sample_count")),
             sample_age_ms: number_for(raw, "imu_age_ms"),
+            sample_timestamp_ms: number_for(raw, "imu_sample_ms"),
             poll_period_ms: number_for(raw, "imu_poll_ms"),
             yaw_mrad: signed_number_for(raw, "imu_yaw_mrad"),
             pitch_mrad: signed_number_for(raw, "imu_pitch_mrad"),
@@ -1107,6 +1130,11 @@ impl ImuSummary {
             impact_score_mm_s2: number_for(raw, "imu_impact_mm_s2"),
             motion_consistency: value_for(raw, "imu_motion_consistency").map(ToOwned::to_owned),
             calibration: value_for(raw, "imu_calibration").map(ToOwned::to_owned),
+            orientation_confidence_permille: number_for(raw, "imu_orientation_confidence")
+                .and_then(|value| value.try_into().ok()),
+            gyro_bias_calibrated: bool_for(raw, "imu_gyro_bias_calibrated"),
+            mounting_calibrated: bool_for(raw, "imu_mounting_calibrated"),
+            orientation_source: value_for(raw, "imu_orientation_source").map(ToOwned::to_owned),
         }
     }
 
@@ -1119,6 +1147,7 @@ impl ImuSummary {
             health: json_str_value(imu, "health").map(ToOwned::to_owned),
             sample_count: json_u32_value(imu, "sample_count"),
             sample_age_ms: json_u32_value(imu, "sample_age_ms"),
+            sample_timestamp_ms: json_u32_value(imu, "last_sample_timestamp_ms"),
             poll_period_ms: json_u32_value(imu, "poll_period_ms"),
             yaw_mrad: json_i32_value(imu, "yaw_mrad"),
             pitch_mrad: json_i32_value(imu, "pitch_mrad"),
@@ -1134,6 +1163,11 @@ impl ImuSummary {
             impact_score_mm_s2: json_u32_value(imu, "impact_score_mm_s2"),
             motion_consistency: json_str_value(imu, "motion_consistency").map(ToOwned::to_owned),
             calibration: json_str_value(imu, "calibration").map(ToOwned::to_owned),
+            orientation_confidence_permille: json_u32_value(imu, "orientation_confidence_permille")
+                .and_then(|value| value.try_into().ok()),
+            gyro_bias_calibrated: json_bool_value(imu, "gyro_bias_calibrated"),
+            mounting_calibrated: json_bool_value(imu, "mounting_calibrated"),
+            orientation_source: json_str_value(imu, "orientation_source").map(ToOwned::to_owned),
         }
     }
 }

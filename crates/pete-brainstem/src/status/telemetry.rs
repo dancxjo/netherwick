@@ -275,12 +275,12 @@ fn integrate_odometry_delta(distance_mm: i32, angle_mrad: i32) {
     // distance/angle packet follows the measured arc instead of applying the
     // whole displacement before or after the turn.
     let midpoint_rad = (heading_mrad as f32 + angle_mrad as f32 * 0.5) / 1000.0;
-    let dx_q10 = libm::roundf(
-        distance_mm as f32 * libm::cosf(midpoint_rad) * ODOMETRY_POSITION_SCALE,
-    ) as i32;
-    let dy_q10 = libm::roundf(
-        distance_mm as f32 * libm::sinf(midpoint_rad) * ODOMETRY_POSITION_SCALE,
-    ) as i32;
+    let dx_q10 =
+        libm::roundf(distance_mm as f32 * libm::cosf(midpoint_rad) * ODOMETRY_POSITION_SCALE)
+            as i32;
+    let dy_q10 =
+        libm::roundf(distance_mm as f32 * libm::sinf(midpoint_rad) * ODOMETRY_POSITION_SCALE)
+            as i32;
     add_signed(&ODOMETRY_X_MM_Q10, dx_q10);
     add_signed(&ODOMETRY_Y_MM_Q10, dy_q10);
     add_signed(&ODOMETRY_DISTANCE_MM, distance_mm);
@@ -298,7 +298,21 @@ fn end_odometry_write() {
     ODOMETRY_SEQUENCE.store(sequence.wrapping_add(1), Ordering::Release);
 }
 
-pub fn mark_imu_sample(sample: ImuSample) {
+const IMU_GYRO_BIAS_REQUIRED_SAMPLES: u32 = 50;
+
+pub fn mark_imu_sample(mut sample: ImuSample) {
+    update_stationary_gyro_bias(sample);
+    if imu_gyro_bias_calibrated() {
+        sample.gyro_x_mrad_s = sample.gyro_x_mrad_s.saturating_sub(decode_signed_i16(
+            IMU_GYRO_BIAS_X_MRAD_S.load(Ordering::Relaxed),
+        ));
+        sample.gyro_y_mrad_s = sample.gyro_y_mrad_s.saturating_sub(decode_signed_i16(
+            IMU_GYRO_BIAS_Y_MRAD_S.load(Ordering::Relaxed),
+        ));
+        sample.gyro_z_mrad_s = sample.gyro_z_mrad_s.saturating_sub(decode_signed_i16(
+            IMU_GYRO_BIAS_Z_MRAD_S.load(Ordering::Relaxed),
+        ));
+    }
     let previous_timestamp = IMU_LAST_SAMPLE_TIMESTAMP_MS.load(Ordering::Relaxed);
     let previous_yaw = decode_signed_i32(IMU_YAW_MRAD.load(Ordering::Relaxed));
     let previous_accel = IMU_ACCEL_MAGNITUDE_MM_S2.load(Ordering::Relaxed) as u16;
@@ -365,6 +379,47 @@ pub fn mark_imu_sample(sample: ImuSample) {
     }
 }
 
+pub fn imu_gyro_bias_calibrated() -> bool {
+    IMU_GYRO_BIAS_SAMPLE_COUNT.load(Ordering::Relaxed) >= IMU_GYRO_BIAS_REQUIRED_SAMPLES
+}
+
+fn update_stationary_gyro_bias(sample: ImuSample) {
+    if imu_gyro_bias_calibrated() {
+        return;
+    }
+    let accel = crate::drivers::imu::gravity_vector(sample);
+    let accel_square = (accel.x_mm_s2 as i32)
+        .saturating_mul(accel.x_mm_s2 as i32)
+        .saturating_add((accel.y_mm_s2 as i32).saturating_mul(accel.y_mm_s2 as i32))
+        .saturating_add((accel.z_mm_s2 as i32).saturating_mul(accel.z_mm_s2 as i32));
+    let plausible_gravity = (9_200_i32.saturating_mul(9_200)..=10_400_i32.saturating_mul(10_400))
+        .contains(&accel_square);
+    let quiet = sample.gyro_x_mrad_s.abs() <= 80
+        && sample.gyro_y_mrad_s.abs() <= 80
+        && sample.gyro_z_mrad_s.abs() <= 80;
+    if !plausible_gravity || !quiet {
+        return;
+    }
+    add_signed(&IMU_GYRO_BIAS_SUM_X, sample.gyro_x_mrad_s as i32);
+    add_signed(&IMU_GYRO_BIAS_SUM_Y, sample.gyro_y_mrad_s as i32);
+    add_signed(&IMU_GYRO_BIAS_SUM_Z, sample.gyro_z_mrad_s as i32);
+    let count = IMU_GYRO_BIAS_SAMPLE_COUNT
+        .load(Ordering::Relaxed)
+        .saturating_add(1);
+    IMU_GYRO_BIAS_SAMPLE_COUNT.store(count, Ordering::Relaxed);
+    if count == IMU_GYRO_BIAS_REQUIRED_SAMPLES {
+        for (sum, bias) in [
+            (&IMU_GYRO_BIAS_SUM_X, &IMU_GYRO_BIAS_X_MRAD_S),
+            (&IMU_GYRO_BIAS_SUM_Y, &IMU_GYRO_BIAS_Y_MRAD_S),
+            (&IMU_GYRO_BIAS_SUM_Z, &IMU_GYRO_BIAS_Z_MRAD_S),
+        ] {
+            let average = decode_signed_i32(sum.load(Ordering::Relaxed))
+                / IMU_GYRO_BIAS_REQUIRED_SAMPLES as i32;
+            bias.store(encode_signed_i16(average as i16), Ordering::Relaxed);
+        }
+    }
+}
+
 pub fn zero_imu_orientation_from_gravity() -> bool {
     let sample_count = IMU_SAMPLE_COUNT.load(Ordering::Relaxed);
     if sample_count == 0 {
@@ -422,6 +477,13 @@ pub fn clear_imu_orientation_calibration() {
     IMU_GRAVITY_REF_Y_MM_S2.store(0, Ordering::Relaxed);
     IMU_GRAVITY_REF_Z_MM_S2.store(0, Ordering::Relaxed);
     IMU_GRAVITY_REF_MAGNITUDE_MM_S2.store(0, Ordering::Relaxed);
+    IMU_GYRO_BIAS_SAMPLE_COUNT.store(0, Ordering::Relaxed);
+    IMU_GYRO_BIAS_SUM_X.store(0, Ordering::Relaxed);
+    IMU_GYRO_BIAS_SUM_Y.store(0, Ordering::Relaxed);
+    IMU_GYRO_BIAS_SUM_Z.store(0, Ordering::Relaxed);
+    IMU_GYRO_BIAS_X_MRAD_S.store(0, Ordering::Relaxed);
+    IMU_GYRO_BIAS_Y_MRAD_S.store(0, Ordering::Relaxed);
+    IMU_GYRO_BIAS_Z_MRAD_S.store(0, Ordering::Relaxed);
     IMU_CALIBRATION_STATE.store(ImuCalibrationCode::Uncalibrated as u8, Ordering::Relaxed);
     record_public_event(
         PublicEventKind::ImuCalibrationChanged,

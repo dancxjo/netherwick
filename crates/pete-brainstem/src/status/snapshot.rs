@@ -11,8 +11,13 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
     } else {
         pending_command
     };
-    let (odometry_reset_count, odometry_distance_mm, odometry_x_mm, odometry_y_mm, odometry_heading_mrad) =
-        coherent_odometry_snapshot();
+    let (
+        odometry_reset_count,
+        odometry_distance_mm,
+        odometry_x_mm,
+        odometry_y_mm,
+        odometry_heading_mrad,
+    ) = coherent_odometry_snapshot();
 
     BrainstemStatus {
         firmware_name: env!("CARGO_PKG_NAME"),
@@ -159,8 +164,28 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
         imu_impact_score_mm_s2: IMU_IMPACT_SCORE_MM_S2.load(Ordering::Relaxed) as u16,
         imu_motion_consistency: IMU_MOTION_CONSISTENCY.load(Ordering::Relaxed),
         imu_calibration_state: IMU_CALIBRATION_STATE.load(Ordering::Relaxed),
+        imu_orientation_confidence_permille: imu_orientation_confidence_permille(),
+        imu_gyro_bias_calibrated: imu_gyro_bias_calibrated(),
+        imu_mounting_calibrated: body::IMU_MOUNTING_CALIBRATED,
+        imu_orientation_source: body::IMU_ORIENTATION_SOURCE,
         safety_hazard_generation: safety_hazard_generation(),
         event_next_seq: EVENT_NEXT_SEQ.load(Ordering::Relaxed),
+    }
+}
+
+fn imu_orientation_confidence_permille() -> u16 {
+    if IMU_HEALTH.load(Ordering::Relaxed) != ImuHealthCode::Ok as u8 {
+        return 0;
+    }
+    match (
+        body::IMU_MOUNTING_CALIBRATED,
+        imu_gyro_bias_calibrated(),
+        IMU_GRAVITY_CALIBRATED.load(Ordering::Relaxed) != 0,
+    ) {
+        (true, true, true) => 900,
+        (true, true, false) => 450,
+        (true, false, true) => 400,
+        _ => 100,
     }
 }
 

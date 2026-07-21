@@ -52,7 +52,7 @@ fn write_compact_status_line<const N: usize>(
     let flags = snapshot.create_sensor_flags;
     writeln!(
         response,
-        "OK {seq} STATUS uptime_ms={} runtime={} body={} action={} command={} pending={} error={} error_uart={} power={} oi={} armed={} estop={} safety_tripped={} safety_latch_kind={} safety_hazard_generation={} motion_interlock={} active_cmd_vel={} event_next_seq={} uart_health={} uart_error={} create_rx_bytes={} create_rx_packets={} create_last_packet_ms={} create_sensor_packet_id={} create_body_packets={} create_last_body_packet_ms={} create_last_packet_len={} charging_sources={} create_flags={} ir_byte={} bump_left={} bump_right={} wheel_drop={} cliff_left={} cliff_front_left={} cliff_front_right={} cliff_right={} create_tx_bytes={} create_last_rx_byte={} create_last_tx_byte={} create_last_rx_ms={} create_last_tx_ms={} create_rx_errors={}/{}/{}/{}/{} wake_probe={}/{} forebrain_rx_bytes={} forebrain_rx_lines={} odometry_resets={} odometry_distance_mm={} odometry_x_mm={} odometry_y_mm={} odometry_heading_mrad={} imu_present={} imu_health={} imu_samples={} imu_age_ms={} imu_poll_ms={} imu_yaw_mrad={} imu_pitch_mrad={} imu_roll_mrad={} imu_yaw_rate_mrad_s={} imu_gyro_x_mrad_s={} imu_gyro_y_mrad_s={} imu_gyro_z_mrad_s={} imu_accel_x_mm_s2={} imu_accel_y_mm_s2={} imu_accel_z_mm_s2={} imu_accel_mag_mm_s2={} imu_tilt_mrad={} imu_roughness_mm_s2={} imu_impact_mm_s2={} imu_motion_consistency={} imu_calibration={} firmware_version={} git_commit={} git_dirty={} build_id={} careful_mode={} careful_remaining_ms={}",
+        "OK {seq} STATUS uptime_ms={} clock_epoch=0 runtime={} body={} action={} command={} pending={} error={} error_uart={} power={} oi={} armed={} estop={} safety_tripped={} safety_latch_kind={} safety_hazard_generation={} motion_interlock={} active_cmd_vel={} event_next_seq={} uart_health={} uart_error={} create_rx_bytes={} create_rx_packets={} create_last_packet_ms={} create_sensor_packet_id={} create_body_packets={} create_last_body_packet_ms={} create_last_packet_len={} charging_sources={} create_flags={} ir_byte={} bump_left={} bump_right={} wheel_drop={} cliff_left={} cliff_front_left={} cliff_front_right={} cliff_right={} create_tx_bytes={} create_last_rx_byte={} create_last_tx_byte={} create_last_rx_ms={} create_last_tx_ms={} create_rx_errors={}/{}/{}/{}/{} wake_probe={}/{} forebrain_rx_bytes={} forebrain_rx_lines={} odometry_resets={} odometry_distance_mm={} odometry_x_mm={} odometry_y_mm={} odometry_heading_mrad={} imu_present={} imu_health={} imu_samples={} imu_sample_ms={} imu_age_ms={} imu_poll_ms={} imu_yaw_mrad={} imu_pitch_mrad={} imu_roll_mrad={} imu_yaw_rate_mrad_s={} imu_gyro_x_mrad_s={} imu_gyro_y_mrad_s={} imu_gyro_z_mrad_s={} imu_accel_x_mm_s2={} imu_accel_y_mm_s2={} imu_accel_z_mm_s2={} imu_accel_mag_mm_s2={} imu_tilt_mrad={} imu_roughness_mm_s2={} imu_impact_mm_s2={} imu_motion_consistency={} imu_calibration={} imu_orientation_confidence={} imu_gyro_bias_calibrated={} imu_mounting_calibrated={} imu_orientation_source={} firmware_version={} git_commit={} git_dirty={} build_id={} careful_mode={} careful_remaining_ms={}",
         snapshot.uptime_ms,
         snapshot.current_runtime_state,
         snapshot.body_state,
@@ -112,6 +112,7 @@ fn write_compact_status_line<const N: usize>(
         snapshot.imu_present,
         snapshot.imu_health,
         snapshot.imu_sample_count,
+        snapshot.imu_last_sample_timestamp_ms,
         snapshot.imu_sample_age_ms,
         snapshot.imu_poll_period_ms,
         snapshot.imu_yaw_mrad,
@@ -130,6 +131,10 @@ fn write_compact_status_line<const N: usize>(
         snapshot.imu_impact_score_mm_s2,
         snapshot.imu_motion_consistency,
         snapshot.imu_calibration_state,
+        snapshot.imu_orientation_confidence_permille,
+        snapshot.imu_gyro_bias_calibrated,
+        snapshot.imu_mounting_calibrated,
+        snapshot.imu_orientation_source,
         snapshot.firmware_version,
         snapshot.git_commit,
         snapshot.git_dirty,

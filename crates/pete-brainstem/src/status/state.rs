@@ -143,6 +143,13 @@ static IMU_GRAVITY_REF_X_MM_S2: AtomicU32 = AtomicU32::new(0);
 static IMU_GRAVITY_REF_Y_MM_S2: AtomicU32 = AtomicU32::new(0);
 static IMU_GRAVITY_REF_Z_MM_S2: AtomicU32 = AtomicU32::new(0);
 static IMU_GRAVITY_REF_MAGNITUDE_MM_S2: AtomicU32 = AtomicU32::new(0);
+static IMU_GYRO_BIAS_SAMPLE_COUNT: AtomicU32 = AtomicU32::new(0);
+static IMU_GYRO_BIAS_SUM_X: AtomicU32 = AtomicU32::new(0);
+static IMU_GYRO_BIAS_SUM_Y: AtomicU32 = AtomicU32::new(0);
+static IMU_GYRO_BIAS_SUM_Z: AtomicU32 = AtomicU32::new(0);
+static IMU_GYRO_BIAS_X_MRAD_S: AtomicU32 = AtomicU32::new(0);
+static IMU_GYRO_BIAS_Y_MRAD_S: AtomicU32 = AtomicU32::new(0);
+static IMU_GYRO_BIAS_Z_MRAD_S: AtomicU32 = AtomicU32::new(0);
 static EVENT_NEXT_SEQ: AtomicU32 = AtomicU32::new(1);
 static EVENT_SEQ: [AtomicU32; EVENT_LOG_CAPACITY] =
     [const { AtomicU32::new(0) }; EVENT_LOG_CAPACITY];
@@ -314,6 +321,10 @@ pub struct BrainstemStatus {
     pub imu_impact_score_mm_s2: u16,
     pub imu_motion_consistency: u8,
     pub imu_calibration_state: u8,
+    pub imu_orientation_confidence_permille: u16,
+    pub imu_gyro_bias_calibrated: bool,
+    pub imu_mounting_calibrated: bool,
+    pub imu_orientation_source: &'static str,
     pub safety_hazard_generation: u32,
     pub event_next_seq: u32,
 }

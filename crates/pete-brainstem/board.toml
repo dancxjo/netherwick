@@ -67,6 +67,14 @@ i2c_bus = "primary"
 poll_period_ms = 20
 tilt_stop_mrad = 650
 impact_stop_mm_s2 = 18000
+# Board/body mounting contract. The current board is installed with the MPU-6050
+# X/Y/Z axes aligned to base forward/left/up; change this declaration when the
+# physical mounting changes instead of introducing call-site sign flips.
+mounting_calibrated = true
+forward_axis = "+x"
+left_axis = "+y"
+up_axis = "+z"
+orientation_source = "mpu6050_accel_gyro_roll_pitch"
 
 [spi.primary]
 mosi = "GP7"

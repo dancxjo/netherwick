@@ -187,6 +187,11 @@ struct Imu {
     poll_period_ms: u32,
     tilt_stop_mrad: i16,
     impact_stop_mm_s2: u16,
+    mounting_calibrated: bool,
+    forward_axis: String,
+    left_axis: String,
+    up_axis: String,
+    orientation_source: String,
 }
 
 #[allow(dead_code)]
@@ -257,6 +262,9 @@ fn main() {
     assert_eq!(body.create_oi.stop_bits, 1);
     assert_eq!(board.board.arch, "rp2040");
     assert_eq!(board.imu.i2c_bus, "primary");
+    assert_eq!(board.imu.forward_axis, "+x");
+    assert_eq!(board.imu.left_axis, "+y");
+    assert_eq!(board.imu.up_axis, "+z");
     validate_board_gpio_assignments(&board);
     println!("cargo:rustc-check-cfg=cfg(motherbrain_reset_hardware)");
     let motherbrain_reset_enabled = board.pins.motherbrain_reset.enabled
@@ -369,6 +377,11 @@ pub const IMU_ENABLED: bool = {imu_enabled};
 pub const IMU_POLL_PERIOD_MS: u32 = {imu_poll_period_ms};
 pub const IMU_TILT_STOP_MRAD: i16 = {imu_tilt_stop_mrad};
 pub const IMU_IMPACT_STOP_MM_S2: u16 = {imu_impact_stop_mm_s2};
+pub const IMU_MOUNTING_CALIBRATED: bool = {imu_mounting_calibrated};
+pub const IMU_FORWARD_AXIS: &str = {imu_forward_axis:?};
+pub const IMU_LEFT_AXIS: &str = {imu_left_axis:?};
+pub const IMU_UP_AXIS: &str = {imu_up_axis:?};
+pub const IMU_ORIENTATION_SOURCE: &str = {imu_orientation_source:?};
 "#,
         body_name = body.body.name,
         board_name = board.board.name,
@@ -450,6 +463,11 @@ pub const IMU_IMPACT_STOP_MM_S2: u16 = {imu_impact_stop_mm_s2};
         imu_poll_period_ms = board.imu.poll_period_ms,
         imu_tilt_stop_mrad = board.imu.tilt_stop_mrad,
         imu_impact_stop_mm_s2 = board.imu.impact_stop_mm_s2,
+        imu_mounting_calibrated = board.imu.mounting_calibrated,
+        imu_forward_axis = board.imu.forward_axis,
+        imu_left_axis = board.imu.left_axis,
+        imu_up_axis = board.imu.up_axis,
+        imu_orientation_source = board.imu.orientation_source,
     );
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());

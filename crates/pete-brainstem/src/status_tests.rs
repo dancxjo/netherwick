@@ -607,3 +607,35 @@ fn imu_gravity_zero_calibrates_arbitrary_mount_direction() {
     assert_eq!(snapshot.imu_roll_mrad, 0);
     assert_eq!(snapshot.imu_tilt_magnitude_mrad, 0);
 }
+
+#[test]
+fn stationary_imu_samples_estimate_gyro_bias_before_advertising_trust() {
+    let _guard = status_test_guard();
+    clear_imu_orientation_calibration();
+    reset_event_log_for_test();
+    for timestamp_ms in 1..=50 {
+        mark_imu_sample(ImuSample {
+            timestamp_ms,
+            gyro_x_mrad_s: 10,
+            gyro_y_mrad_s: -20,
+            gyro_z_mrad_s: 30,
+            ..ImuSample::stationary(timestamp_ms)
+        });
+    }
+    let biased = snapshot(50);
+    assert!(biased.imu_gyro_bias_calibrated);
+    assert_eq!(biased.imu_gyro_x_mrad_s, 0);
+    assert_eq!(biased.imu_gyro_y_mrad_s, 0);
+    assert_eq!(biased.imu_gyro_z_mrad_s, 0);
+    assert_eq!(biased.imu_orientation_confidence_permille, 450);
+
+    assert!(zero_imu_orientation_from_gravity());
+    mark_imu_sample(ImuSample::stationary(60));
+    let ready = snapshot(60);
+    assert!(ready.imu_mounting_calibrated);
+    assert_eq!(ready.imu_orientation_confidence_permille, 900);
+    assert_eq!(
+        ready.imu_orientation_source,
+        "mpu6050_accel_gyro_roll_pitch"
+    );
+}

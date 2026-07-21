@@ -16,6 +16,7 @@ struct StatusJson {
     create_uart_baud: u32,
     create_sensor_probe_packet: u8,
     uptime_ms: u32,
+    clock_epoch: u32,
     current_runtime_state: &'static str,
     create_power_state: &'static str,
     oi_mode: &'static str,
@@ -128,6 +129,10 @@ struct ImuStatusJson {
     impact_score_mm_s2: u16,
     motion_consistency: &'static str,
     calibration: &'static str,
+    orientation_confidence_permille: u16,
+    gyro_bias_calibrated: bool,
+    mounting_calibrated: bool,
+    orientation_source: &'static str,
 }
 
 #[cfg(feature = "pico-w")]
@@ -208,6 +213,10 @@ pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Resul
         create_uart_baud: snapshot.create_uart_baud,
         create_sensor_probe_packet: snapshot.create_sensor_probe_packet,
         uptime_ms: snapshot.uptime_ms,
+        // RP2040 uptime resets on boot. Motherbrain combines this firmware-local
+        // epoch with connection identity and advances its epoch on reconnect or
+        // uptime regression before it joins any interpolation history.
+        clock_epoch: 0,
         current_runtime_state: runtime_state_text(snapshot.current_runtime_state),
         create_power_state: tri_state_text(snapshot.create_power_state),
         oi_mode: oi_mode_text(snapshot.oi_mode),
@@ -309,6 +318,10 @@ pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Resul
             impact_score_mm_s2: snapshot.imu_impact_score_mm_s2,
             motion_consistency: motion_consistency_text(snapshot.imu_motion_consistency),
             calibration: imu_calibration_text(snapshot.imu_calibration_state),
+            orientation_confidence_permille: snapshot.imu_orientation_confidence_permille,
+            gyro_bias_calibrated: snapshot.imu_gyro_bias_calibrated,
+            mounting_calibrated: snapshot.imu_mounting_calibrated,
+            orientation_source: snapshot.imu_orientation_source,
         },
         create_sensors: create_sensor_status_json(snapshot),
         forebrain_uart: ForebrainUartStatusJson {

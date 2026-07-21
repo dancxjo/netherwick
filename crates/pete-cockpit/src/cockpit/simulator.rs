@@ -1026,7 +1026,7 @@ impl Cockpit for SimCockpit {
         self.expire_heartbeat_if_due();
         Ok(CockpitStatus {
             raw: format!(
-                "OK 0 STATUS sim=true now_ms={} uptime_ms={} create_body_packets=1 create_last_body_packet_ms={} armed={} estop={} safety_tripped={} safety_latch_kind={} safety_hazard_generation={} event_next_seq={} active_cmd_vel={} bump_left={} bump_right={} cliff_left={} cliff_front_left={} cliff_front_right={} cliff_right={} wheel_drop={} wall={} virtual_wall={} ir_byte={} buttons={} charging_state={} charge_mah={} capacity_mah={} voltage_mv={} current_ma={} odometry_resets={} odometry_distance_mm={} odometry_heading_mrad={} imu_present=2 imu_health=1 imu_samples=1 imu_age_ms=0 imu_poll_ms=20 imu_yaw_mrad=0 imu_pitch_mrad=0 imu_roll_mrad=0 imu_yaw_rate_mrad_s=0 imu_gyro_x_mrad_s=0 imu_gyro_y_mrad_s=0 imu_gyro_z_mrad_s=0 imu_accel_x_mm_s2=0 imu_accel_y_mm_s2=0 imu_accel_z_mm_s2=9807 imu_accel_mag_mm_s2=9807 imu_tilt_mrad=0 imu_roughness_mm_s2=0 imu_impact_mm_s2=0 imu_motion_consistency=1 imu_calibration={} audio_silent={} audio_last_requested=none audio_last_played=none audio_last_playback_ms=0 audio_suppressed=0 audio_dropped=0",
+                "OK 0 STATUS sim=true now_ms={} uptime_ms={} clock_epoch=0 create_body_packets=1 create_last_body_packet_ms={} armed={} estop={} safety_tripped={} safety_latch_kind={} safety_hazard_generation={} event_next_seq={} active_cmd_vel={} bump_left={} bump_right={} cliff_left={} cliff_front_left={} cliff_front_right={} cliff_right={} wheel_drop={} wall={} virtual_wall={} ir_byte={} buttons={} charging_state={} charge_mah={} capacity_mah={} voltage_mv={} current_ma={} odometry_resets={} odometry_distance_mm={} odometry_heading_mrad={} imu_present=2 imu_health=1 imu_samples=1 imu_sample_ms={} imu_age_ms=0 imu_poll_ms=20 imu_yaw_mrad=0 imu_pitch_mrad=0 imu_roll_mrad=0 imu_yaw_rate_mrad_s=0 imu_gyro_x_mrad_s=0 imu_gyro_y_mrad_s=0 imu_gyro_z_mrad_s=0 imu_accel_x_mm_s2=0 imu_accel_y_mm_s2=0 imu_accel_z_mm_s2=9807 imu_accel_mag_mm_s2=9807 imu_tilt_mrad=0 imu_roughness_mm_s2=0 imu_impact_mm_s2=0 imu_motion_consistency=1 imu_calibration={} imu_orientation_confidence=950 imu_gyro_bias_calibrated=true imu_mounting_calibrated=true imu_orientation_source=simulated_accel_gyro_roll_pitch audio_silent={} audio_last_requested=none audio_last_played=none audio_last_playback_ms=0 audio_suppressed=0 audio_dropped=0",
                 self.now_ms,
                 self.now_ms,
                 self.now_ms,
@@ -1061,6 +1061,7 @@ impl Cockpit for SimCockpit {
                 self.odometry_reset_count,
                 self.odometry_distance_mm,
                 self.odometry_heading_mrad,
+                self.now_ms,
                 self.imu_calibration,
                 self.audio_silent
             ),
@@ -1337,4 +1338,3 @@ fn request_is_removed_brainstem_convenience(request: &CockpitRequest) -> bool {
             | CockpitRequest::SetSafetyPolicy { .. }
     )
 }
-

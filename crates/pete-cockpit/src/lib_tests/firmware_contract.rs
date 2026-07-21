@@ -332,6 +332,75 @@ fn compact_status_infers_imu_tilt_safety_latch() {
 }
 
 #[test]
+fn compact_and_json_status_preserve_brainstem_timing_and_imu_trust_parity() {
+    let compact = StatusSummary::from_raw(
+        "OK 7 STATUS uptime_ms=4294967200 clock_epoch=3 create_body_packets=9 create_last_body_packet_ms=4294967180 imu_present=2 imu_health=1 imu_samples=50 imu_sample_ms=4294967190 imu_age_ms=10 imu_poll_ms=20 imu_roll_mrad=120 imu_pitch_mrad=-80 imu_gyro_x_mrad_s=1 imu_gyro_y_mrad_s=-2 imu_gyro_z_mrad_s=3 imu_accel_x_mm_s2=10 imu_accel_y_mm_s2=20 imu_accel_z_mm_s2=9800 imu_orientation_confidence=875 imu_gyro_bias_calibrated=true imu_mounting_calibrated=true imu_orientation_source=mpu6050_accel_gyro_roll_pitch",
+    );
+    let json = StatusSummary::from_raw(
+        r#"{
+          "uptime_ms": 4294967200,
+          "clock_epoch": 3,
+          "create_sensors": {
+            "complete_packet_count": 9,
+            "last_complete_packet_timestamp_ms": 4294967180
+          },
+          "imu": {
+            "present": "on",
+            "health": "ok",
+            "sample_count": 50,
+            "last_sample_timestamp_ms": 4294967190,
+            "sample_age_ms": 10,
+            "poll_period_ms": 20,
+            "roll_mrad": 120,
+            "pitch_mrad": -80,
+            "angular_velocity_mrad_s": {"x": 1, "y": -2, "z": 3},
+            "linear_acceleration_mm_s2": {"x": 10, "y": 20, "z": 9800},
+            "orientation_confidence_permille": 875,
+            "gyro_bias_calibrated": true,
+            "mounting_calibrated": true,
+            "orientation_source": "mpu6050_accel_gyro_roll_pitch"
+          }
+        }"#,
+    );
+
+    assert_eq!(compact.uptime_ms, json.uptime_ms);
+    assert_eq!(compact.clock_epoch, json.clock_epoch);
+    assert_eq!(
+        compact.body_packet_timestamp_ms,
+        json.body_packet_timestamp_ms
+    );
+    assert_eq!(compact.body_packet_age_ms, json.body_packet_age_ms);
+    assert_eq!(
+        compact.imu.sample_timestamp_ms,
+        json.imu.sample_timestamp_ms
+    );
+    assert_eq!(compact.imu.sample_age_ms, json.imu.sample_age_ms);
+    assert_eq!(compact.imu.roll_mrad, json.imu.roll_mrad);
+    assert_eq!(compact.imu.pitch_mrad, json.imu.pitch_mrad);
+    assert_eq!(
+        compact.imu.angular_velocity_mrad_s,
+        json.imu.angular_velocity_mrad_s
+    );
+    assert_eq!(
+        compact.imu.linear_acceleration_mm_s2,
+        json.imu.linear_acceleration_mm_s2
+    );
+    assert_eq!(
+        compact.imu.orientation_confidence_permille,
+        json.imu.orientation_confidence_permille
+    );
+    assert_eq!(
+        compact.imu.gyro_bias_calibrated,
+        json.imu.gyro_bias_calibrated
+    );
+    assert_eq!(
+        compact.imu.mounting_calibrated,
+        json.imu.mounting_calibrated
+    );
+    assert_eq!(compact.imu.orientation_source, json.imu.orientation_source);
+}
+
+#[test]
 fn dock_ir_cue_decodes_and_steers_toward_both_buoys() {
     let green = DockIrCue::from_character(246).unwrap();
     assert_eq!(green.steering_mrad_s(400), -400);
