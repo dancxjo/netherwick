@@ -6,6 +6,18 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Ready: Add a new versioned `pete-events::BrainEvent` observability contract with
+  typed event identity, causality, quality, trust, authority, loss policy, and
+  payload/reference boundaries; include migration support from legacy v0 input and a
+  v1 schema validator.
+- Ready: Add conversion/adaptor pathways from existing runtime records (`Sensation`,
+  `Impression`, `Experience`, legacy `Event`, Reign outcomes, and now snapshots) into canonical `BrainEvent` envelopes for replay-capture-explain interoperability.
+- Ready: Add strict deduplication and schema regression coverage for BrainEvent
+  envelopes, including a v0 fixture migration test and canonical replay compatibility
+  checks.
+- Ready: Add the `docs/brain-event-contract.md` contract document covering identity,
+  causality, time/epoch semantics, loss policy, payload boundaries, and schema
+  evolution.
 - Add bounded offline object detection for Kinect/camera RGB with a backend-
   neutral interface, latest-first Pi 5 worker, calibration-aware depth
   association, short-term tracking, provenance-bearing descendant crops,
