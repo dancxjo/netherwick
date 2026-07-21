@@ -867,6 +867,8 @@ async fn live_map_endpoint_returns_pose_projected_beams_and_overlays() {
 
     assert_eq!(map.schema_version, 1);
     assert_eq!(map.label, MAP_LABEL);
+    assert_eq!(map.world_projection.coordinate_frame, "odometry_world");
+    assert!(!map.world_projection.aligned_with_3d);
     assert!(map.summary.label.contains("scan-matched"));
     assert!(map.summary.label.contains("occupancy"));
     assert_eq!(map.pose_trail.len(), 2);
@@ -977,6 +979,58 @@ async fn live_map_endpoint_returns_pose_projected_beams_and_overlays() {
     assert!((forward_hit.end_x_m - 0.5).abs() < 0.001);
     assert!((forward_hit.end_y_m - 1.75).abs() < 0.001);
     assert!((forward_hit.angle_rad - 0.0).abs() < 0.001);
+}
+
+#[tokio::test]
+async fn live_map_projects_depth_only_world_voxels_in_the_same_frame_as_3d() {
+    let state = LiveViewState::new();
+    state.update_scene_metadata(LiveSceneMetadata {
+        sensor_calibration: Some(SceneSensorCalibration::sim_default()),
+        ..LiveSceneMetadata::default()
+    });
+    for t_ms in [100, 200, 300] {
+        let mut snapshot = WorldSnapshot::default();
+        snapshot.body.odometry = Pose2 {
+            x_m: 0.5,
+            y_m: 0.75,
+            heading_rad: std::f32::consts::FRAC_PI_2,
+        };
+        snapshot.body.last_update_ms = t_ms;
+        snapshot.kinect = KinectSense {
+            captured_at_ms: t_ms,
+            depth_m: vec![1.0],
+            depth_width: 1,
+            depth_height: 1,
+            depth_fx: 1.0,
+            depth_fy: 1.0,
+            min_depth_m: 0.1,
+            max_depth_m: 8.0,
+            depth_coordinate_system: Some("kinect_camera".to_string()),
+            ..KinectSense::default()
+        };
+        state.update(snapshot);
+    }
+
+    let cloud = state.point_cloud_snapshot();
+    let world_point = cloud
+        .points()
+        .into_iter()
+        .find(|point| point.stable)
+        .expect("repeated calibrated depth point should be stable");
+    let Json(map) = get_live_map(State(state)).await.unwrap();
+
+    assert!(map.cells.is_empty(), "range-only map should have no cells");
+    assert!(map.world_projection.aligned_with_3d);
+    assert!(map.world_projection.geometry_trusted);
+    assert!(!map.world_projection.navigation_trusted);
+    assert_eq!(map.world_projection.source_voxels, 1);
+    assert_eq!(map.world_projection.projected_cells, 1);
+    assert_eq!(map.world_projection.stable_cells, 1);
+    let projected = &map.world_projection.cells[0];
+    let half_cell = map.world_projection.resolution_m * 0.5;
+    assert!((projected.center_x_m - world_point.position.x_m).abs() <= half_cell);
+    assert!((projected.center_y_m - world_point.position.y_m).abs() <= half_cell);
+    assert!(projected.stable);
 }
 
 #[test]
@@ -1614,8 +1668,12 @@ async fn live_routes_include_3d_and_scene_endpoints() {
     assert!(page.contains("function renderPersistentWorldBelief"));
     assert!(page.contains("local_world_belief"));
     assert!(page.contains("roll_pitch_corrected"));
-    assert!(page
-        .contains("Scan-matched occupancy map: range scans correct odometry before integration."));
+    assert!(page.contains("id=\"map-trust\""));
+    assert!(page.contains("function updateMapTrust"));
+    assert!(page.contains("liveMap?.world_projection?.cells"));
+    assert!(page.contains(
+        "Obstacle cells project the same calibrated odometry-world voxels shown in 3D."
+    ));
     assert!(page.contains("const traceLocal = (x, y) =>"));
     assert!(page.contains("forward: dx * headingCos + dy * headingSin"));
     assert!(page.contains("function occupancyGridCellCenter"));

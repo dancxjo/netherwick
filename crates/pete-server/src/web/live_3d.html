@@ -39,6 +39,9 @@ html,body,#scene{width:100%;height:100%;margin:0;overflow:hidden}
 .cockpit-arm input{width:16px;height:16px}
 #hardware-state{font-size:11px;color:#ffbf7a;min-height:15px}
 .trace-label{font-size:11px;color:#9fb0bf}
+#map-trust{font-size:10px;line-height:1.35;padding:5px 7px;border:1px solid #465768;border-radius:4px;background:rgba(20,29,38,.8);color:#b9cad8}
+#map-trust[data-aligned="true"]{border-color:#39755b;color:#8df0b2}
+#map-trust[data-geometry-trusted="false"]{border-color:#856433;color:#ffd083}
 #trace-map{width:100%;height:auto;display:block;background:#081015;border:1px solid #2d3d4a;border-radius:4px}
 #entity-graph{width:100%;height:auto;display:block;background:#070b0f;border:1px solid #2d3d4a;border-radius:4px;margin-top:8px}
 #entity-graph-summary{font-size:10px;color:#b7c8d8;min-height:13px;margin-top:4px;font-variant-numeric:tabular-nums}
@@ -268,6 +271,7 @@ canvas{display:block}
 <aside id="reign-map" data-window-title="2D map">
   <strong>2D map</strong>
   <canvas id="trace-map" width="220" height="180" aria-label="odometry/range trace map"></canvas>
+  <div id="map-trust" data-aligned="false" data-geometry-trusted="false">waiting for shared 3D world evidence...</div>
   <div class="map-toggles" aria-label="map overlays">
     <label><input type="checkbox" data-map-layer="occupancy" checked>occupancy</label>
     <label><input type="checkbox" data-map-layer="rays" checked>rays</label>
@@ -287,7 +291,7 @@ canvas{display:block}
     <label><input type="checkbox" data-map-layer="novelty">novelty</label>
     <label><input type="checkbox" data-map-layer="events" checked>events</label>
   </div>
-  <div class="trace-label">Scan-matched occupancy map: range scans correct odometry before integration.</div>
+  <div class="trace-label">Obstacle cells project the same calibrated odometry-world voxels shown in 3D. Navigation remains gated until corrected SLAM is ready.</div>
 </aside>
 <aside id="reign-constellation" data-window-title="Entities">
   <strong>Entities</strong>
@@ -432,6 +436,7 @@ const hardwareArm = document.getElementById('hardware-arm');
 const hardwareState = document.getElementById('hardware-state');
 const traceCanvas = document.getElementById('trace-map');
 const traceCtx = traceCanvas.getContext('2d');
+const mapTrust = document.getElementById('map-trust');
 const entityGraphCanvas = document.getElementById('entity-graph');
 const entityGraphCtx = entityGraphCanvas.getContext('2d');
 const entityGraphSummary = document.getElementById('entity-graph-summary');
@@ -1724,6 +1729,24 @@ function enabledMapLayers(){
   return new Set(mapLayerInputs.filter(input => input.checked).map(input => input.dataset.mapLayer));
 }
 
+function updateMapTrust(liveMap){
+  const projection = liveMap?.world_projection;
+  if(!projection){
+    mapTrust.dataset.aligned = 'false';
+    mapTrust.dataset.geometryTrusted = 'false';
+    mapTrust.textContent = 'waiting for shared 3D world evidence...';
+    mapTrust.title = '';
+    return;
+  }
+  mapTrust.dataset.aligned = String(!!projection.aligned_with_3d);
+  mapTrust.dataset.geometryTrusted = String(!!projection.geometry_trusted);
+  const alignment = projection.aligned_with_3d ? '3D aligned' : '3D evidence pending';
+  const geometry = projection.geometry_trusted ? 'geometry trusted' : 'geometry provisional';
+  const navigation = projection.navigation_trusted ? 'navigation trusted' : 'navigation gated';
+  mapTrust.textContent = `${alignment} · ${geometry} · ${navigation} · ${projection.projected_cells || 0} cells`;
+  mapTrust.title = (projection.reasons || []).join('; ');
+}
+
 function syncDisplayToggles(){
   const layers = enabledMapLayers();
   eyePanel.setEnabled(layers.has('flat image'));
@@ -1986,6 +2009,7 @@ entityGraphCanvas.addEventListener('click', (event) => {
 
 function drawTraceMap(packet, liveMap=null){
   updateTraceState(packet);
+  updateMapTrust(liveMap);
   const w = traceCanvas.width, h = traceCanvas.height;
   traceCtx.clearRect(0, 0, w, h);
   traceCtx.fillStyle = '#081015';
@@ -2014,6 +2038,12 @@ function drawTraceMap(packet, liveMap=null){
     return h / 2 - p.forward * scale;
   };
   if(layers.has('occupancy')){
+    for(const cell of liveMap?.world_projection?.cells || []){
+      const alpha = Math.max(.18, Math.min(.88, Number(cell.confidence) || .25));
+      traceCtx.fillStyle = cell.stable ? `rgba(115,240,178,${alpha})` : `rgba(116,193,240,${alpha * .65})`;
+      const size = cell.stable ? 5 : 3;
+      traceCtx.fillRect(sx(cell.center_x_m, cell.center_y_m)-size/2, sy(cell.center_x_m, cell.center_y_m)-size/2, size, size);
+    }
     if(liveMap?.cells?.length){
       for(const cell of liveMap.cells){
         const occupied = Number(cell.occupied_score) > Number(cell.free_score);

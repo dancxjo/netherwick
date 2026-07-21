@@ -57,6 +57,12 @@ All notable changes are grouped by date.
 - Add calibrated 3D world point-cloud projection metadata to the live map API:
   emit a new `world_projection` payload with source attribution, coordinate
   frame, trust gates, reasons, and per-cell stability/confidence/age data.
+- Add a live-map trust banner on the 2D trace view that displays projection
+  alignment, geometry trust, navigation gating, and projected-cell counts
+  while rendering projected cells with separate stable/unstable styling.
+- Derive `Clone`, `Debug`, `PartialEq`, `Serialize`, and `Deserialize` for
+  `EmbodiedDemo` so demo embeddings can be copied, compared, and serialized
+  consistently through experience tooling.
 
 ### Auto-sync (2026-07-15)
 
@@ -145,6 +151,10 @@ All notable changes are grouped by date.
   body-link events without automatically promoting candidates.
 
 ### Changed
+
+- Refactor `crates/pete-tools/src/main_tests.rs` into domain-specific modules
+  under `crates/pete-tools/src/main_tests/` and re-export them through
+  targeted `include!` statements.
 
 - Retire the action-producing `event_face_detected` behavior. Face events now
   remain perception evidence: canonical social `Now` opens and closes

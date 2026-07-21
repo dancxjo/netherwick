@@ -447,6 +447,7 @@ pub async fn demo_embodied_experience(now_ms: TimeMs) -> Result<EmbodiedDemo> {
     })
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EmbodiedDemo {
     pub sensations: Vec<Sensation>,
     pub impressions: Vec<Impression>,
