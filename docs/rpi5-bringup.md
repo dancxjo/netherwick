@@ -37,7 +37,8 @@ sudo usermod -aG dialout,i2c,video,audio "$USER"
 
 `dialout` is normally required for `/dev/ttyUSB*` or `/dev/ttyACM*` brainstem, USB GPS, and HLS-LFCD2 lidar devices. `i2c` is normally required for `/dev/i2c-*` IMU access. `video` is normally required for `/dev/video*` camera access. `audio` may be required for microphone capture.
 
-Enable the Pi I2C bus before plugging in the MPU-6050:
+Enable the Pi I2C bus only for an explicitly Motherbrain-local diagnostic MPU-6050. The normal
+brainstem-connected IMU does not require `/dev/i2c-1` on Motherbrain:
 
 ```bash
 sudo raspi-config nonint do_i2c 0
@@ -85,9 +86,9 @@ Kinect availability is detected best-effort through `freenect-*` tools or `pkg-c
 
 Camera devices are expected under `/dev/video*`. Microphones should be visible to ALSA, for example through `arecord -l`.
 
-MPU-6050 IMUs use I2C bus 1 by default on Raspberry Pi header pins: VCC to 3.3V physical pin 1, GND to pin 6, SDA to GPIO 2 physical pin 3, and SCL to GPIO 3 physical pin 5. Pete defaults `robot` and `capture-real` to `/dev/i2c-1` at address `0x68`, so no `--imu` flag is needed for the normal wiring. Use `--imu none` to disable IMU capture, or `--imu /dev/i2c-1@0x69` if AD0 is pulled high.
+The normal MPU-6050 is attached to brainstem Pico I2C1 (GP2/GP3) and is discovered through Cockpit status; Pete does not assume `/dev/i2c-1` exists on Motherbrain. A separately wired local diagnostic MPU must be explicit, for example `--imu-source local-i2c --imu /dev/i2c-1@0x69`. Use `--imu-source none` to disable fusion IMU without weakening brainstem tilt/impact safety. See [Brainstem IMU handoff](brainstem-imu-handoff.md).
 
-After wiring, this should show address `68`:
+For that separately Motherbrain-local wiring only, this should show address `68`:
 
 ```bash
 i2cdetect -y 1

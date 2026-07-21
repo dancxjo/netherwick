@@ -60,7 +60,9 @@ physical_pin = 25
 
 UART is `57600 8N1`.
 
-The IMU path is short-horizon inertial telemetry plus local tilt/impact reflex safety. It is not SLAM, global pose, or autonomous recovery; higher-level mapping must treat IMU status as one sensor input with explicit freshness and health. The IMU is optional at runtime: when it is absent, the brainstem reports `imu.health = "absent"`, continues operating without inertial reflexes, and periodically probes for a newly attached device.
+The IMU path is short-horizon inertial telemetry plus local tilt/impact reflex safety. It is not SLAM, global pose, or autonomous recovery; higher-level mapping treats IMU status as one discoverable sensor candidate with explicit freshness, clock, calibration, mounting, confidence, and provenance. Compact and JSON status include uptime at status generation, exact IMU and Create body-packet timestamps, a firmware-local clock epoch, orientation confidence, independent gyro-bias/mounting gates, and orientation source. The MPU path reports roll/pitch but does not advertise gyro-integrated yaw as absolute orientation. The IMU is optional at runtime: when absent, brainstem reports `imu.health = "absent"`, continues operating without inertial reflexes, and periodically probes for a newly attached device.
+
+`board.toml` explicitly declares the fixed MPU X/Y/Z to base forward/left/up mounting. Firmware requires 50 stationary plausible-gravity samples before reporting gyro bias calibrated; the attended gravity-zero operation is a separate calibration and is never relabeled as gyro bias. Local tilt/impact safety consumes raw acquisition independently of Motherbrain selection or clock acceptance. Motherbrain's full handoff and bring-up procedure is documented in [`docs/brainstem-imu-handoff.md`](../../docs/brainstem-imu-handoff.md).
 
 The Pico W backend also supports an optional 0.91-inch 128x32
 SSD1306-compatible status OLED on the same I2C1 bus. Connect only VCC, GND, SDA,

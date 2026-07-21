@@ -183,7 +183,7 @@ Log out and back in after changing group membership. A missing cockpit UART devi
 
 ## Optional Sensors
 
-The CLI accepts `--camera`, `--mic`, `--asr-command`, `--imu`, `--gps`, and `--lidar`. Camera and microphone are optional by default, so absent devices do not block read-only cockpit bring-up. IMU defaults to the Raspberry Pi bus `/dev/i2c-1`; pass `--imu none` to disable it. GPS auto-starts on real runs when Pete finds a likely u-blox/GPS USB serial device; pass `--gps none` to disable it. HLS-LFCD2 / LDS-01 lidar auto-starts when its stable serial name is recognizable; otherwise pin it with `--lidar /dev/serial/by-id/DEVICE` or `LIDAR_SERIAL_PORT`. Passing `--require-camera`, `--require-mic`, `--require-imu`, `--require-gps`, or `--require-lidar` makes the command fail if that provider is unavailable.
+The CLI accepts `--camera`, `--mic`, `--asr-command`, `--imu`, `--imu-source`, `--gps`, and `--lidar`. Camera and microphone are optional by default, so absent devices do not block read-only cockpit bring-up. Brainstem IMU telemetry is discovered and selected automatically; the runtime does not assume `/dev/i2c-1` exists. A local I2C IMU registers only after hardware discovery or an explicit `--imu /dev/i2c-N` setting. `--imu-source none` disables fusion IMU while brainstem safety remains active. GPS auto-starts on real runs when Pete finds a likely u-blox/GPS USB serial device; pass `--gps none` to disable it. HLS-LFCD2 / LDS-01 lidar auto-starts when its stable serial name is recognizable; otherwise pin it with `--lidar /dev/serial/by-id/DEVICE` or `LIDAR_SERIAL_PORT`. Passing `--require-camera`, `--require-mic`, `--require-imu`, `--require-gps`, or `--require-lidar` makes an explicitly configured provider fail if unavailable. See [Brainstem IMU handoff](brainstem-imu-handoff.md) for trust, timing, mounting, and verification details.
 
 `--asr-command` enables the command-backed ASR tool for microphone input. Pete chunks voiced PCM, writes each finalized chunk to a temporary WAV file, appends that path to the configured command, and reads the transcript from stdout. The same value can be supplied with `PETE_ASR_COMMAND`. ASR output is delivered as `EarSense.asr` and follows the normal sensation/vector path.
 
@@ -197,13 +197,13 @@ sudo usermod -aG i2c "$USER"
 sudo reboot
 ```
 
-The default bus is `/dev/i2c-1` and the default MPU-6050 address is `0x68`, so this reads real IMU data with normal Pi wiring:
+The normal robot reads the MPU-6050 through brainstem telemetry, so this needs no local I2C device:
 
 ```bash
 cargo run -p pete-tools -- robot
 ```
 
-If AD0 is high, include the address in the device string:
+For a separately wired diagnostic/future Motherbrain-local MPU only, include the device and address explicitly:
 
 ```bash
 cargo run -p pete-tools -- robot --imu /dev/i2c-1@0x69

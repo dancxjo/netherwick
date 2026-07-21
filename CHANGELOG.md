@@ -6,6 +6,13 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Add the complete brainstem inertial handoff: parity timing/trust fields in
+  compact and JSON status, stationary firmware gyro-bias estimation, bounded
+  host clock mapping with reboot/reconnect epochs, truthful roll/pitch-only MPU
+  conversion, automatic trust-gated per-source arbitration, isolated fusion
+  histories, Kinect exposure alignment, diagnostics, and bring-up guidance,
+  while preserving independent brainstem safety and raw Create odometry.
+
 - Add Brainstem-owned Solresol auditory annunciation with typed hazard,
   control, power, health, recovery, docking, and service cues; bounded
   urgent/informational scheduling; transition deduplication; playback
