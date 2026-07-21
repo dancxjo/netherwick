@@ -4,6 +4,13 @@ All notable changes are grouped by date.
 
 ## Unreleased
 
+### Added
+
+- Add a deterministic seven-case social acceptance exam spanning simulator
+  perception, canonical social/temporal/epistemic state, sleep interruption,
+  asynchronous cognition delay, and forebrain failure, with a `just
+  social-exam` operator command and optional JSON report.
+
 ### Fixed
 
 - Honor a cognition provider's declared availability before scheduling work, so
@@ -281,7 +288,6 @@ All notable changes are grouped by date.
 ### Ongoing
 
 - Migration of face, object, and voice features to `VectorArtifact`-only schema fields. Downstream runtime, training, and event consumers still require coordinated updates, so this is not yet a completed release change.
-- Register `social_exam` as a runtime module in `crates/pete-runtime/src/lib.rs` (`mod` + re-export), but the backing `crates/pete-runtime/src/social_exam.rs` implementation is missing in this worktree, so the integration is still incomplete.
 
 ### Cognitive provider health follow-up (2026-07-15)
 

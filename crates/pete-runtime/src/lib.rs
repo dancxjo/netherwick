@@ -1,6 +1,8 @@
 mod sleep;
+mod social_exam;
 
 pub use sleep::*;
+pub use social_exam::*;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};

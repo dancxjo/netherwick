@@ -104,6 +104,7 @@ enum Command {
     NeatTrain(NeatTrainArgs),
     DreamTrain(DreamTrainArgs),
     EvalScenario(EvalScenarioArgs),
+    SocialExam(SocialExamArgs),
     MemoryInspect(MemoryInspectArgs),
     Mouth(MouthArgs),
     Robot(RobotArgs),
@@ -144,6 +145,7 @@ async fn main() -> Result<()> {
         Command::NeatTrain(args) => run_neat_train(args).await,
         Command::DreamTrain(args) => run_dream_train(args).await,
         Command::EvalScenario(args) => run_eval_scenario(args).await,
+        Command::SocialExam(args) => run_social_exam_command(args).await,
         Command::MemoryInspect(args) => memory_inspect(args).await,
         Command::Mouth(args) => run_mouth(args),
         Command::Robot(args) => run_robot(args).await,
@@ -442,6 +444,13 @@ struct EvalScenarioArgs {
     action_selector: CliActionSelectorMode,
     #[command(flatten)]
     llm: LlmArgs,
+}
+
+#[derive(Debug, Parser)]
+struct SocialExamArgs {
+    /// Write the complete machine-readable exam report to this path.
+    #[arg(long)]
+    out: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -6531,6 +6540,35 @@ impl ScenarioEpisodeMemoryBuilder {
                 .unwrap_or(false),
         }
     }
+}
+
+async fn run_social_exam_command(args: SocialExamArgs) -> Result<()> {
+    let report = pete_runtime::run_social_exam().await?;
+    for case in &report.cases {
+        println!(
+            "{:<28} {}",
+            case.case,
+            if case.passed { "PASS" } else { "FAIL" }
+        );
+        for failure in &case.failures {
+            println!("  {failure}");
+        }
+    }
+    if let Some(out) = args.out.as_deref() {
+        let path = Path::new(out);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::write(path, serde_json::to_vec_pretty(&report)?)?;
+        println!("social exam report written: {out}");
+    }
+    if !report.passed {
+        anyhow::bail!("social exam failed");
+    }
+    println!("social exam passed: {} cases", report.cases.len());
+    Ok(())
 }
 
 async fn run_eval_scenario(args: EvalScenarioArgs) -> Result<()> {

@@ -37,3 +37,21 @@ Those captures can be replayed through the normal worldlab path, while the ledge
 By default, `sim-curriculum` assigns the first 80% of episodes to `train`, the next 10% to
 `validation`, and the remaining 10% to `test`. Tune that with `--validation-ratio` and
 `--test-ratio` when you need a different split.
+
+## Social acceptance exam
+
+The social exam complements the static room curricula with deterministic
+changes over time and explicit pass/fail gates:
+
+```bash
+just social-exam
+just social-exam --out data/reports/social-exam.json
+```
+
+It projects people and speech through the real simulator sensor path, then
+checks the canonical world model and runtime for arrival/departure with a new
+return encounter, conflicting identity evidence, attributed conversation,
+social interruption of sleep, changes among no-gain epistemic strategies,
+non-blocking delayed cognition, and explicit forebrain failure. The command
+exits unsuccessfully if any case fails; `--out` preserves the observations and
+failure details as JSON.
