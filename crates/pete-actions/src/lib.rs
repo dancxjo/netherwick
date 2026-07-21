@@ -251,12 +251,38 @@ pub struct ReignOutcome {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LlmActionProposal {
+    /// An executable action offered to local action selection.
+    ///
+    /// Higher-cognition provider decisions must not populate this field.
     pub proposed_action: Option<ActionPrimitive>,
+    /// Provider output retained strictly as non-executable telemetry.
+    #[serde(default)]
+    pub advisory_action: Option<LlmAdvisoryAction>,
     pub accepted: bool,
     pub safety_vetoed: bool,
     pub final_action: Option<ActionPrimitive>,
     pub ignored_reason: Option<String>,
     pub safety_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LlmAdvisoryAction {
+    pub action: ActionPrimitive,
+    pub source: LlmAdvisoryActionSource,
+    pub input_snapshot_ref: String,
+    pub disposition: LlmAdvisoryActionDisposition,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmAdvisoryActionSource {
+    ProviderDecision,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmAdvisoryActionDisposition {
+    DiscardedAtAdvisoryBoundary,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

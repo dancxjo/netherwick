@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use pete_actions::{
     action_to_motor_command, ActionPrimitive, ApproachTarget, ChirpPattern, ExploreStyle,
-    InspectTarget, LlmActionProposal, ReignInput, ReignMode, ReignOutcome, ReignSource, TurnDir,
+    InspectTarget, LlmActionProposal, LlmAdvisoryAction, LlmAdvisoryActionDisposition,
+    LlmAdvisoryActionSource, ReignInput, ReignMode, ReignOutcome, ReignSource, TurnDir,
 };
 use pete_autonomic::{SafetyLayer, SafetyReason};
 use pete_behaviors::{
@@ -130,10 +131,14 @@ where
 }
 
 const COGNITION_DEADLINE_MS: u64 = 2_000;
+/// Leave a quiet period after every terminal provider outcome so a fast or
+/// disabled provider cannot turn the organism tick into a request generator.
+const COGNITION_COOLDOWN_MS: u64 = 2_000;
 
 #[derive(Default)]
 struct RuntimeCognition {
     pending: Option<PendingLlmCognition>,
+    next_request_at_ms: u64,
     last_sense: pete_now::LlmSense,
     last_sense_valid_until_ms: u64,
     last_outcome: Option<CognitionOutcome>,
@@ -3209,6 +3214,9 @@ where
     /// Cancel optional cognition without disturbing local control state.
     pub fn cancel_cognition(&mut self) {
         if let Some(pending) = self.cognition.pending.take() {
+            self.cognition.next_request_at_ms = pending
+                .requested_at_ms
+                .saturating_add(COGNITION_COOLDOWN_MS);
             pending.task.abort();
             self.cognition.last_outcome = Some(CognitionOutcome::Cancelled);
         }
@@ -3246,6 +3254,7 @@ where
         {
             let pending = self.cognition.pending.take().expect("expired task");
             pending.task.abort();
+            self.cognition.next_request_at_ms = now.t_ms.saturating_add(COGNITION_COOLDOWN_MS);
             self.cognition.last_outcome = Some(CognitionOutcome::Expired);
         }
         if self
@@ -3255,6 +3264,7 @@ where
             .is_some_and(|pending| pending.task.is_finished())
         {
             let pending = self.cognition.pending.take().expect("finished task");
+            self.cognition.next_request_at_ms = now.t_ms.saturating_add(COGNITION_COOLDOWN_MS);
             match pending.task.await {
                 Err(error) => {
                     let outcome = if error.is_cancelled() {
@@ -3286,7 +3296,7 @@ where
             }
         }
 
-        if self.cognition.pending.is_none() {
+        if self.cognition.pending.is_none() && now.t_ms >= self.cognition.next_request_at_ms {
             let llm = Arc::clone(&self.llm);
             let request_now = now.clone();
             let request_impressions = impressions.to_vec();
@@ -3776,9 +3786,9 @@ where
                     CognitionOutcome::Cancelled => Some("latest request was cancelled".to_string()),
                     _ => None,
                 });
-        // Occupancy and health are separate: advance_cognition immediately
-        // queues the next request after accepting a result, so a pending task
-        // means the healthy service is busy, not unavailable.
+        // Occupancy and health are separate: a pending task means the healthy
+        // service is busy, not unavailable. The post-request cooldown is idle,
+        // healthy time rather than either an outage or request occupancy.
         let enhanced_cognition_available = cognition_failure.is_none();
         world_context.cognitive_services.insert(
             "rich_language".to_string(),
@@ -16811,6 +16821,41 @@ mod tests {
         )
     }
 
+    async fn finished_cognition_task(
+    ) -> JoinHandle<Result<(Option<Combobulation>, LlmTickResult)>> {
+        let task = tokio::spawn(async {
+            Ok((
+                None,
+                LlmTickResult {
+                    sense: pete_now::LlmSense {
+                        schema_version: 1,
+                        command_summary: Some("completed cognition".to_string()),
+                        confidence: 1.0,
+                        ..pete_now::LlmSense::default()
+                    },
+                    ..LlmTickResult::default()
+                },
+            ))
+        });
+        tokio::task::yield_now().await;
+        assert!(task.is_finished(), "fixture cognition task should be ready");
+        task
+    }
+
+    fn cognition_test_inputs() -> (
+        EmbodiedContext,
+        ExperienceLatent,
+        Vec<FuturePrediction>,
+        Vec<String>,
+    ) {
+        (
+            EmbodiedContext::default(),
+            ExperienceLatent::default(),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
     #[tokio::test]
     async fn llm_command_is_never_granted_control_authority() {
         let ledger = JsonlLedger::new("/tmp/pete-runtime-llm-command-action-test");
@@ -16852,7 +16897,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_cognition_remains_available_while_next_request_is_in_flight() {
+    async fn accepted_cognition_enters_cooldown_before_scheduling_again() {
         let ledger = JsonlLedger::new("/tmp/pete-runtime-cognition-service-health-test");
         let memory = InMemoryExperienceStore::new();
         let mut runtime = MinimalRuntime::new(
@@ -16885,17 +16930,41 @@ mod tests {
             runtime.cognition.last_outcome.as_ref(),
             Some(CognitionOutcome::Accepted)
         ));
-        assert!(runtime.cognition.pending.is_some());
+        assert!(runtime.cognition.pending.is_none());
+        assert_eq!(runtime.cognition.next_request_at_ms, 2_200);
         let accepted_service =
             &accepted.frame.now.world.self_model.service_state.services["rich_language"];
         assert!(accepted_service.available);
-        assert!(accepted_service.busy);
+        assert!(!accepted_service.busy);
         assert_eq!(accepted_service.unavailable_reason, None);
         assert!(accepted
             .frame
             .notes
             .iter()
             .any(|note| note == "LlmProviderOutcome: accepted"));
+
+        let cooling_down = runtime
+            .tick(idle_now(2_199), ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+        assert!(runtime.cognition.pending.is_none());
+        assert!(
+            !cooling_down
+                .frame
+                .now
+                .world
+                .self_model
+                .service_state
+                .services["rich_language"]
+                .busy
+        );
+
+        let eligible = runtime
+            .tick(idle_now(2_200), ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+        assert!(runtime.cognition.pending.is_some());
+        assert!(eligible.frame.now.world.self_model.service_state.services["rich_language"].busy);
     }
 
     #[tokio::test]

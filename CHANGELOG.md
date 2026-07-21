@@ -8,7 +8,12 @@ All notable changes are grouped by date.
 
 - Keep `rich_language` available while a healthy cognition request is in flight,
   and report request occupancy separately as `busy` instead of treating every
-  pending request as a service outage.
+  pending request as a service outage; enforce a runtime-owned cooldown after
+  every cognition outcome so fast providers cannot continuously generate work.
+- Separate higher-cognition outcomes from executable local actions by adding an
+  `advisory_action` payload to cognition proposals, keeping provider-suggested
+  suggestions as non-authoritative telemetry while preserving
+  `proposed_action` as the only executable path.
 - Read the r23 Create charging indicator from GP20/physical pin 26 in both Pico
   backends, and move the optional external status output to GP17 so firmware
   never drives the TXS channel 8 charging signal.
