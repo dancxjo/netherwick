@@ -474,6 +474,8 @@ impl Cockpit for CountingCockpit {
                 },
                 "odometry": {
                     "distance_mm": (self.body.odometry.x_m * 1000.0).round() as i32,
+                    "x_mm": (self.body.odometry.x_m * 1000.0).round() as i32,
+                    "y_mm": (self.body.odometry.y_m * 1000.0).round() as i32,
                     "heading_mrad": (self.body.odometry.heading_rad * 1000.0).round() as i32,
                     "reset_count": 0,
                 }
