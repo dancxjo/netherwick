@@ -30,12 +30,13 @@ episode, and 120 more generations at the current stage when resuming. Set
 values override automatic discovery.
 
 The command evolves a candidate, writes progress reports and WorldLab captures,
-then performs a transfer audit. If the candidate's transfer fitness beats the
-currently active locomotion model, or the hardcoded baseline when no model is
-active, the command writes the checkpoint and promotes `locomotion` to
-`model_infer` in `configs/models.toml`. The selected `Drive` still passes
-through the downstream safety layers. Defaults can be changed without changing
-the command contract:
+then performs a transfer audit. A passing candidate remains an inert candidate
+artifact until an evidence bundle proves that it also passed held-out simulation
+and physical shadow evaluation. Only then can the command atomically promote
+`locomotion` to `model_infer` in `configs/models.toml`; hardcoded locomotion
+remains its immediate fallback. The selected `Drive` still passes through the
+downstream safety layers. Defaults can be changed without changing the command
+contract:
 
 ```bash
 PETE_NEAT_GENERATIONS_PER_STAGE=20 \
@@ -44,7 +45,10 @@ PETE_NEAT_HELDOUT_SEED=9000001 \
 just train --neat locomotion
 ```
 
-Set `PETE_NEAT_NO_PROMOTE=1` to keep the old candidate-only behavior.
+Set `PETE_NEAT_PROMOTION_EVIDENCE=/path/to/promotion-evidence.json` to present
+the two shadow reports to the promotion gate. The evidence must name the exact
+checkpoint path as `candidate_id`. Set `PETE_NEAT_NO_PROMOTE=1` to explicitly
+disable promotion even when evidence is present.
 Use `PETE_NEAT_COMPATIBILITY_THRESHOLD`, `PETE_NEAT_TARGET_SPECIES_MIN`, and
 `PETE_NEAT_TARGET_SPECIES_MAX` to tune speciation pressure.
 
@@ -119,6 +123,24 @@ chargers disabled. Descriptor-only entries remain generalist, open-room, or
 clutter labels.
 
 ## Nervous System
+
+Every `shadow_infer` frame records the exact normalized input identity, baseline
+and candidate proposals, implementation provenance, per-policy inference time,
+candidate confidence/disagreement, and confirms that only the baseline proposal
+was selected. The adjacent safety-chain record proves that the learned output is
+proposal-only and still traverses conductor selection, autonomic filtering, and
+the final motor gate; physical evidence must additionally observe the possession
+lease and brainstem gate.
+
+A schema-v1 promotion evidence file contains `simulation` and `physical`
+`LocomotionShadowReport` objects. Each report includes capture IDs and metrics
+for collision rate, progress, oscillation, energy per metre, recovery success,
+and command instability. The default gate requires 20 held-out simulation
+episodes, 10 physical episodes, exact input alignment on every frame, no safety
+invariant violations, improvement without bounded metric regression, consistent
+simulation/physical progress gains, hardcoded fallback evidence, and atomic
+activation/rollback evidence. Missing or rejected evidence never changes the
+active model.
 
 The stable v1 input order has 17 values:
 

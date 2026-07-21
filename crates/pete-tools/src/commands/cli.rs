@@ -285,6 +285,10 @@ struct NeatTrainArgs {
     /// Leave the trained candidate as a report artifact instead of promoting winners.
     #[arg(long)]
     no_promote: bool,
+    /// JSON evidence containing held-out simulation and physical shadow reports.
+    /// The report candidate_id must exactly match --checkpoint.
+    #[arg(long)]
+    promotion_evidence: Option<String>,
 }
 
 #[derive(Debug, Parser)]

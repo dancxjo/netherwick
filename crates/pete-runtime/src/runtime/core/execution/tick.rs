@@ -829,6 +829,39 @@ where
             .behaviors
             .locomotion
             .infer_with_disagreement(&locomotion_input, now.t_ms)?;
+        let locomotion_shadow = if locomotion_run.record.regime == BehaviorRegime::ShadowInfer {
+            locomotion_run
+                .record
+                .hardcoded_output
+                .zip(locomotion_run.record.model_output)
+                .map(|(baseline, candidate)| {
+                    LocomotionShadowFrame::new(
+                        frame_id.to_string(),
+                        now.t_ms,
+                        locomotion_input.clone(),
+                        baseline,
+                        candidate,
+                        locomotion_run.chosen,
+                        self.models.behaviors.locomotion.hardcoded_id(),
+                        self.models
+                            .behaviors
+                            .locomotion
+                            .model_id()
+                            .unwrap_or("locomotion.model.missing"),
+                        locomotion_run.record.hardcoded_inference_us.unwrap_or_default(),
+                        locomotion_run.record.model_inference_us.unwrap_or_default(),
+                        locomotion_run.record.confidence.or_else(|| {
+                            locomotion_run
+                                .record
+                                .disagreement
+                                .map(|distance| 1.0 / (1.0 + distance.max(0.0)))
+                        }),
+                        locomotion_run.record.error.clone(),
+                    )
+                })
+        } else {
+            None
+        };
         let locomotion_output = locomotion_run.chosen.bounded(0.6, 1.0);
         let locomotion_applied = mechanical_reign_action_for_selection.is_none()
             && (event_script_forced_action.is_none()
@@ -853,6 +886,7 @@ where
                 "output": locomotion_output,
                 "applied": locomotion_applied,
                 "safety_authority": false,
+                "shadow": locomotion_shadow,
             }),
         );
         behavior_runs.push(locomotion_run.record.erase());
@@ -1070,6 +1104,25 @@ where
                 "safety_reason": safety.reason.clone().map(Some).map(describe_safety_reason),
             }),
         );
+        if locomotion_shadow.is_some() {
+            now.extensions.insert(
+                "locomotion.shadow.safety_chain".to_string(),
+                serde_json::json!({
+                    "schema_version": 1,
+                    "candidate_is_proposal_only": true,
+                    "baseline_selected_in_shadow": true,
+                    "conductor_gate_executed": true,
+                    "autonomic_gate_executed": true,
+                    "final_motor_gate_executed": true,
+                    "locomotion_proposal_applied": locomotion_applied,
+                    "desired_motor": desired_motor,
+                    "final_motor": safety.command,
+                    "safety_vetoed": safety.vetoed,
+                    "required_external_authorities": ["possession_lease", "brainstem"],
+                    "candidate_direct_motion_authority": false,
+                }),
+            );
+        }
         now.extensions.insert(
             "action.motion_bridge".to_string(),
             serde_json::json!({

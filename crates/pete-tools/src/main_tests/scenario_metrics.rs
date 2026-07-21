@@ -594,6 +594,8 @@ fn shadow_train_script_errors_do_not_count_as_model_fallbacks() {
         selected_json: Some(Value::Null),
         error: Some("event.bump.shadow.v0 has no observed script samples".to_string()),
         disagreement: None,
+        hardcoded_inference_us: Some(1),
+        model_inference_us: None,
     }]);
 
     let episode = metrics.finish();
@@ -796,4 +798,3 @@ fn memory_hit_rates_are_bounded() {
     assert_eq!(hit_rate(1, 0), None);
     assert_eq!(aggregate_hit_rate([(4, 2), (3, 1)].into_iter()), Some(1.0));
 }
-

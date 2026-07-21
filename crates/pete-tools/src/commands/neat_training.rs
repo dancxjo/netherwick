@@ -19,6 +19,27 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
     if args.resume.is_some() && (args.founders_report.is_some() || args.start_stage.is_some()) {
         anyhow::bail!("--resume cannot be combined with --founders-report or --start-stage");
     }
+    let shadow_promotion = if args.no_promote {
+        None
+    } else if let Some(path) = args.promotion_evidence.as_deref() {
+        let bytes = fs::read(path)
+            .with_context(|| format!("reading locomotion promotion evidence {path}"))?;
+        let evidence: LocomotionPromotionEvidence = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing locomotion promotion evidence {path}"))?;
+        if evidence.physical.candidate_id != args.checkpoint {
+            anyhow::bail!(
+                "physical shadow candidate_id {:?} does not match checkpoint {:?}",
+                evidence.physical.candidate_id,
+                args.checkpoint
+            );
+        }
+        Some(evaluate_locomotion_promotion(
+            &evidence,
+            LocomotionPromotionPolicy::default(),
+        ))
+    } else {
+        None
+    };
     if let Some(founders_report) = args.founders_report.as_deref() {
         if Path::new(founders_report).parent() == Some(Path::new(&args.report_dir)) {
             anyhow::bail!(
@@ -93,6 +114,10 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
     );
     if args.no_promote {
         println!("promotion: disabled; checkpoint remains a candidate artifact");
+    } else if args.promotion_evidence.is_none() {
+        println!(
+            "promotion: evidence-gated; checkpoint remains a candidate until --promotion-evidence supplies held-out simulation and physical shadow reports"
+        );
     } else {
         println!(
             "promotion: enabled; winning checkpoint may set locomotion to model_infer with hardcoded fallback"
@@ -834,7 +859,10 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
             promoted_regime: None,
             models_config: args.models_config.clone(),
         }
-    } else if eligible && beats_baseline {
+    } else if eligible
+        && beats_baseline
+        && shadow_promotion.as_ref().is_some_and(|decision| decision.promote)
+    {
         checkpoint.save(&args.checkpoint)?;
         promote_locomotion_model_config(
             Path::new(&args.models_config),
@@ -865,12 +893,23 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
         }
     } else {
         checkpoint.save(&rejected_candidate_path)?;
-        let reason = transfer_rejection_reason(
-            candidate_evaluation,
-            criteria,
-            beats_baseline,
-            &baseline_kind,
-        );
+        let reason = if eligible && beats_baseline {
+            match shadow_promotion.as_ref() {
+                None => "held-out simulation and physical shadow evidence is required before promotion"
+                    .to_string(),
+                Some(decision) => format!(
+                    "shadow promotion gate rejected candidate: {}",
+                    decision.reasons.join("; ")
+                ),
+            }
+        } else {
+            transfer_rejection_reason(
+                candidate_evaluation,
+                criteria,
+                beats_baseline,
+                &baseline_kind,
+            )
+        };
         println!("\nnot promoting locomotion.neat.v0: {reason}");
         println!(
             "candidate artifact kept for inspection: {}",
@@ -1171,4 +1210,3 @@ fn obstacle_centroid(objects: &[pete_sim::SimObject]) -> Option<(f32, f32)> {
     }
     (count > 0).then_some((x / count as f32, y / count as f32))
 }
-

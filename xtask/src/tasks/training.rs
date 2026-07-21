@@ -147,6 +147,11 @@ fn train_neat(behavior: &str) -> Result<()> {
     if env_flag("PETE_NEAT_NO_PROMOTE") {
         values.push("--no-promote".to_owned());
     }
+    if let Ok(evidence) = env::var("PETE_NEAT_PROMOTION_EVIDENCE") {
+        if !evidence.trim().is_empty() {
+            values.extend(["--promotion-evidence".to_owned(), evidence]);
+        }
+    }
     values.extend(extra);
     pete_tools(values.iter().map(String::as_str), &[])
 }

@@ -21,6 +21,7 @@ include!("neat/genome.rs");
 include!("neat/population.rs");
 include!("neat/evaluation.rs");
 include!("neat/selection.rs");
+include!("neat/shadow.rs");
 include!("neat/helpers.rs");
 
 #[cfg(test)]

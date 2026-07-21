@@ -62,8 +62,8 @@ use pete_models::{
     HardcodedDangerPredictor,
 };
 use pete_neat::{
-    HardcodedLocomotionBehavior, LocomotionInput, LocomotionOutput, LocomotionTracker,
-    NeatLocomotionBehavior,
+    HardcodedLocomotionBehavior, LocomotionInput, LocomotionOutput, LocomotionShadowFrame,
+    LocomotionTracker, NeatLocomotionBehavior,
 };
 use pete_now::{
     ActionValuePrediction, ActiveControlSummary, BeliefMeta, BeliefSourceKind, ChargePrediction,

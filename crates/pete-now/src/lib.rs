@@ -227,6 +227,103 @@ pub struct ObjectObservation {
     pub source: ObjectObservationSource,
 }
 
+/// Pixel bounds retained without coupling Pete's domain schema to an image
+/// library or detector-specific tensor type.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisionBoundingBox {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct VisionLabelHypothesis {
+    pub label: String,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisionModelIdentity {
+    pub backend: String,
+    pub model_id: String,
+    pub version: String,
+    pub checksum: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct VisionPositionEstimate {
+    pub depth_m: f32,
+    pub robot_position_m: [f32; 3],
+    pub world_position_m: Option<[f32; 3]>,
+    pub uncertainty_m: f32,
+}
+
+/// A detector result is evidence tied to one immutable source snapshot. Labels
+/// remain confidence-bearing hypotheses; `track_id` is deliberately short-term
+/// and is not an entity identity.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct VisionDetection {
+    pub source_frame_id: String,
+    pub source_sensation_id: String,
+    pub descendant_sensation_id: String,
+    pub source_snapshot_id: String,
+    pub source_stream: String,
+    pub producer_timestamp_ms: u64,
+    pub image_width: u32,
+    pub image_height: u32,
+    pub bbox: VisionBoundingBox,
+    pub labels: Vec<VisionLabelHypothesis>,
+    pub model: VisionModelIdentity,
+    pub inference_started_at_ms: u64,
+    pub inference_completed_at_ms: u64,
+    pub inference_duration_ms: u64,
+    pub deadline_ms: u64,
+    pub track_id: Option<String>,
+    pub calibration_epoch: Option<u64>,
+    pub geometry_trust: String,
+    pub position: Option<VisionPositionEstimate>,
+    #[serde(default)]
+    pub position_unavailable_reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub crop_rgb8: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VisionBackendState {
+    Ready,
+    Degraded,
+    Failed,
+    #[default]
+    Missing,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct VisionPipelineHealth {
+    pub backend: VisionModelIdentity,
+    pub state: VisionBackendState,
+    pub profile: String,
+    pub input_width: u32,
+    pub input_height: u32,
+    pub maximum_fps: f32,
+    pub queue_capacity: usize,
+    pub inference_deadline_ms: u64,
+    pub model_threads: usize,
+    pub memory_limit_mb: usize,
+    pub queue_depth: usize,
+    pub queued_frames: u64,
+    pub processed_frames: u64,
+    pub replaced_frames: u64,
+    pub dropped_frames: u64,
+    pub expired_frames: u64,
+    pub stale_results: u64,
+    pub failed_frames: u64,
+    pub p50_inference_ms: Option<u64>,
+    pub p95_inference_ms: Option<u64>,
+    pub latest_error: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ObjectSense {
     pub schema_version: u32,
@@ -234,6 +331,10 @@ pub struct ObjectSense {
     pub observations: Vec<ObjectObservation>,
     #[serde(default)]
     pub vectors: Vec<VectorArtifact>,
+    #[serde(default)]
+    pub detections: Vec<VisionDetection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_health: Option<VisionPipelineHealth>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

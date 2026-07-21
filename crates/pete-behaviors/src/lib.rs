@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use pete_core::TimeMs;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::Instant;
 
 pub trait FunctionBehavior<I, O>: Send {
     fn id(&self) -> &'static str;
@@ -100,6 +101,8 @@ pub struct BehaviorRunRecord<I, O> {
     pub error: Option<String>,
     pub disagreement: Option<f32>,
     pub confidence: Option<f32>,
+    pub hardcoded_inference_us: Option<u64>,
+    pub model_inference_us: Option<u64>,
 }
 
 impl<I, O> BehaviorRunRecord<I, O>
@@ -127,6 +130,8 @@ where
                 .and_then(|value| serde_json::to_value(value).ok()),
             error: self.error.clone(),
             disagreement: self.disagreement,
+            hardcoded_inference_us: self.hardcoded_inference_us,
+            model_inference_us: self.model_inference_us,
         }
     }
 }
@@ -142,6 +147,10 @@ pub struct ErasedBehaviorRunRecord {
     pub selected_json: Option<Value>,
     pub error: Option<String>,
     pub disagreement: Option<f32>,
+    #[serde(default)]
+    pub hardcoded_inference_us: Option<u64>,
+    #[serde(default)]
+    pub model_inference_us: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -242,20 +251,29 @@ where
             error: None,
             disagreement: None,
             confidence: None,
+            hardcoded_inference_us: None,
+            model_inference_us: None,
         };
 
         let selected = match self.regime {
             BehaviorRegime::Hardcoded => {
+                let started = Instant::now();
                 let hard = self.hardcoded.infer(input)?;
+                record.hardcoded_inference_us = Some(elapsed_us(started));
                 record.hardcoded_output = Some(hard.clone());
                 (hard, false, false)
             }
             BehaviorRegime::ShadowTrain => {
+                let started = Instant::now();
                 let hard = self.hardcoded.infer(input)?;
+                record.hardcoded_inference_us = Some(elapsed_us(started));
                 record.hardcoded_output = Some(hard.clone());
                 let mut trained = false;
                 if let Some(model) = self.model.as_mut() {
-                    let actual = match model.infer(input) {
+                    let started = Instant::now();
+                    let result = model.infer(input);
+                    record.model_inference_us = Some(elapsed_us(started));
+                    let actual = match result {
                         Ok(model_output) => {
                             record.model_output = Some(model_output.clone());
                             Some(model_output)
@@ -274,10 +292,15 @@ where
                 (hard, false, trained)
             }
             BehaviorRegime::ShadowInfer => {
+                let started = Instant::now();
                 let hard = self.hardcoded.infer(input)?;
+                record.hardcoded_inference_us = Some(elapsed_us(started));
                 record.hardcoded_output = Some(hard.clone());
                 if let Some(model) = self.model.as_mut() {
-                    match model.infer(input) {
+                    let started = Instant::now();
+                    let result = model.infer(input);
+                    record.model_inference_us = Some(elapsed_us(started));
+                    match result {
                         Ok(model_output) => record.model_output = Some(model_output),
                         Err(error) => record.error = Some(error.to_string()),
                     }
@@ -295,10 +318,15 @@ where
                 self.run_model_controlled(input, t_ms, true, teacher_source, &mut record)?
             }
             BehaviorRegime::Compare => {
+                let started = Instant::now();
                 let hard = self.hardcoded.infer(input)?;
+                record.hardcoded_inference_us = Some(elapsed_us(started));
                 record.hardcoded_output = Some(hard.clone());
                 if let Some(model) = self.model.as_mut() {
-                    match model.infer(input) {
+                    let started = Instant::now();
+                    let result = model.infer(input);
+                    record.model_inference_us = Some(elapsed_us(started));
+                    match result {
                         Ok(model_output) => record.model_output = Some(model_output),
                         Err(error) => record.error = Some(error.to_string()),
                     }
@@ -346,12 +374,17 @@ where
         record: &mut BehaviorRunRecord<I, O>,
     ) -> Result<(O, bool, bool)> {
         if let Some(model) = self.model.as_mut() {
-            match model.infer(input) {
+            let started = Instant::now();
+            let result = model.infer(input);
+            record.model_inference_us = Some(elapsed_us(started));
+            match result {
                 Ok(model_output) => {
                     record.model_output = Some(model_output.clone());
                     let mut trained = false;
                     if train {
+                        let started = Instant::now();
                         let hard = self.hardcoded.infer(input)?;
+                        record.hardcoded_inference_us = Some(elapsed_us(started));
                         record.hardcoded_output = Some(hard.clone());
                         let mut sample = TrainingSample::teacher(
                             input.clone(),
@@ -381,7 +414,9 @@ where
         record: &mut BehaviorRunRecord<I, O>,
     ) -> Result<(O, bool, bool)> {
         if self.fallback.should_use_hardcoded() {
+            let started = Instant::now();
             let hard = self.hardcoded.infer(input)?;
+            record.hardcoded_inference_us = Some(elapsed_us(started));
             record.hardcoded_output = Some(hard.clone());
             return Ok((hard, true, false));
         }
@@ -408,6 +443,10 @@ where
         }
         Err(anyhow!("{} failed without fallback", self.id))
     }
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 impl<I, O> ReplaceableBehavior<I, O>

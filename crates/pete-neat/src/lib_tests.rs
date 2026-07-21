@@ -746,6 +746,129 @@ fn transfer_gate_requires_robustness_fallback_and_zero_violations() {
     }));
 }
 
+fn shadow_report(
+    environment: ShadowEnvironment,
+    candidate: LocomotionPolicyMetrics,
+) -> LocomotionShadowReport {
+    LocomotionShadowReport {
+        schema_version: LOCOMOTION_SHADOW_SCHEMA_VERSION,
+        environment,
+        baseline_id: "locomotion.hardcoded_wander.v0".into(),
+        candidate_id: "candidate-good".into(),
+        capture_ids: vec!["capture-a".into()],
+        episodes: 20,
+        total_frames: 2_000,
+        aligned_input_frames: 2_000,
+        baseline_executed_only: true,
+        proposal_only: true,
+        conductor_gate_observed: true,
+        autonomic_gate_observed: true,
+        final_motor_gate_observed: true,
+        possession_lease_observed: true,
+        brainstem_gate_observed: true,
+        safety_invariant_violations: 0,
+        hardcoded_fallback_verified: true,
+        atomic_activation_verified: true,
+        rollback_verified: true,
+        baseline: LocomotionPolicyMetrics {
+            collision_rate: 0.10,
+            progress_m: 10.0,
+            oscillations_per_m: 0.4,
+            energy_per_m: 1.0,
+            recovery_success_rate: 0.70,
+            command_instability: 0.30,
+        },
+        candidate,
+    }
+}
+
+#[test]
+fn shadow_frame_proves_identical_input_and_baseline_only_execution() {
+    let input = LocomotionInput {
+        clearance_front_m: 0.42,
+        ..LocomotionInput::default()
+    };
+    let baseline = LocomotionOutput {
+        forward_velocity_m_s: 0.2,
+        angular_velocity_rad_s: 0.1,
+        recovery_activation: 0.0,
+    };
+    let candidate = LocomotionOutput {
+        forward_velocity_m_s: 0.25,
+        angular_velocity_rad_s: 0.05,
+        recovery_activation: 0.0,
+    };
+    let frame = LocomotionShadowFrame::new(
+        "frame-1",
+        123,
+        input.clone(),
+        baseline,
+        candidate,
+        baseline,
+        "locomotion.hardcoded_wander.v0",
+        "candidate-good",
+        8,
+        12,
+        Some(0.9),
+        None,
+    );
+    assert_eq!(frame.input_id, locomotion_input_id(&input));
+    assert!(frame.baseline_executed_only);
+    assert!(frame.disagreement > 0.0);
+}
+
+#[test]
+fn promotion_requires_consistent_simulation_and_physical_shadow_evidence() {
+    let candidate = LocomotionPolicyMetrics {
+        collision_rate: 0.08,
+        progress_m: 11.0,
+        oscillations_per_m: 0.3,
+        energy_per_m: 1.02,
+        recovery_success_rate: 0.75,
+        command_instability: 0.25,
+    };
+    let evidence = LocomotionPromotionEvidence {
+        schema_version: LOCOMOTION_SHADOW_SCHEMA_VERSION,
+        simulation: shadow_report(ShadowEnvironment::HeldOutSimulation, candidate),
+        physical: shadow_report(ShadowEnvironment::Physical, candidate),
+    };
+    assert!(evaluate_locomotion_promotion(&evidence, Default::default()).promote);
+}
+
+#[test]
+fn deliberately_poor_candidate_is_rejected_and_hardcoded_remains_fallback() {
+    let poor = LocomotionPolicyMetrics {
+        collision_rate: 0.35,
+        progress_m: 4.0,
+        oscillations_per_m: 1.2,
+        energy_per_m: 1.8,
+        recovery_success_rate: 0.25,
+        command_instability: 0.9,
+    };
+    let mut physical = shadow_report(ShadowEnvironment::Physical, poor);
+    physical.hardcoded_fallback_verified = false;
+    physical.rollback_verified = false;
+    let evidence = LocomotionPromotionEvidence {
+        schema_version: LOCOMOTION_SHADOW_SCHEMA_VERSION,
+        simulation: shadow_report(ShadowEnvironment::HeldOutSimulation, poor),
+        physical,
+    };
+    let decision = evaluate_locomotion_promotion(&evidence, Default::default());
+    assert!(!decision.promote);
+    assert!(decision
+        .reasons
+        .iter()
+        .any(|reason| reason.contains("fallback")));
+    assert!(decision
+        .reasons
+        .iter()
+        .any(|reason| reason.contains("rollback")));
+    assert!(decision
+        .reasons
+        .iter()
+        .any(|reason| reason.contains("collision")));
+}
+
 fn two_species_population() -> (Population, StdRng) {
     let mut rng = StdRng::seed_from_u64(17);
     let config = NeatConfig {

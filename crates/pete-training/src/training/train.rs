@@ -692,5 +692,20 @@ pub fn set_behavior_regime(
 
 pub fn write_models_config(path: &Path, config: &BehaviorRegistryConfig) -> Result<()> {
     let text = toml::to_string_pretty(config)?;
-    std::fs::write(path, text).with_context(|| format!("write {}", path.display()))
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create {}", parent.display()))?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("models.toml");
+    let temporary = path.with_file_name(format!(
+        ".{file_name}.{}.tmp",
+        std::process::id()
+    ));
+    std::fs::write(&temporary, text)
+        .with_context(|| format!("write {}", temporary.display()))?;
+    std::fs::rename(&temporary, path)
+        .with_context(|| format!("atomically replace {}", path.display()))
 }
