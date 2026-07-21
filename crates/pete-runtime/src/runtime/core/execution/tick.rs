@@ -833,14 +833,13 @@ where
             locomotion_run
                 .record
                 .hardcoded_output
-                .zip(locomotion_run.record.model_output)
-                .map(|(baseline, candidate)| {
+                .map(|baseline| {
                     LocomotionShadowFrame::new(
                         frame_id.to_string(),
                         now.t_ms,
                         locomotion_input.clone(),
                         baseline,
-                        candidate,
+                        locomotion_run.record.model_output,
                         locomotion_run.chosen,
                         self.models.behaviors.locomotion.hardcoded_id(),
                         self.models
@@ -848,8 +847,8 @@ where
                             .locomotion
                             .model_id()
                             .unwrap_or("locomotion.model.missing"),
-                        locomotion_run.record.hardcoded_inference_us.unwrap_or_default(),
-                        locomotion_run.record.model_inference_us.unwrap_or_default(),
+                        locomotion_run.record.hardcoded_inference_us,
+                        locomotion_run.record.model_inference_us,
                         locomotion_run.record.confidence.or_else(|| {
                             locomotion_run
                                 .record

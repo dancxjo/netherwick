@@ -750,6 +750,7 @@ fn shadow_report(
     environment: ShadowEnvironment,
     candidate: LocomotionPolicyMetrics,
 ) -> LocomotionShadowReport {
+    let physical = environment == ShadowEnvironment::Physical;
     LocomotionShadowReport {
         schema_version: LOCOMOTION_SHADOW_SCHEMA_VERSION,
         environment,
@@ -764,8 +765,8 @@ fn shadow_report(
         conductor_gate_observed: true,
         autonomic_gate_observed: true,
         final_motor_gate_observed: true,
-        possession_lease_observed: true,
-        brainstem_gate_observed: true,
+        possession_lease_observed: physical,
+        brainstem_gate_observed: physical,
         safety_invariant_violations: 0,
         hardcoded_fallback_verified: true,
         atomic_activation_verified: true,
@@ -803,18 +804,42 @@ fn shadow_frame_proves_identical_input_and_baseline_only_execution() {
         123,
         input.clone(),
         baseline,
-        candidate,
+        Some(candidate),
         baseline,
         "locomotion.hardcoded_wander.v0",
         "candidate-good",
-        8,
-        12,
+        Some(8),
+        Some(12),
         Some(0.9),
         None,
     );
     assert_eq!(frame.input_id, locomotion_input_id(&input));
     assert!(frame.baseline_executed_only);
-    assert!(frame.disagreement > 0.0);
+    assert!(frame.disagreement.is_some_and(|value| value > 0.0));
+}
+
+#[test]
+fn shadow_frame_retains_candidate_failure_without_inventing_an_output() {
+    let input = LocomotionInput::default();
+    let baseline = LocomotionOutput::default();
+    let frame = LocomotionShadowFrame::new(
+        "frame-failed",
+        124,
+        input,
+        baseline,
+        None,
+        baseline,
+        "locomotion.hardcoded_wander.v0",
+        "candidate-broken",
+        Some(7),
+        Some(9),
+        None,
+        Some("candidate inference failed".into()),
+    );
+    assert_eq!(frame.candidate_output, None);
+    assert_eq!(frame.disagreement, None);
+    assert_eq!(frame.candidate_inference_us, Some(9));
+    assert!(frame.baseline_executed_only);
 }
 
 #[test]
@@ -867,6 +892,41 @@ fn deliberately_poor_candidate_is_rejected_and_hardcoded_remains_fallback() {
         .reasons
         .iter()
         .any(|reason| reason.contains("collision")));
+}
+
+#[test]
+fn malformed_or_non_finite_shadow_evidence_fails_closed() {
+    let candidate = LocomotionPolicyMetrics {
+        collision_rate: 0.08,
+        progress_m: 11.0,
+        oscillations_per_m: 0.3,
+        energy_per_m: 1.02,
+        recovery_success_rate: 0.75,
+        command_instability: 0.25,
+    };
+    let mut simulation = shadow_report(ShadowEnvironment::HeldOutSimulation, candidate);
+    simulation.schema_version += 1;
+    simulation.aligned_input_frames = simulation.total_frames + 1;
+    simulation.candidate.progress_m = f32::NAN;
+    let evidence = LocomotionPromotionEvidence {
+        schema_version: LOCOMOTION_SHADOW_SCHEMA_VERSION + 1,
+        simulation,
+        physical: shadow_report(ShadowEnvironment::Physical, candidate),
+    };
+    let decision = evaluate_locomotion_promotion(&evidence, Default::default());
+    assert!(!decision.promote);
+    assert!(decision
+        .reasons
+        .iter()
+        .any(|reason| reason.contains("schema")));
+    assert!(decision
+        .reasons
+        .iter()
+        .any(|reason| reason.contains("frame counts")));
+    assert!(decision
+        .reasons
+        .iter()
+        .any(|reason| reason.contains("invalid policy metrics")));
 }
 
 fn two_species_population() -> (Population, StdRng) {

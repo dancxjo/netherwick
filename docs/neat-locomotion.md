@@ -125,9 +125,10 @@ clutter labels.
 ## Nervous System
 
 Every `shadow_infer` frame records the exact normalized input identity, baseline
-and candidate proposals, implementation provenance, per-policy inference time,
-candidate confidence/disagreement, and confirms that only the baseline proposal
-was selected. The adjacent safety-chain record proves that the learned output is
+and candidate proposals (or an explicit candidate inference failure),
+implementation provenance, per-policy inference time, candidate
+confidence/disagreement, and confirms that only the baseline proposal was
+selected. The adjacent safety-chain record proves that the learned output is
 proposal-only and still traverses conductor selection, autonomic filtering, and
 the final motor gate; physical evidence must additionally observe the possession
 lease and brainstem gate.

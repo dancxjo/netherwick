@@ -8,15 +8,15 @@ pub struct LocomotionShadowFrame {
     pub input_id: String,
     pub input: LocomotionInput,
     pub baseline_output: LocomotionOutput,
-    pub candidate_output: LocomotionOutput,
+    pub candidate_output: Option<LocomotionOutput>,
     pub executed_output: LocomotionOutput,
     pub baseline_provenance: String,
     pub candidate_provenance: String,
-    pub baseline_inference_us: u64,
-    pub candidate_inference_us: u64,
+    pub baseline_inference_us: Option<u64>,
+    pub candidate_inference_us: Option<u64>,
     pub candidate_confidence: Option<f32>,
     pub candidate_error: Option<String>,
-    pub disagreement: f32,
+    pub disagreement: Option<f32>,
     pub baseline_executed_only: bool,
 }
 
@@ -27,16 +27,18 @@ impl LocomotionShadowFrame {
         t_ms: u64,
         input: LocomotionInput,
         baseline_output: LocomotionOutput,
-        candidate_output: LocomotionOutput,
+        candidate_output: Option<LocomotionOutput>,
         executed_output: LocomotionOutput,
         baseline_provenance: impl Into<String>,
         candidate_provenance: impl Into<String>,
-        baseline_inference_us: u64,
-        candidate_inference_us: u64,
+        baseline_inference_us: Option<u64>,
+        candidate_inference_us: Option<u64>,
         candidate_confidence: Option<f32>,
         candidate_error: Option<String>,
     ) -> Self {
-        let disagreement = baseline_output.distance(&candidate_output);
+        let disagreement = candidate_output
+            .as_ref()
+            .map(|candidate| baseline_output.distance(candidate));
         let baseline_executed_only = executed_output == baseline_output;
         Self {
             schema_version: LOCOMOTION_SHADOW_SCHEMA_VERSION,
@@ -84,7 +86,7 @@ pub struct LocomotionPolicyMetrics {
     pub command_instability: f32,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShadowEnvironment {
     HeldOutSimulation,
@@ -117,14 +119,15 @@ pub struct LocomotionShadowReport {
 }
 
 impl LocomotionShadowReport {
-    fn safety_chain_complete(&self) -> bool {
-        self.proposal_only
+    fn safety_chain_complete(&self, expected_environment: ShadowEnvironment) -> bool {
+        let common_chain = self.proposal_only
             && self.conductor_gate_observed
             && self.autonomic_gate_observed
             && self.final_motor_gate_observed
-            && self.possession_lease_observed
-            && self.brainstem_gate_observed
-            && self.safety_invariant_violations == 0
+            && self.safety_invariant_violations == 0;
+        common_chain
+            && (expected_environment != ShadowEnvironment::Physical
+                || (self.possession_lease_observed && self.brainstem_gate_observed))
     }
 }
 
@@ -177,6 +180,15 @@ pub fn evaluate_locomotion_promotion(
     policy: LocomotionPromotionPolicy,
 ) -> LocomotionPromotionDecision {
     let mut reasons = Vec::new();
+    if evidence.schema_version != LOCOMOTION_SHADOW_SCHEMA_VERSION {
+        reasons.push(format!(
+            "promotion evidence schema {} is unsupported; expected {}",
+            evidence.schema_version, LOCOMOTION_SHADOW_SCHEMA_VERSION
+        ));
+    }
+    if !valid_policy(policy) {
+        reasons.push("promotion policy contains invalid thresholds".into());
+    }
     validate_report(
         &evidence.simulation,
         ShadowEnvironment::HeldOutSimulation,
@@ -232,14 +244,32 @@ fn validate_report(
         ShadowEnvironment::HeldOutSimulation => "simulation",
         ShadowEnvironment::Physical => "physical",
     };
+    if report.schema_version != LOCOMOTION_SHADOW_SCHEMA_VERSION {
+        reasons.push(format!(
+            "{label} report schema {} is unsupported; expected {}",
+            report.schema_version, LOCOMOTION_SHADOW_SCHEMA_VERSION
+        ));
+    }
     if report.environment != expected_environment {
         reasons.push(format!("{label} report has the wrong environment"));
+    }
+    if report.baseline_id.trim().is_empty()
+        || report.candidate_id.trim().is_empty()
+        || report.baseline_id == report.candidate_id
+    {
+        reasons.push(format!("{label} report has invalid policy identities"));
+    }
+    if report.capture_ids.is_empty() || report.capture_ids.iter().any(|id| id.trim().is_empty()) {
+        reasons.push(format!("{label} report has invalid capture provenance"));
     }
     if report.episodes < minimum_episodes {
         reasons.push(format!(
             "{label} report has {} episodes; {minimum_episodes} required",
             report.episodes
         ));
+    }
+    if report.total_frames == 0 || report.aligned_input_frames > report.total_frames {
+        reasons.push(format!("{label} report has invalid frame counts"));
     }
     let aligned_fraction = if report.total_frames == 0 {
         0.0
@@ -255,11 +285,15 @@ fn validate_report(
     if !report.baseline_executed_only {
         reasons.push(format!("{label} shadow run did not execute baseline only"));
     }
-    if !report.safety_chain_complete() {
+    if !report.safety_chain_complete(expected_environment) {
         reasons.push(format!("{label} safety-authority chain is incomplete"));
     }
     let baseline = report.baseline;
     let candidate = report.candidate;
+    if !valid_metrics(baseline) || !valid_metrics(candidate) {
+        reasons.push(format!("{label} report contains invalid policy metrics"));
+        return;
+    }
     if relative_gain(baseline.progress_m, candidate.progress_m) < policy.minimum_progress_gain {
         reasons.push(format!("{label} candidate progress did not beat baseline"));
     }
@@ -300,6 +334,46 @@ fn validate_report(
     {
         reasons.push(format!("{label} candidate recovery regressed"));
     }
+}
+
+fn valid_policy(policy: LocomotionPromotionPolicy) -> bool {
+    let values = [
+        policy.minimum_aligned_fraction,
+        policy.minimum_progress_gain,
+        policy.maximum_collision_regression,
+        policy.maximum_oscillation_regression,
+        policy.maximum_energy_regression,
+        policy.maximum_instability_regression,
+        policy.minimum_recovery_gain,
+        policy.maximum_sim_physical_gain_delta,
+    ];
+    values.into_iter().all(f32::is_finite)
+        && (0.0..=1.0).contains(&policy.minimum_aligned_fraction)
+        && policy.minimum_progress_gain >= 0.0
+        && policy.maximum_collision_regression >= 0.0
+        && policy.maximum_oscillation_regression >= 0.0
+        && policy.maximum_energy_regression >= 0.0
+        && policy.maximum_instability_regression >= 0.0
+        && policy.minimum_recovery_gain >= 0.0
+        && policy.maximum_sim_physical_gain_delta >= 0.0
+}
+
+fn valid_metrics(metrics: LocomotionPolicyMetrics) -> bool {
+    let values = [
+        metrics.collision_rate,
+        metrics.progress_m,
+        metrics.oscillations_per_m,
+        metrics.energy_per_m,
+        metrics.recovery_success_rate,
+        metrics.command_instability,
+    ];
+    values.into_iter().all(f32::is_finite)
+        && (0.0..=1.0).contains(&metrics.collision_rate)
+        && metrics.progress_m >= 0.0
+        && metrics.oscillations_per_m >= 0.0
+        && metrics.energy_per_m >= 0.0
+        && (0.0..=1.0).contains(&metrics.recovery_success_rate)
+        && metrics.command_instability >= 0.0
 }
 
 fn reject_regression(
