@@ -113,7 +113,10 @@ static AUDIO_LAST_PLAYBACK_TIMESTAMP_MS: AtomicU32 = AtomicU32::new(0);
 static AUDIO_SUPPRESSED_BY_SILENT_COUNT: AtomicU32 = AtomicU32::new(0);
 static AUDIO_DROPPED_OR_REPLACED_COUNT: AtomicU32 = AtomicU32::new(0);
 static ODOMETRY_RESET_COUNT: AtomicU32 = AtomicU32::new(0);
+static ODOMETRY_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 static ODOMETRY_DISTANCE_MM: AtomicU32 = AtomicU32::new(0);
+static ODOMETRY_X_MM_Q10: AtomicU32 = AtomicU32::new(0);
+static ODOMETRY_Y_MM_Q10: AtomicU32 = AtomicU32::new(0);
 static ODOMETRY_HEADING_MRAD: AtomicU32 = AtomicU32::new(0);
 static IMU_PRESENT: AtomicU8 = AtomicU8::new(UNKNOWN);
 static IMU_HEALTH: AtomicU8 = AtomicU8::new(ImuHealthCode::Unknown as u8);
@@ -286,6 +289,8 @@ pub struct BrainstemStatus {
     pub audio_dropped_or_replaced_count: u32,
     pub odometry_reset_count: u32,
     pub odometry_distance_mm: i32,
+    pub odometry_x_mm: i32,
+    pub odometry_y_mm: i32,
     pub odometry_heading_mrad: i32,
     pub imu_present: u8,
     pub imu_health: u8,

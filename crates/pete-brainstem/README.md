@@ -318,14 +318,24 @@ transport, or the skill loop go stale, renewal stops and the Brainstem zeros
 the motors. Brainstem reflex and invariant events terminate the owning skill as
 `safety-preempted`, never as success.
 
-Odometry is currently a lightweight accumulator over decoded Create distance/angle deltas. Packets `0`, `19`, and `20` update odometry: complete packet `0` carries both distance and angle deltas, packet `19` carries distance, and packet `20` carries angle. Other decoded sensor packets update status and events but do not integrate into odometry. `reset_odometry` clears accumulated distance and heading and increments a reset count. Full pose integration, set/calibrate verbs, and body-specific odometry calibration are still future work.
+Odometry integrates decoded Create distance/angle deltas into a planar SE(2)
+pose. Packets `0`, `19`, and `20` update odometry: complete packet `0` carries
+both distance and angle deltas, packet `19` carries distance, and packet `20`
+carries angle. Translation is applied at the midpoint heading for combined
+distance/angle packets. Status publishes coherent `x_mm`, `y_mm`, and
+`heading_mrad` pose values plus the accumulated signed distance. Other decoded
+sensor packets update status and events but do not integrate into odometry.
+`reset_odometry` clears the pose and accumulated distance and increments a reset
+count. Set/calibrate verbs and body-specific odometry calibration remain future
+work.
 
 Create OI power, Open Interface start, continuous Full mode, status-light
 animation, watchdog stop, and recovery remain owned by the brainstem runtime
-and Create body driver. Hardware watchdog support is plumbed through the
-`BrainstemHardware::feed_watchdog` hook and called from the runtime safety lane.
-The current RP2040/Pico W backends still no-op that hook until the hardware
-watchdog is deliberately enabled.
+and Create body driver. Pico W starts the RP2040 hardware watchdog with the
+body-configured two-second timeout, pauses it while a debugger is attached, and
+feeds it only from the runtime safety lane through
+`BrainstemHardware::feed_watchdog`. The bare RP2040 backend does not yet enable
+the hardware watchdog.
 
 ## Current Boundaries
 
@@ -345,8 +355,8 @@ Known remaining TODOs:
 
 - Move the primitive axle-track conversion constant into `body.toml`/capabilities.
 - Promote body descriptors from generated constants into a stronger typed driver contract.
-- Expand odometry from accumulated distance/heading deltas into pose integration plus get/set/calibrate verbs.
-- Enable a real hardware watchdog feed in the RP2040/Pico W backend once reset timing and bring-up policy are settled.
+- Add odometry get/set/calibrate verbs and body-specific wheel calibration.
+- Enable a real hardware watchdog feed in the bare RP2040 backend once reset timing and bring-up policy are settled.
 
 ## Bring-Up Ladder
 
@@ -487,7 +497,7 @@ It silently drops malformed, fragmented, unsupported, unowned, oversized, or
 rate-limited traffic; replies are capped at four per second and do not create a
 route, bridge, NAT path, or any path to robot hardware.
 
-The status JSON includes firmware name/version plus immutable build identity (`git_commit`, `git_commit_short`, `git_dirty`, `build_timestamp`, profile, target, backend, and `build_id`), body name/kind, uptime, runtime state, body/Create diagnostic state, UART RX health, last UART packet timestamp, current command, command lifecycle ids, event sequence, last error, body state, Wi-Fi state, HTTPS state, HTTP request count, DHCP grant count, ICMP echo request/reply/dropped/rate-limited counters, forebrain UART status, sensor state, battery state, song state, and odometry accumulator state. `get_capabilities` reports the same identity in JSON and the compact UART/UDP response.
+The status JSON includes firmware name/version plus immutable build identity (`git_commit`, `git_commit_short`, `git_dirty`, `build_timestamp`, profile, target, backend, and `build_id`), body name/kind, uptime, runtime state, body/Create diagnostic state, UART RX health, last UART packet timestamp, current command, command lifecycle ids, event sequence, last error, body state, Wi-Fi state, HTTPS state, HTTP request count, DHCP grant count, ICMP echo request/reply/dropped/rate-limited counters, forebrain UART status, sensor state, battery state, song state, and coherent integrated odometry pose/distance state. `get_capabilities` reports the same identity in JSON and the compact UART/UDP response.
 
 Build identity is derived at compile time. Local builds use the exact Git `HEAD` and mark `git_dirty=true` when tracked changes are present. Cargo watches Git refs, index, and tracked sources so a branch/commit or dirty-state change does not reuse an old identity. Exported-source and CI builds can set `PETE_GIT_COMMIT`, `PETE_GIT_DIRTY` (`true`/`false`), and `PETE_BUILD_TIMESTAMP`; `SOURCE_DATE_EPOCH` is used when no explicit timestamp is supplied. Without Git metadata or an override, the identity visibly reports `unknown`. The timestamp defaults to `unknown`, keeping otherwise identical builds reproducible.
 

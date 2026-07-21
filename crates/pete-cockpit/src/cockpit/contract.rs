@@ -1027,6 +1027,8 @@ impl BatterySummary {
 pub struct OdometrySummary {
     pub reset_count: Option<u32>,
     pub distance_mm: Option<i32>,
+    pub x_mm: Option<i32>,
+    pub y_mm: Option<i32>,
     pub heading_mrad: Option<i32>,
 }
 
@@ -1035,6 +1037,8 @@ impl OdometrySummary {
         Self {
             reset_count: number_for(raw, "odometry_resets"),
             distance_mm: signed_number_for(raw, "odometry_distance_mm"),
+            x_mm: signed_number_for(raw, "odometry_x_mm"),
+            y_mm: signed_number_for(raw, "odometry_y_mm"),
             heading_mrad: signed_number_for(raw, "odometry_heading_mrad"),
         }
     }
@@ -1046,6 +1050,8 @@ impl OdometrySummary {
         Self {
             reset_count: json_u32_value(odometry, "reset_count"),
             distance_mm: json_i32_value(odometry, "distance_mm"),
+            x_mm: json_i32_value(odometry, "x_mm"),
+            y_mm: json_i32_value(odometry, "y_mm"),
             heading_mrad: json_i32_value(odometry, "heading_mrad"),
         }
     }
@@ -1184,4 +1190,3 @@ fn battery_percent(charge_mah: Option<u32>, capacity_mah: Option<u32>) -> Option
         Some(((charge_mah * 100) / capacity_mah).min(100) as u8)
     }
 }
-

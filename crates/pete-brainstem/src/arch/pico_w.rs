@@ -18,13 +18,14 @@ use embassy_rp::i2c::{
 use embassy_rp::multicore::{spawn_core1, Stack as CoreStack};
 use embassy_rp::peripherals::{
     DMA_CH0, I2C1, PIN_0, PIN_1, PIN_17, PIN_18, PIN_19, PIN_2, PIN_20, PIN_23, PIN_24, PIN_25,
-    PIN_29, PIN_3, PIN_4, PIN_5, PIO0, UART0, UART1, USB,
+    PIN_29, PIN_3, PIN_4, PIN_5, PIO0, UART0, UART1, USB, WATCHDOG,
 };
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::rom_data::reset_to_usb_boot;
 use embassy_rp::uart::{
     Blocking, Config as UartConfig, DataBits, Error as UartError, Parity, StopBits, Uart,
 };
+use embassy_rp::watchdog::Watchdog;
 use embassy_rp::{bind_interrupts, dma, Peri};
 use embassy_time::{Duration, Instant, Timer};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcAcmState};

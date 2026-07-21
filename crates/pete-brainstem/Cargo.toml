@@ -13,6 +13,7 @@ embedded-hal = "1.0"
 embedded-hal-nb = "1.0"
 fugit = "0.3"
 heapless = { version = "0.8", features = ["serde"] }
+libm = "0.2"
 nb = "1"
 rp2040-boot2 = "0.3"
 rp-pac = { version = "7", features = ["rp2040"], optional = true }

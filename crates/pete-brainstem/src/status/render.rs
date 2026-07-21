@@ -102,6 +102,8 @@ struct AudioStatusJson {
 struct OdometryStatusJson {
     reset_count: u32,
     distance_mm: i32,
+    x_mm: i32,
+    y_mm: i32,
     heading_mrad: i32,
 }
 
@@ -276,6 +278,8 @@ pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Resul
         odometry: OdometryStatusJson {
             reset_count: snapshot.odometry_reset_count,
             distance_mm: snapshot.odometry_distance_mm,
+            x_mm: snapshot.odometry_x_mm,
+            y_mm: snapshot.odometry_y_mm,
             heading_mrad: snapshot.odometry_heading_mrad,
         },
         imu: ImuStatusJson {

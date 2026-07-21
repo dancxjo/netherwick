@@ -120,6 +120,7 @@ bind_interrupts!(struct Irqs {
 
 pub struct PicoWBrainstem {
     uart: Uart<'static, Blocking>,
+    watchdog: Watchdog,
     power_toggle: Output<'static>,
     _txs_oe: Output<'static>,
     status_led: Output<'static>,
@@ -131,11 +132,14 @@ pub struct PicoWBrainstem {
 const _: () = assert!(body::CREATE_CHARGING_INDICATOR_GPIO == 20);
 const _: () = assert!(body::CREATE_CHARGING_INDICATOR_ACTIVE_HIGH);
 const _: () = assert!(body::EXTERNAL_LED_GPIO == 17);
+const _: () = assert!(body::HARDWARE_WATCHDOG_TIMEOUT_MS >= 1_000);
+const _: () = assert!(body::HARDWARE_WATCHDOG_TIMEOUT_MS <= 8_000);
 
 impl PicoWBrainstem {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         uart0: Peri<'static, UART0>,
+        watchdog: Peri<'static, WATCHDOG>,
         tx: Peri<'static, PIN_0>,
         rx: Peri<'static, PIN_1>,
         power_toggle: Peri<'static, PIN_18>,
@@ -160,6 +164,11 @@ impl PicoWBrainstem {
         uart_config.stop_bits = StopBits::STOP1;
         uart_config.parity = Parity::ParityNone;
         let uart = Uart::new_blocking(uart0, tx, rx, uart_config);
+        let mut watchdog = Watchdog::new(watchdog);
+        watchdog.pause_on_debug(true);
+        watchdog.start(Duration::from_millis(
+            body::HARDWARE_WATCHDOG_TIMEOUT_MS as u64,
+        ));
         // UART idles high. Keep the Create RX input at a defined idle level
         // while the robot or level shifter is unpowered instead of accepting
         // the RP2040 pad's reset pull-down as break/framing noise.
@@ -169,6 +178,7 @@ impl PicoWBrainstem {
         });
         Self {
             uart,
+            watchdog,
             power_toggle,
             _txs_oe: txs_oe,
             status_led: Output::new(status_led, Level::Low),
@@ -198,8 +208,8 @@ impl BrainstemHardware for PicoWBrainstem {
     }
 
     fn feed_watchdog(&mut self) {
-        // Watchdog plumbing is owned by the runtime safety lane; this Pico W
-        // backend currently leaves the hardware watchdog disabled.
+        self.watchdog
+            .feed(Duration::from_millis(body::HARDWARE_WATCHDOG_TIMEOUT_MS as u64));
     }
 
     fn begin_power_toggle_pulse(&mut self) {
@@ -278,6 +288,7 @@ pub fn spawn_safety_lane(p: embassy_rp::Peripherals) -> ! {
     );
     let hardware = PicoWBrainstem::new(
         p.UART0,
+        p.WATCHDOG,
         p.PIN_0,
         p.PIN_1,
         p.PIN_18,

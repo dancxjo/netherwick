@@ -11,6 +11,8 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
     } else {
         pending_command
     };
+    let (odometry_reset_count, odometry_distance_mm, odometry_x_mm, odometry_y_mm, odometry_heading_mrad) =
+        coherent_odometry_snapshot();
 
     BrainstemStatus {
         firmware_name: env!("CARGO_PKG_NAME"),
@@ -127,9 +129,11 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
         audio_last_playback_timestamp_ms: AUDIO_LAST_PLAYBACK_TIMESTAMP_MS.load(Ordering::Relaxed),
         audio_suppressed_by_silent_count: AUDIO_SUPPRESSED_BY_SILENT_COUNT.load(Ordering::Relaxed),
         audio_dropped_or_replaced_count: AUDIO_DROPPED_OR_REPLACED_COUNT.load(Ordering::Relaxed),
-        odometry_reset_count: ODOMETRY_RESET_COUNT.load(Ordering::Relaxed),
-        odometry_distance_mm: decode_signed_i32(ODOMETRY_DISTANCE_MM.load(Ordering::Relaxed)),
-        odometry_heading_mrad: decode_signed_i32(ODOMETRY_HEADING_MRAD.load(Ordering::Relaxed)),
+        odometry_reset_count,
+        odometry_distance_mm,
+        odometry_x_mm,
+        odometry_y_mm,
+        odometry_heading_mrad,
         imu_present: IMU_PRESENT.load(Ordering::Relaxed),
         imu_health: IMU_HEALTH.load(Ordering::Relaxed),
         imu_sample_count: IMU_SAMPLE_COUNT.load(Ordering::Relaxed),
@@ -157,6 +161,27 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
         imu_calibration_state: IMU_CALIBRATION_STATE.load(Ordering::Relaxed),
         safety_hazard_generation: safety_hazard_generation(),
         event_next_seq: EVENT_NEXT_SEQ.load(Ordering::Relaxed),
+    }
+}
+
+fn coherent_odometry_snapshot() -> (u32, i32, i32, i32, i32) {
+    loop {
+        let before = ODOMETRY_SEQUENCE.load(Ordering::Acquire);
+        if before & 1 != 0 {
+            core::hint::spin_loop();
+            continue;
+        }
+        let values = (
+            ODOMETRY_RESET_COUNT.load(Ordering::Relaxed),
+            decode_signed_i32(ODOMETRY_DISTANCE_MM.load(Ordering::Relaxed)),
+            decode_signed_i32(ODOMETRY_X_MM_Q10.load(Ordering::Relaxed)) / 1024,
+            decode_signed_i32(ODOMETRY_Y_MM_Q10.load(Ordering::Relaxed)) / 1024,
+            decode_signed_i32(ODOMETRY_HEADING_MRAD.load(Ordering::Relaxed)),
+        );
+        let after = ODOMETRY_SEQUENCE.load(Ordering::Acquire);
+        if before == after {
+            return values;
+        }
     }
 }
 

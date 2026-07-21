@@ -176,11 +176,14 @@ pub fn mark_create_sensor_packet(packet_id: u8, sensors: CreateSensorPacket) {
     // Create OI packets 0, 19, and 20 contain distance/angle deltas since
     // the last requested packet. Other packets are snapshots and must not be
     // integrated into odometry.
-    if create_packet_has_distance_delta(packet_id) {
-        add_signed(&ODOMETRY_DISTANCE_MM, sensors.distance_mm as i32);
-    }
-    if create_packet_has_angle_delta(packet_id) {
-        add_signed(&ODOMETRY_HEADING_MRAD, sensors.angle_mrad as i32);
+    let distance_mm = create_packet_has_distance_delta(packet_id)
+        .then_some(sensors.distance_mm as i32)
+        .unwrap_or(0);
+    let angle_mrad = create_packet_has_angle_delta(packet_id)
+        .then_some(sensors.angle_mrad as i32)
+        .unwrap_or(0);
+    if distance_mm != 0 || angle_mrad != 0 {
+        integrate_odometry_delta(distance_mm, angle_mrad);
     }
 
     record_sensor_edge_events(
@@ -253,10 +256,46 @@ pub fn reset_audio_observability() {
 }
 
 pub fn mark_odometry_reset() {
+    begin_odometry_write();
     increment(&ODOMETRY_RESET_COUNT);
     ODOMETRY_DISTANCE_MM.store(0, Ordering::Relaxed);
+    ODOMETRY_X_MM_Q10.store(0, Ordering::Relaxed);
+    ODOMETRY_Y_MM_Q10.store(0, Ordering::Relaxed);
     ODOMETRY_HEADING_MRAD.store(0, Ordering::Relaxed);
+    end_odometry_write();
     IMU_YAW_MRAD.store(0, Ordering::Relaxed);
+}
+
+const ODOMETRY_POSITION_SCALE: f32 = 1024.0;
+
+fn integrate_odometry_delta(distance_mm: i32, angle_mrad: i32) {
+    begin_odometry_write();
+    let heading_mrad = decode_signed_i32(ODOMETRY_HEADING_MRAD.load(Ordering::Relaxed));
+    // Integrate translation at the midpoint heading so a combined Create
+    // distance/angle packet follows the measured arc instead of applying the
+    // whole displacement before or after the turn.
+    let midpoint_rad = (heading_mrad as f32 + angle_mrad as f32 * 0.5) / 1000.0;
+    let dx_q10 = libm::roundf(
+        distance_mm as f32 * libm::cosf(midpoint_rad) * ODOMETRY_POSITION_SCALE,
+    ) as i32;
+    let dy_q10 = libm::roundf(
+        distance_mm as f32 * libm::sinf(midpoint_rad) * ODOMETRY_POSITION_SCALE,
+    ) as i32;
+    add_signed(&ODOMETRY_X_MM_Q10, dx_q10);
+    add_signed(&ODOMETRY_Y_MM_Q10, dy_q10);
+    add_signed(&ODOMETRY_DISTANCE_MM, distance_mm);
+    add_signed(&ODOMETRY_HEADING_MRAD, angle_mrad);
+    end_odometry_write();
+}
+
+fn begin_odometry_write() {
+    let sequence = ODOMETRY_SEQUENCE.load(Ordering::Relaxed);
+    ODOMETRY_SEQUENCE.store(sequence.wrapping_add(1), Ordering::Release);
+}
+
+fn end_odometry_write() {
+    let sequence = ODOMETRY_SEQUENCE.load(Ordering::Relaxed);
+    ODOMETRY_SEQUENCE.store(sequence.wrapping_add(1), Ordering::Release);
 }
 
 pub fn mark_imu_sample(sample: ImuSample) {

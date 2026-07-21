@@ -433,6 +433,49 @@ fn charging_source_packet_updates_home_base_source() {
     assert_eq!(status.create_sensor_charging_sources, 0b10);
 }
 
+#[test]
+fn create_distance_and_angle_packets_integrate_planar_pose() {
+    let _guard = status_test_guard();
+    mark_odometry_reset();
+
+    mark_create_sensor_packet(
+        0,
+        CreateSensorPacket {
+            distance_mm: 100,
+            angle_mrad: 1_571,
+            ..CreateSensorPacket::default()
+        },
+    );
+    mark_create_sensor_packet(
+        19,
+        CreateSensorPacket {
+            distance_mm: 100,
+            ..CreateSensorPacket::default()
+        },
+    );
+    // Snapshot-only packet data must not move the pose.
+    mark_create_sensor_packet(
+        7,
+        CreateSensorPacket {
+            distance_mm: 500,
+            angle_mrad: 500,
+            ..CreateSensorPacket::default()
+        },
+    );
+
+    let odometry = snapshot(0);
+    assert_eq!(odometry.odometry_distance_mm, 200);
+    assert!((odometry.odometry_x_mm - 71).abs() <= 1);
+    assert!((odometry.odometry_y_mm - 171).abs() <= 1);
+    assert_eq!(odometry.odometry_heading_mrad, 1_571);
+
+    mark_odometry_reset();
+    let reset = snapshot(0);
+    assert_eq!(reset.odometry_x_mm, 0);
+    assert_eq!(reset.odometry_y_mm, 0);
+    assert_eq!(reset.odometry_heading_mrad, 0);
+}
+
 #[cfg(feature = "pico-w")]
 #[test]
 fn charging_motion_reaches_runtime_for_internal_dock_departure() {

@@ -100,6 +100,7 @@ struct Timing {
     post_start_settle_ms: u32,
     post_mode_settle_ms: u32,
     uart_byte_timeout_ms: u32,
+    hardware_watchdog_timeout_ms: u32,
     idle_blink_ms: u32,
     error_blink_ms: u32,
     error_pause_ms: u32,
@@ -327,6 +328,7 @@ pub const CREATE_RESPONSIVE_TIMEOUT_MS: u32 = {responsive_timeout_ms};
 pub const POST_START_SETTLE_MS: u32 = {post_start_settle_ms};
 pub const POST_MODE_SETTLE_MS: u32 = {post_mode_settle_ms};
 pub const UART_BYTE_TIMEOUT_MS: u32 = {uart_byte_timeout_ms};
+pub const HARDWARE_WATCHDOG_TIMEOUT_MS: u32 = {hardware_watchdog_timeout_ms};
 pub const IDLE_BLINK_MS: u32 = {idle_blink_ms};
 pub const ERROR_BLINK_MS: u32 = {error_blink_ms};
 pub const ERROR_PAUSE_MS: u32 = {error_pause_ms};
@@ -401,6 +403,7 @@ pub const IMU_IMPACT_STOP_MM_S2: u16 = {imu_impact_stop_mm_s2};
         post_start_settle_ms = body.timing.post_start_settle_ms,
         post_mode_settle_ms = body.timing.post_mode_settle_ms,
         uart_byte_timeout_ms = body.timing.uart_byte_timeout_ms,
+        hardware_watchdog_timeout_ms = body.timing.hardware_watchdog_timeout_ms,
         idle_blink_ms = body.timing.idle_blink_ms,
         error_blink_ms = body.timing.error_blink_ms,
         error_pause_ms = body.timing.error_pause_ms,
