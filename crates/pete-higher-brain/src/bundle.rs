@@ -60,6 +60,9 @@ pub enum BundleContentKind {
     GraphExport,
     VectorRecords,
     SensorRecords,
+    CaptureManifest,
+    CaptureFrames,
+    CaptureAsset,
     BlobReferences,
     Other,
 }
@@ -154,6 +157,104 @@ impl BundleSourceAdapter for FileExportAdapter {
 #[derive(Clone, Debug)]
 pub struct JsonlLedgerAdapter {
     pub ledger_root: PathBuf,
+}
+
+/// Exports a complete WorldLab physical capture without flattening frame or
+/// raw-asset provenance. The capture is rejected unless its manifest says it
+/// came from the real-robot path; simulated and replay captures must not be
+/// mislabeled as physical experience.
+#[derive(Clone, Debug)]
+pub struct PhysicalCaptureAdapter {
+    pub capture_root: PathBuf,
+}
+
+impl BundleSourceAdapter for PhysicalCaptureAdapter {
+    fn export(
+        &self,
+        payload_root: &Path,
+        _request: &ExperienceBundleRequest,
+    ) -> Result<Vec<ExportedFile>> {
+        let manifest_path = self.capture_root.join("manifest.json");
+        let frames_path = self.capture_root.join("frames.jsonl");
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).with_context(|| {
+                format!("read physical capture manifest {}", manifest_path.display())
+            })?)?;
+        if manifest.get("source").and_then(Value::as_str) != Some("RealRobot") {
+            anyhow::bail!(
+                "capture {} is not physical real-robot experience",
+                self.capture_root.display()
+            );
+        }
+        if !frames_path.is_file() {
+            anyhow::bail!("physical capture is missing frames.jsonl");
+        }
+
+        let declared_frames = manifest
+            .get("frame_count")
+            .and_then(Value::as_u64)
+            .context("physical capture manifest has no frame_count")?;
+        let observed_frames = BufReader::new(fs::File::open(&frames_path)?)
+            .lines()
+            .filter_map(|line| line.ok())
+            .filter(|line| !line.trim().is_empty())
+            .count() as u64;
+        if declared_frames != observed_frames {
+            anyhow::bail!(
+                "physical capture frame count mismatch: manifest={declared_frames}, frames={observed_frames}"
+            );
+        }
+        if observed_frames == 0 {
+            anyhow::bail!("physical capture contains no frames");
+        }
+
+        let mut sources = Vec::new();
+        collect_capture_files(&self.capture_root, &self.capture_root, &mut sources)?;
+        let mut exported = Vec::with_capacity(sources.len());
+        for (source, relative) in sources {
+            let destination = PathBuf::from("capture").join(&relative);
+            let target = payload_root.join(&destination);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&source, &target)?;
+            let kind = match relative.to_string_lossy().as_ref() {
+                "manifest.json" => BundleContentKind::CaptureManifest,
+                "frames.jsonl" => BundleContentKind::CaptureFrames,
+                _ => BundleContentKind::CaptureAsset,
+            };
+            exported.push(ExportedFile {
+                path: destination,
+                kind,
+                completeness_note: None,
+            });
+        }
+        Ok(exported)
+    }
+}
+
+fn collect_capture_files(
+    root: &Path,
+    current: &Path,
+    output: &mut Vec<(PathBuf, PathBuf)>,
+) -> Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("physical capture contains symlink: {}", path.display());
+        }
+        if metadata.is_dir() {
+            collect_capture_files(root, &path, output)?;
+        } else if metadata.is_file() {
+            let relative = path.strip_prefix(root)?.to_path_buf();
+            safe_relative_path(&relative)?;
+            output.push((path, relative));
+        }
+    }
+    output.sort_by(|left, right| left.1.cmp(&right.1));
+    Ok(())
 }
 
 impl BundleSourceAdapter for JsonlLedgerAdapter {
@@ -562,6 +663,73 @@ mod tests {
         )
         .unwrap();
         assert!(validate_bundle(&path).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn physical_capture_export_is_complete_and_checksummed() {
+        let root = temp("physical-capture");
+        let capture = root.join("capture");
+        fs::create_dir_all(capture.join("assets/lidar")).unwrap();
+        fs::write(
+            capture.join("manifest.json"),
+            br#"{"source":"RealRobot","frame_count":1}"#,
+        )
+        .unwrap();
+        fs::write(
+            capture.join("frames.jsonl"),
+            b"{\"index\":0,\"t_ms\":10,\"snapshot\":{\"body\":{}},\"assets\":{\"lidar\":\"assets/lidar/000000.json\"}}\n",
+        )
+        .unwrap();
+        fs::write(
+            capture.join("assets/lidar/000000.json"),
+            b"{\"beams\":[1.0]}\n",
+        )
+        .unwrap();
+        let path = BundleBuilder {
+            root: root.join("bundles"),
+        }
+        .create(
+            &request(),
+            &[Box::new(PhysicalCaptureAdapter {
+                capture_root: capture,
+            })],
+        )
+        .unwrap();
+        let manifest = validate_bundle(&path).unwrap();
+        assert_eq!(manifest.files.len(), 3);
+        assert!(manifest
+            .files
+            .iter()
+            .any(|file| file.kind == BundleContentKind::CaptureFrames));
+        assert_eq!(
+            fs::read(path.join("payload/capture/assets/lidar/000000.json")).unwrap(),
+            b"{\"beams\":[1.0]}\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn simulated_capture_cannot_be_exported_as_physical_experience() {
+        let root = temp("sim-capture");
+        let capture = root.join("capture");
+        fs::create_dir_all(&capture).unwrap();
+        fs::write(
+            capture.join("manifest.json"),
+            br#"{"source":"Sim","frame_count":1}"#,
+        )
+        .unwrap();
+        fs::write(capture.join("frames.jsonl"), b"{}\n").unwrap();
+        let result = BundleBuilder {
+            root: root.join("bundles"),
+        }
+        .create(
+            &request(),
+            &[Box::new(PhysicalCaptureAdapter {
+                capture_root: capture,
+            })],
+        );
+        assert!(result.is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }

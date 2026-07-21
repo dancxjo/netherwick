@@ -2,6 +2,11 @@ use crate::auth::{Principal, Scope};
 use crate::bundle::validate_bundle;
 use crate::candidate::{create_candidate, CandidateRequest};
 use crate::capability::AcceleratorCapabilities;
+use crate::physical_dataset::{
+    construct_physical_dataset, DEPLOYMENT_TARGET as PHYSICAL_DATASET_TARGET,
+    OUTPUT_SCHEMA_VERSION as PHYSICAL_DATASET_SCHEMA,
+    PREPROCESSING_VERSION as PHYSICAL_DATASET_PREPROCESSING,
+};
 use crate::{atomic_write_json, canonical_json, read_json, sha256_bytes, JOB_SCHEMA_VERSION};
 use anyhow::Result;
 use chrono::Utc;
@@ -278,11 +283,94 @@ impl ForebrainWorker {
         self.save(job)?;
         match job.envelope.job_class {
             JobClass::FixtureDigest => self.run_fixture_digest(job, &manifests),
+            JobClass::DatasetConstruction => self.run_physical_dataset(job, &manifests),
             _ => anyhow::bail!(
                 "job class {} is declared but no trainer adapter is configured",
                 job.envelope.job_class.capability_name()
             ),
         }
+    }
+
+    fn run_physical_dataset(
+        &self,
+        job: &mut DurableJob,
+        manifests: &[crate::bundle::ExperienceBundleManifest],
+    ) -> Result<String> {
+        let workspace = self.paths.workspaces.join(&job.envelope.job_id);
+        let output = construct_physical_dataset(
+            &self.paths.bundles,
+            manifests,
+            &workspace,
+            &job.envelope.parameters,
+        )?;
+        job.transition(
+            JobStatus::Running,
+            80,
+            format!(
+                "indexed {} physical frames; required-modality ratio {:.3}",
+                output.evaluation.frame_count, output.evaluation.required_modality_frame_ratio
+            ),
+        );
+        self.save(job)?;
+        let candidate = create_candidate(
+            &self.paths.candidates,
+            &CandidateRequest {
+                algorithm_family: "physical_experience_dataset_v1".into(),
+                preprocessing_version: PHYSICAL_DATASET_PREPROCESSING.into(),
+                input_schema_version: "experience_bundle/1".into(),
+                output_schema_version: PHYSICAL_DATASET_SCHEMA.into(),
+                training_build_identity: job.envelope.software_identity.clone(),
+                source_experience_bundle_ids: job.envelope.source_experience_bundle_ids.clone(),
+                training_parameters: job.envelope.parameters.clone(),
+                evaluation_results: [
+                    (
+                        "physical_capture_count".into(),
+                        json!(output.evaluation.physical_capture_count),
+                    ),
+                    ("frame_count".into(), json!(output.evaluation.frame_count)),
+                    (
+                        "required_modality_frame_ratio".into(),
+                        json!(output.evaluation.required_modality_frame_ratio),
+                    ),
+                    (
+                        "mean_required_modality_coverage".into(),
+                        json!(output.evaluation.mean_required_modality_coverage),
+                    ),
+                    (
+                        "temporal_monotonicity_ratio".into(),
+                        json!(output.evaluation.temporal_monotonicity_ratio),
+                    ),
+                    (
+                        "capture_writer_dropped_frames".into(),
+                        json!(output.evaluation.capture_writer_dropped_frames),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                hardware_requirements: BTreeMap::new(),
+                runtime_requirements: BTreeSet::new(),
+                intended_deployment_target: PHYSICAL_DATASET_TARGET.into(),
+                rollback_compatibility: [
+                    ("schema_stable".into(), Value::Bool(true)),
+                    ("atomic_symlink_activation".into(), Value::Bool(true)),
+                    ("previous_candidate_retained".into(), Value::Bool(true)),
+                    ("brainstem_authority".into(), Value::Bool(false)),
+                ]
+                .into_iter()
+                .collect(),
+            },
+            &[
+                (
+                    output.dataset_path,
+                    PathBuf::from("physical-experience-dataset.jsonl"),
+                ),
+                (
+                    output.evaluation_path,
+                    PathBuf::from("physical-experience-evaluation.json"),
+                ),
+            ],
+        )?;
+        Ok(crate::candidate::validate_candidate(&candidate, None)?.candidate_id)
     }
 
     fn run_fixture_digest(
@@ -486,9 +574,13 @@ mod tests {
     use crate::auth::Scope;
     use crate::bundle::{
         BundleBuilder, BundleContentKind, BundleSourceAdapter, ExperienceBundleRequest,
-        FileExportAdapter,
+        FileExportAdapter, PhysicalCaptureAdapter,
+    };
+    use crate::candidate::{
+        create_candidate, ActivationPolicy, CandidateCompatibility, CandidateState, CandidateStore,
     };
     use crate::capability::{AcceleratorCapabilities, CapabilityProbe};
+    use crate::transfer::{transfer_bundle, TransferOutcome};
     use std::path::Path;
     use uuid::Uuid;
 
@@ -560,6 +652,78 @@ mod tests {
         validate_bundle(&path).unwrap().bundle_id
     }
 
+    fn physical_bundle(root: &Path) -> PathBuf {
+        let capture = root.join("source-capture");
+        fs::create_dir_all(capture.join("assets/lidar")).unwrap();
+        fs::write(
+            capture.join("manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "id": "physical-pete-001",
+                "source": "RealRobot",
+                "schema_version": 2,
+                "frame_count": 2,
+                "writer_health": {"dropped_frames": 0}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            capture.join("frames.jsonl"),
+            concat!(
+                "{\"index\":0,\"t_ms\":100,\"snapshot\":{\"body\":{\"odometry\":{}}},\"assets\":{\"lidar\":\"assets/lidar/000000.json\"}}\n",
+                "{\"index\":1,\"t_ms\":200,\"snapshot\":{\"body\":{\"odometry\":{}}},\"assets\":{\"lidar\":\"assets/lidar/000001.json\"}}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(capture.join("assets/lidar/000000.json"), b"{}\n").unwrap();
+        fs::write(capture.join("assets/lidar/000001.json"), b"{}\n").unwrap();
+        let request = ExperienceBundleRequest {
+            pete_id: "pete".into(),
+            source_node_id: "mother".into(),
+            begin_timestamp_ms: 100,
+            end_timestamp_ms: 200,
+            event_range: None,
+            source_checkpoints: [("capture".into(), "physical-pete-001".into())]
+                .into_iter()
+                .collect(),
+            software_identity: "commit".into(),
+            schema_versions: [("worldlab_capture".into(), "2".into())]
+                .into_iter()
+                .collect(),
+            active_model_versions: BTreeMap::new(),
+            configuration_identity: "cfg".into(),
+            calibration_identity: "cal".into(),
+        };
+        BundleBuilder {
+            root: root.join("exported"),
+        }
+        .create(
+            &request,
+            &[Box::new(PhysicalCaptureAdapter {
+                capture_root: capture,
+            })],
+        )
+        .unwrap()
+    }
+
+    fn dataset_envelope(bundle_id: String, tag: u64) -> JobEnvelope {
+        JobEnvelope::deterministic(
+            JobClass::DatasetConstruction,
+            vec![bundle_id],
+            ResourceRequirements::default(),
+            [
+                ("required_modalities".into(), json!(["body", "range"])),
+                ("minimum_required_modality_frame_ratio".into(), json!(1.0)),
+                ("split_seed".into(), json!(tag)),
+            ]
+            .into_iter()
+            .collect(),
+            "mother",
+            "commit",
+        )
+        .unwrap()
+    }
+
     fn envelope(id: String) -> JobEnvelope {
         JobEnvelope::deterministic(
             JobClass::FixtureDigest,
@@ -609,6 +773,183 @@ mod tests {
         assert_eq!(first_id, second_id);
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(second_root).unwrap();
+    }
+
+    #[test]
+    fn physical_dataset_exercises_resumption_restart_rejection_activation_and_rollback() {
+        let root = temp_root("physical-lifecycle");
+        let source_bundle = physical_bundle(&root);
+        let source_manifest = validate_bundle(&source_bundle).unwrap();
+        let worker_paths = paths(&root.join("forebrain"));
+        let transfer_principal = Principal {
+            id: "mother".into(),
+            scopes: [Scope::TransferExperience].into_iter().collect(),
+        };
+        assert!(matches!(
+            transfer_bundle(
+                &source_bundle,
+                &worker_paths.bundles,
+                &root.join("acks"),
+                &transfer_principal,
+                "fore",
+                Some(64),
+            )
+            .unwrap(),
+            TransferOutcome::Interrupted { .. }
+        ));
+        assert!(matches!(
+            transfer_bundle(
+                &source_bundle,
+                &worker_paths.bundles,
+                &root.join("acks"),
+                &transfer_principal,
+                "fore",
+                None,
+            )
+            .unwrap(),
+            TransferOutcome::Completed { .. }
+        ));
+
+        let worker = ForebrainWorker::open(worker_paths.clone(), caps()).unwrap();
+        let first_envelope = dataset_envelope(source_manifest.bundle_id.clone(), 1);
+        let mut interrupted = worker
+            .enqueue(first_envelope.clone(), &principal())
+            .unwrap();
+        interrupted.transition(JobStatus::Running, 35, "injected worker stop");
+        worker.save(&interrupted).unwrap();
+        drop(worker);
+
+        let worker = ForebrainWorker::open(worker_paths.clone(), caps()).unwrap();
+        assert_eq!(
+            worker.load(&first_envelope.job_id).unwrap().status,
+            JobStatus::Interrupted
+        );
+        worker
+            .retry_interrupted(&first_envelope.job_id, &principal())
+            .unwrap();
+        let first = worker.run_once().unwrap().unwrap();
+        assert_eq!(first.status, JobStatus::Succeeded);
+        assert!(first.transitions.iter().any(|transition| {
+            transition.status == JobStatus::Interrupted
+                && transition.detail.contains("worker restarted")
+        }));
+        let first_id = first.candidate_id.unwrap();
+        let first_path = worker_paths
+            .candidates
+            .join(format!("{first_id}.candidate"));
+        let first_manifest = crate::candidate::validate_candidate(&first_path, None).unwrap();
+        assert_eq!(
+            first_manifest.output_schema_version,
+            PHYSICAL_DATASET_SCHEMA
+        );
+        assert_eq!(
+            first_manifest.intended_deployment_target,
+            PHYSICAL_DATASET_TARGET
+        );
+        assert_eq!(
+            first_manifest.evaluation_results["required_modality_frame_ratio"],
+            json!(1.0)
+        );
+        assert_ne!(first_manifest.intended_deployment_target, "brainstem");
+
+        let lifecycle_principal = Principal {
+            id: "operator".into(),
+            scopes: [
+                Scope::ReturnCandidate,
+                Scope::StageCandidate,
+                Scope::ActivateCandidate,
+                Scope::RollbackModel,
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let store = CandidateStore {
+            root: root.join("motherbrain-models"),
+            compatibility: CandidateCompatibility {
+                input_schema_versions: ["experience_bundle/1".into()].into_iter().collect(),
+                output_schema_versions: [PHYSICAL_DATASET_SCHEMA.into()].into_iter().collect(),
+                preprocessing_versions: [PHYSICAL_DATASET_PREPROCESSING.into()]
+                    .into_iter()
+                    .collect(),
+                deployment_targets: [PHYSICAL_DATASET_TARGET.into()].into_iter().collect(),
+                runtimes: BTreeSet::new(),
+            },
+            policy: ActivationPolicy::OperatorApproval,
+        };
+        assert_eq!(
+            store.receive(&first_path, &lifecycle_principal).unwrap(),
+            first_id
+        );
+        store.validate(&first_id, &lifecycle_principal).unwrap();
+        store.stage(&first_id, &lifecycle_principal).unwrap();
+        store
+            .activate(&first_id, &lifecycle_principal, true)
+            .unwrap();
+        let active_before_rejection = fs::read_link(store.root.join("active/current")).unwrap();
+
+        let invalid_artifact = root.join("invalid-dataset.jsonl");
+        fs::write(&invalid_artifact, b"{}\n").unwrap();
+        let invalid_path = create_candidate(
+            &root.join("invalid-candidate"),
+            &CandidateRequest {
+                algorithm_family: "physical_experience_dataset_v1".into(),
+                preprocessing_version: PHYSICAL_DATASET_PREPROCESSING.into(),
+                input_schema_version: "experience_bundle/1".into(),
+                output_schema_version: "physical_experience_dataset/999".into(),
+                training_build_identity: "commit".into(),
+                source_experience_bundle_ids: vec![source_manifest.bundle_id.clone()],
+                training_parameters: BTreeMap::new(),
+                evaluation_results: BTreeMap::new(),
+                hardware_requirements: BTreeMap::new(),
+                runtime_requirements: BTreeSet::new(),
+                intended_deployment_target: PHYSICAL_DATASET_TARGET.into(),
+                rollback_compatibility: BTreeMap::new(),
+            },
+            &[(invalid_artifact, PathBuf::from("dataset.jsonl"))],
+        )
+        .unwrap();
+        let invalid_id = store.receive(&invalid_path, &lifecycle_principal).unwrap();
+        assert!(store.validate(&invalid_id, &lifecycle_principal).is_err());
+        assert_eq!(
+            store
+                .lifecycle(&invalid_id)
+                .unwrap()
+                .transitions
+                .last()
+                .unwrap()
+                .state,
+            CandidateState::Rejected
+        );
+        assert_eq!(
+            fs::read_link(store.root.join("active/current")).unwrap(),
+            active_before_rejection
+        );
+
+        let second_envelope = dataset_envelope(source_manifest.bundle_id, 2);
+        worker.enqueue(second_envelope, &principal()).unwrap();
+        let second_id = worker.run_once().unwrap().unwrap().candidate_id.unwrap();
+        assert_ne!(first_id, second_id);
+        let second_path = worker_paths
+            .candidates
+            .join(format!("{second_id}.candidate"));
+        store.receive(&second_path, &lifecycle_principal).unwrap();
+        store.validate(&second_id, &lifecycle_principal).unwrap();
+        store.stage(&second_id, &lifecycle_principal).unwrap();
+        assert!(store
+            .activate(&second_id, &lifecycle_principal, false)
+            .is_err());
+        assert_eq!(
+            fs::read_link(store.root.join("active/current")).unwrap(),
+            active_before_rejection
+        );
+        store
+            .activate(&second_id, &lifecycle_principal, true)
+            .unwrap();
+        assert_eq!(store.rollback(&lifecycle_principal).unwrap(), first_id);
+        assert!(fs::read_link(store.root.join("active/current"))
+            .unwrap()
+            .ends_with(format!("{first_id}.candidate")));
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn copy_dir_for_test(source: &Path, destination: &Path) {

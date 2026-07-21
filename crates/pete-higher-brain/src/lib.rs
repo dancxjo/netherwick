@@ -13,6 +13,7 @@ pub mod coordinator;
 pub mod discovery;
 pub mod failover;
 pub mod job;
+pub mod physical_dataset;
 pub mod transfer;
 
 use anyhow::{Context, Result};

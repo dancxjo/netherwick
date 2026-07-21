@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use pete_higher_brain::auth::{Principal, Scope};
 use pete_higher_brain::bundle::{
     validate_bundle, BundleBuilder, BundleContentKind, BundleSourceAdapter,
-    ExperienceBundleRequest, FileExportAdapter, JsonlLedgerAdapter,
+    ExperienceBundleRequest, FileExportAdapter, JsonlLedgerAdapter, PhysicalCaptureAdapter,
 };
 use pete_higher_brain::candidate::{
     validate_candidate, ActivationPolicy, CandidateCompatibility, CandidateStore,
@@ -66,6 +66,9 @@ enum Command {
         vectors: Option<PathBuf>,
         #[arg(long)]
         sensors: Option<PathBuf>,
+        /// Complete WorldLab capture whose manifest source is RealRobot.
+        #[arg(long)]
+        capture: Option<PathBuf>,
     },
     BundleVerify {
         path: PathBuf,
@@ -78,6 +81,9 @@ enum Command {
         acknowledgements: PathBuf,
         #[arg(long, default_value = "forebrain")]
         receiver: String,
+        /// Stop after this many bytes to exercise resumable transfer.
+        #[arg(long)]
+        byte_budget: Option<u64>,
     },
     JobCreate {
         #[arg(long)]
@@ -88,6 +94,13 @@ enum Command {
         submitter: String,
         #[arg(long, default_value = "development")]
         software_identity: String,
+        #[arg(long, value_enum, default_value_t = JobClassArg::FixtureDigest)]
+        job_class: JobClassArg,
+        /// Modality each physical dataset row must contain for the coverage metric.
+        #[arg(long)]
+        required_modality: Vec<String>,
+        #[arg(long, default_value_t = 0.0)]
+        minimum_required_modality_frame_ratio: f64,
     },
     JobSubmit {
         #[arg(long)]
@@ -96,6 +109,11 @@ enum Command {
         envelope: PathBuf,
     },
     JobStatus {
+        #[arg(long)]
+        config: PathBuf,
+        job_id: String,
+    },
+    JobRetry {
         #[arg(long)]
         config: PathBuf,
         job_id: String,
@@ -126,6 +144,21 @@ enum Command {
     },
     /// Run deterministic host-link failure injection and print the matrix.
     FailoverCheck,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum JobClassArg {
+    FixtureDigest,
+    DatasetConstruction,
+}
+
+impl From<JobClassArg> for JobClass {
+    fn from(value: JobClassArg) -> Self {
+        match value {
+            JobClassArg::FixtureDigest => Self::FixtureDigest,
+            JobClassArg::DatasetConstruction => Self::DatasetConstruction,
+        }
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -198,11 +231,15 @@ fn main() -> Result<()> {
             graph,
             vectors,
             sensors,
+            capture,
         } => {
             let request: ExperienceBundleRequest = pete_higher_brain::read_json(&request)?;
             let mut adapters: Vec<Box<dyn BundleSourceAdapter>> = Vec::new();
             if let Some(ledger_root) = ledger {
                 adapters.push(Box::new(JsonlLedgerAdapter { ledger_root }));
+            }
+            if let Some(capture_root) = capture {
+                adapters.push(Box::new(PhysicalCaptureAdapter { capture_root }));
             }
             for (source, destination, kind) in [
                 (graph, "stores/graph.json", BundleContentKind::GraphExport),
@@ -240,6 +277,7 @@ fn main() -> Result<()> {
             destination,
             acknowledgements,
             receiver,
+            byte_budget,
         } => {
             println!(
                 "{:?}",
@@ -249,7 +287,7 @@ fn main() -> Result<()> {
                     &acknowledgements,
                     &local_principal([Scope::TransferExperience]),
                     &receiver,
-                    None,
+                    byte_budget,
                 )?
             );
         }
@@ -258,12 +296,28 @@ fn main() -> Result<()> {
             output,
             submitter,
             software_identity,
+            job_class,
+            required_modality,
+            minimum_required_modality_frame_ratio,
         } => {
+            let mut parameters = BTreeMap::new();
+            if matches!(job_class, JobClassArg::DatasetConstruction) {
+                if !required_modality.is_empty() {
+                    parameters.insert(
+                        "required_modalities".into(),
+                        serde_json::json!(required_modality),
+                    );
+                }
+                parameters.insert(
+                    "minimum_required_modality_frame_ratio".into(),
+                    serde_json::json!(minimum_required_modality_frame_ratio),
+                );
+            }
             let envelope = JobEnvelope::deterministic(
-                JobClass::FixtureDigest,
+                job_class.into(),
                 bundle_id,
                 ResourceRequirements::default(),
-                BTreeMap::new(),
+                parameters,
                 submitter,
                 software_identity,
             )?;
@@ -283,6 +337,13 @@ fn main() -> Result<()> {
             let capabilities = detect_local(&config.workspace, config.node_id.clone())?;
             let worker = ForebrainWorker::open(config.worker_paths(), capabilities)?;
             println!("{}", serde_json::to_string_pretty(&worker.load(&job_id)?)?);
+        }
+        Command::JobRetry { config, job_id } => {
+            let config = ForebrainConfig::load(&config)?;
+            let capabilities = detect_local(&config.workspace, config.node_id.clone())?;
+            let worker = ForebrainWorker::open(config.worker_paths(), capabilities)?;
+            worker.retry_interrupted(&job_id, &local_principal([Scope::SubmitJob]))?;
+            println!("retry queued {job_id}");
         }
         Command::CandidateValidate { path } => {
             println!(
@@ -430,9 +491,21 @@ fn candidate_store(root: PathBuf) -> CandidateStore {
         root,
         compatibility: CandidateCompatibility {
             input_schema_versions: ["experience_bundle/1".into()].into_iter().collect(),
-            output_schema_versions: ["fixture_model/1".into()].into_iter().collect(),
-            preprocessing_versions: ["fixture_digest/1".into()].into_iter().collect(),
-            deployment_targets: ["motherbrain_fixture".into()].into_iter().collect(),
+            output_schema_versions: [
+                "fixture_model/1".into(),
+                "physical_experience_dataset/1".into(),
+            ]
+            .into_iter()
+            .collect(),
+            preprocessing_versions: ["fixture_digest/1".into(), "physical_capture_index/1".into()]
+                .into_iter()
+                .collect(),
+            deployment_targets: [
+                "motherbrain_fixture".into(),
+                "motherbrain_dataset_library".into(),
+            ]
+            .into_iter()
+            .collect(),
             runtimes: BTreeSet::new(),
         },
         policy: ActivationPolicy::OperatorApproval,

@@ -6,6 +6,13 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Add a useful forebrain `dataset_construction` lifecycle for checksummed
+  `RealRobot` WorldLab captures, including complete physical-capture export,
+  resumable-transfer and worker-restart recovery controls, deterministic
+  frame/modality datasets and quality metrics, schema-gated candidate staging,
+  explicit activation, incompatible-candidate rejection, and rollback coverage
+  without granting learned artifacts brainstem authority.
+
 - Add `just possess-sensorium` and `just possess-sensorium-rpi5` as explicit
   second-stage physical checks that retain possession safeguards while restoring
   configured higher sensors and Ollama cognition; keep existing possession

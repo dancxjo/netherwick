@@ -131,9 +131,18 @@ progress, detail, and transition history. A worker restart turns a durable
 `running` record into `interrupted`; an authorized retry can requeue it. Invalid
 or unavailable resources fail before execution.
 
-`fixture_digest` is the real deterministic demonstrator. It verifies source
-bundles, derives a digest/count/byte artifact, evaluates its deterministic
-properties, and emits a complete model candidate. Candidate manifests include
+`dataset_construction` is the useful physical-experience job. It accepts only a
+complete WorldLab capture whose source is `RealRobot`, retains every capture
+file and raw asset in the checksummed experience bundle, and deterministically
+builds a provenance-bearing frame/modality index. Its evaluation reports
+required-modality frame coverage, mean modality coverage, temporal
+monotonicity, asset-reference count, and capture-writer drops. The candidate
+declares `physical_experience_dataset/1` output compatibility and targets only
+the motherbrain dataset library.
+
+`fixture_digest` remains a small deterministic infrastructure smoke test. It
+verifies source bundles, derives a digest/count/byte artifact, evaluates its
+deterministic properties, and emits a complete model candidate. Candidate manifests include
 algorithm family, learned artifacts, preprocessing and I/O schemas, training
 build, exact bundle IDs, parameters, evaluation, hardware/runtime needs,
 deployment target, rollback compatibility, and checksums.
@@ -252,6 +261,73 @@ cargo run -q -p pete-higher-brain -- candidate-receive --store "$ROOT/mother/mod
 cargo run -q -p pete-higher-brain -- candidate-stage --store "$ROOT/mother/models" "$CANDIDATE_ID"
 cargo run -q -p pete-higher-brain -- candidate-activate --store "$ROOT/mother/models" --approve "$CANDIDATE_ID"
 readlink "$ROOT/mother/models/active/current"
+```
+
+## Physical-experience dataset lifecycle
+
+Start from a completed capture produced by `capture-real` or a physical
+possession session. `bundle-create --capture` refuses `Sim`, `Replay`, and
+`Unknown` sources and checks that the manifest frame count matches
+`frames.jsonl` before checksumming the complete capture tree.
+
+```bash
+ROOT="$(mktemp -d)"
+mkdir -p "$ROOT/mother" "$ROOT/fore"/{experience,jobs,candidates,workspace} "$ROOT/acks"
+cargo run -q -p pete-higher-brain -- bundle-create \
+  --request physical-experience-request.json \
+  --output "$ROOT/mother" \
+  --capture data/captures/real/rpi5-smoke
+BUNDLE_PATH="$(find "$ROOT/mother" -maxdepth 1 -name '*.bundle' -print -quit)"
+BUNDLE_ID="$(cargo run -q -p pete-higher-brain -- bundle-verify "$BUNDLE_PATH" | jq -r .bundle_id)"
+```
+
+Exercise an interrupted transfer, then resume it using the same command without
+the byte budget:
+
+```bash
+cargo run -q -p pete-higher-brain -- bundle-transfer "$BUNDLE_PATH" \
+  --destination "$ROOT/fore/experience" --acknowledgements "$ROOT/acks" \
+  --receiver forebrain-physical --byte-budget 65536
+cargo run -q -p pete-higher-brain -- bundle-transfer "$BUNDLE_PATH" \
+  --destination "$ROOT/fore/experience" --acknowledgements "$ROOT/acks" \
+  --receiver forebrain-physical
+```
+
+Create and submit the useful job. Choose required modalities that the capture
+was meant to provide; the minimum ratio makes coverage a deterministic
+candidate-production gate rather than an informational count.
+
+```bash
+cargo run -q -p pete-higher-brain -- job-create \
+  --job-class dataset-construction --bundle-id "$BUNDLE_ID" \
+  --required-modality body --required-modality range \
+  --minimum-required-modality-frame-ratio 0.90 \
+  --software-identity "$(git rev-parse HEAD)" --output "$ROOT/job.json"
+cargo run -q -p pete-higher-brain -- job-submit \
+  --config "$ROOT/forebrain.toml" --envelope "$ROOT/job.json"
+cargo run -q -p pete-higher-brain -- worker --config "$ROOT/forebrain.toml" --once
+```
+
+If the worker was stopped while the durable record was running, reopening it
+marks the job interrupted. Requeue it explicitly and run the worker again:
+
+```bash
+JOB_ID="$(jq -r .job_id "$ROOT/job.json")"
+cargo run -q -p pete-higher-brain -- job-retry \
+  --config "$ROOT/forebrain.toml" "$JOB_ID"
+cargo run -q -p pete-higher-brain -- worker --config "$ROOT/forebrain.toml" --once
+```
+
+Use the existing `candidate-receive`, `candidate-stage`,
+`candidate-activate --approve`, and `candidate-rollback` commands for the
+explicit lifecycle. The focused integration test exercises interrupted
+transfer, worker restart/retry, incompatible-candidate rejection without an
+active-link change, approval-gated activation, rollback, and the forbidden
+brainstem target in one path:
+
+```bash
+cargo test -p pete-higher-brain \
+  physical_dataset_exercises_resumption_restart_rejection_activation_and_rollback
 ```
 
 Run the flow again with a changed fixture/checkpoint identity to create a second
