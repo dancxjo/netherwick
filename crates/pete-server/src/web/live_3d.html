@@ -153,6 +153,7 @@ canvas{display:block}
   <div id="status">connecting...</div>
   <dl>
     <dt>mode</dt><dd id="mode">-</dd>
+    <dt>control</dt><dd id="control_state">-</dd>
     <dt>scenario</dt><dd id="scenario">-</dd>
     <dt>training</dt><dd id="training_mode">-</dd>
     <dt>weights</dt><dd id="weights_updating">-</dd>
@@ -450,7 +451,7 @@ const behaviorInspector = document.getElementById('behavior-inspector');
 const virtualPipelineSection = document.getElementById('virtual-pipeline-section');
 const virtualReportSummary = document.getElementById('virtual-report-summary');
 const virtualModelRecommendations = document.getElementById('virtual-model-recommendations');
-const fields = Object.fromEntries(['mode','scenario','training_mode','weights_updating','ledger_counts','action_selector_mode','chosen_action','motor_line','motion_sent','movement_delta','blocked_reason','seed','tick','t','pose','battery','stuck','trap_kind','dead_battery','recovery_mode','recovery_attempts','stuck_ticks','nearest','eye','points','depth_stats','geometry_frames','imu_orientation','calibration_readout','geometry_warnings','surfaces','audio','mind','scheme','secure','webxr'].map(id => [id, document.getElementById(id)]));
+const fields = Object.fromEntries(['mode','control_state','scenario','training_mode','weights_updating','ledger_counts','action_selector_mode','chosen_action','motor_line','motion_sent','movement_delta','blocked_reason','seed','tick','t','pose','battery','stuck','trap_kind','dead_battery','recovery_mode','recovery_attempts','stuck_ticks','nearest','eye','points','depth_stats','geometry_frames','imu_orientation','calibration_readout','geometry_warnings','surfaces','audio','mind','scheme','secure','webxr'].map(id => [id, document.getElementById(id)]));
 const learningMode = document.getElementById('learning-mode');
 const learningSteps = document.getElementById('learning-steps');
 const learningStatus = document.getElementById('learning-status');
@@ -1441,6 +1442,7 @@ function updateScene(packet, liveMap=null){
   drawTraceMap(packet, liveMap);
   const session = packet.session || {};
   fields.mode.textContent = session.mode || '-';
+  fields.control_state.textContent = session.control_detail || session.control_state || '-';
   fields.scenario.textContent = session.scenario || '-';
   fields.training_mode.textContent = packet.training_mode || packet.training?.training_mode || '-';
   fields.weights_updating.textContent = packet.weights_updating ? 'live learning active' : 'not updating';

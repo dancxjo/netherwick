@@ -165,6 +165,10 @@ pub struct SceneSession {
     pub seed: Option<u64>,
     pub source: String,
     pub tick_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_detail: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

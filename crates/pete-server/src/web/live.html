@@ -363,7 +363,7 @@ async function refresh(){
       }
       fields.ear_age.textContent = '-';
       drawBeams((scenePacket.range?.beams || []).map(beam => beam.distance_m));
-      status.textContent = 'live';
+      status.textContent = scenePacket.session?.control_detail || scenePacket.session?.control_state || 'live';
       refreshGraph();
       return;
     }

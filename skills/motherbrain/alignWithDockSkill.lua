@@ -1,10 +1,9 @@
 function alignWithDockSkill(args)
     if charging() then
         stop()
-        return {charging = true}
+        return verifyCharging()
     end
     searchForDockSignal()
     alignWithDock()
-    verifyCharging()
-    return {charging = true}
+    return verifyCharging()
 end

@@ -14,6 +14,5 @@ function returnToDock(args)
     )
     alignWithDock()
     stop()
-    verifyCharging()
-    return {charging = true}
+    return verifyCharging()
 end

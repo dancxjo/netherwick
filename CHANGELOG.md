@@ -26,6 +26,13 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Require a fresh complete Create OI packet reporting an active electrical
+  charging state before Lua docking skills claim charging, keeping Home Base
+  contact, dock IR, charge-indicator GPIO state, and OI waiting/fault states
+  from satisfying the charging postcondition.
+- Keep charging completion in docking dependent on VerifyCharging freshness and
+  charging-state code, and return source/state metadata so consumers can
+  distinguish create-derived evidence.
 - Timestamp physical capture frames with the canonical fused runtime-frame time
   while retaining body and sensor producer timestamps as provenance, preventing
   stale Create packets from collapsing asynchronous sensor evidence onto duplicate
@@ -100,6 +107,9 @@ All notable changes are grouped by date.
   `crates/pete-brainstem/src/{arch/pico_w_tests.rs,display_tests.rs,runtime_tests.rs,status_tests.rs}`
   by removing stray leading indentation and restoring canonical top-level item
   alignment.
+- Propagate optional live control intent (`control_state`, `control_detail`) through
+  scene session contracts and UI dashboards so live mode and 3D views display the
+  current control posture alongside mode, scenario, and training labels.
 
 ### Auto-sync (2026-07-15)
 

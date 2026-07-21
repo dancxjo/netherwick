@@ -494,60 +494,174 @@ fn dock_alignment_skill_follows_ir_and_fails_stopped_when_the_gradient_disappear
 }
 
 #[test]
-fn charging_or_home_base_contact_completes_dock_alignment() {
+fn charging_or_home_base_contact_completes_dock_alignment_operation() {
     let request = SkillRequest {
         skill_id: SkillId::AlignWithDock,
-        maximum_duration_ms: 2_000,
         ..SkillRequest::default()
     };
-    let body = BodySense {
-        charging: true,
-        ..BodySense::default()
-    };
-    let mut cockpit = SimCockpit::new().with_unscoped_bench_mode();
-    let events = cockpit.get_events_since(0).unwrap();
-    let mut runtime = PossessorSkillRuntime::default();
-
-    let _ = possessor_test_step(
-        &mut runtime,
-        &mut cockpit,
-        &request,
-        &body,
-        false,
-        &events,
-        1,
-    );
-    let (completed, stop_sent) = possessor_test_step(
-        &mut runtime,
-        &mut cockpit,
-        &request,
-        &body,
-        false,
-        &events,
-        101,
-    );
-    assert!(stop_sent);
-    assert_eq!(completed.outcome, Some(SkillOutcome::Completed));
-
-    let body = BodySense::default();
-    let mut cockpit = SimCockpit::new().with_unscoped_bench_mode();
-    let events = cockpit.get_events_since(0).unwrap();
-    let mut runtime = PossessorSkillRuntime::default();
-    let mut completed = SkillStatus::default();
-    let mut stop_sent = false;
-    for now_ms in [1, 101, 201, 301] {
-        (completed, stop_sent) = possessor_test_step(
-            &mut runtime,
-            &mut cockpit,
-            &request,
-            &body,
-            true,
-            &events,
-            now_ms,
+    for (body_charging, home_base_contact) in [(true, false), (false, true)] {
+        let mut cockpit = SimCockpit::new().with_unscoped_bench_mode();
+        let events = cockpit.get_events_since(0).unwrap();
+        let mut state = EmbodiedLuaDriverState::default();
+        let status = StatusSummary::from_raw("");
+        let mut driver = RealLuaOrganDriver {
+            cockpit: &mut cockpit,
+            request: &request,
+            status: &status,
+            home_base_contact,
+            state: &mut state,
+            command_sent: false,
+        };
+        let now = Now::blank(
+            100,
+            BodySense {
+                charging: body_charging,
+                ..BodySense::default()
+            },
         );
+        let result = driver.poll(
+            &HostOperation::AlignWithDock,
+            OperationContext {
+                operation_id: 1,
+                child_id: 0,
+                first_poll: true,
+                elapsed_ms: 0,
+                now_ms: 100,
+                primitive_ttl_ms: 250,
+            },
+            &now,
+            &events,
+        );
+
+        assert!(matches!(result, OrganPoll::Completed(_)));
+        assert!(driver.command_sent);
     }
-    let _ = stop_sent;
-    assert_eq!(completed.outcome, Some(SkillOutcome::Completed));
+}
+
+fn poll_verify_charging(
+    status_raw: &str,
+    body_charging: bool,
+    home_base_contact: bool,
+    elapsed_ms: u64,
+) -> OrganPoll {
+    let mut cockpit = SimCockpit::new().with_unscoped_bench_mode();
+    let events = cockpit.get_events_since(0).unwrap();
+    let request = SkillRequest {
+        skill_id: SkillId::ReturnToDock,
+        ..SkillRequest::default()
+    };
+    let status = StatusSummary::from_raw(status_raw);
+    let mut state = EmbodiedLuaDriverState::default();
+    let mut driver = RealLuaOrganDriver {
+        cockpit: &mut cockpit,
+        request: &request,
+        status: &status,
+        home_base_contact,
+        state: &mut state,
+        command_sent: false,
+    };
+    let now = Now::blank(
+        1_000,
+        BodySense {
+            charging: body_charging,
+            ..BodySense::default()
+        },
+    );
+
+    driver.poll(
+        &HostOperation::VerifyCharging,
+        OperationContext {
+            operation_id: 1,
+            child_id: 0,
+            first_poll: elapsed_ms == 0,
+            elapsed_ms,
+            now_ms: 1_000,
+            primitive_ttl_ms: 250,
+        },
+        &now,
+        &events,
+    )
+}
+
+#[test]
+fn verify_charging_requires_fresh_active_create_oi_state() {
+    let fresh_not_charging = r#"{
+        "uptime_ms": 1000,
+        "create_sensors": {
+            "complete_packet_count": 1,
+            "last_complete_packet_timestamp_ms": 1000,
+            "charging_state": 0
+        }
+    }"#;
+
+    for (body_charging, home_base_contact) in [(false, true), (true, false)] {
+        assert!(matches!(
+            poll_verify_charging(
+                fresh_not_charging,
+                body_charging,
+                home_base_contact,
+                1_000,
+            ),
+            OrganPoll::Failed(SkillFailure {
+                outcome: SkillOutcome::PostconditionFailed,
+                ..
+            })
+        ));
+    }
+
+    for charging_state in [4, 5] {
+        let waiting_or_fault = format!(
+            r#"{{
+                "uptime_ms": 1000,
+                "create_sensors": {{
+                    "complete_packet_count": 1,
+                    "last_complete_packet_timestamp_ms": 1000,
+                    "charging_state": {charging_state}
+                }}
+            }}"#
+        );
+        assert!(matches!(
+            poll_verify_charging(&waiting_or_fault, true, true, 1_000),
+            OrganPoll::Failed(SkillFailure {
+                outcome: SkillOutcome::PostconditionFailed,
+                ..
+            })
+        ));
+    }
+
+    let stale_charging = r#"{
+        "uptime_ms": 1000,
+        "create_sensors": {
+            "complete_packet_count": 1,
+            "last_complete_packet_timestamp_ms": 499,
+            "charging_state": 2
+        }
+    }"#;
+    assert!(matches!(
+        poll_verify_charging(stale_charging, true, true, 1_000),
+        OrganPoll::Failed(SkillFailure {
+            outcome: SkillOutcome::PostconditionFailed,
+            ..
+        })
+    ));
+
+    let fresh_charging = r#"{
+        "uptime_ms": 1000,
+        "create_sensors": {
+            "complete_packet_count": 2,
+            "last_complete_packet_timestamp_ms": 750,
+            "charging_state": 2
+        }
+    }"#;
+    let OrganPoll::Completed(result) =
+        poll_verify_charging(fresh_charging, false, false, 0)
+    else {
+        panic!("fresh Create charging state should verify charging");
+    };
+    assert_eq!(result.get("charging"), Some(&json!(true)));
+    assert_eq!(result.get("source"), Some(&json!("create_oi")));
+    assert_eq!(result.get("charging_state"), Some(&json!(2)));
+    assert_eq!(result.get("body_packet_age_ms"), Some(&json!(250)));
 }
 
 #[test]

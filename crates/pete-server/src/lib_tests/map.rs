@@ -137,6 +137,8 @@ async fn live_scene_returns_body_pose_and_range_beams() {
         seed: Some(99),
         source: "sim".to_string(),
         tick_ms: Some(100),
+        control_state: None,
+        control_detail: None,
     });
     state.update_training_status(LiveTrainingStatus {
         training_mode: "collecting".to_string(),

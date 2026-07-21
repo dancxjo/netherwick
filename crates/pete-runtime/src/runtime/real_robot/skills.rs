@@ -118,6 +118,7 @@ struct SensorPollHealth {
 }
 
 const SENSOR_FAILURE_REPORT_INTERVAL_MS: TimeMs = 30_000;
+const VERIFY_CHARGING_PACKET_MAX_AGE_MS: u32 = 500;
 
 struct PossessorSkillRuntime {
     lua: Option<LuaSkillRuntime>,
@@ -374,7 +375,11 @@ impl<C: Cockpit> OrganDriver for RealLuaOrganDriver<'_, C> {
                     complete_stopped(
                         self.cockpit,
                         operation,
-                        json!({"charging": true}),
+                        json!({
+                            "aligned": true,
+                            "home_base_contact": self.home_base_contact,
+                            "charging_observed": now.body.charging,
+                        }),
                         &mut self.command_sent,
                     )
                 } else {
@@ -442,14 +447,24 @@ impl<C: Cockpit> OrganDriver for RealLuaOrganDriver<'_, C> {
                 }
             }
             HostOperation::VerifyCharging => {
-                if now.body.charging || self.home_base_contact {
-                    OrganPoll::Completed(json!({"charging": true}))
+                let charging_state = self.status.battery.charging_state;
+                if self
+                    .status
+                    .has_fresh_complete_body_packet(VERIFY_CHARGING_PACKET_MAX_AGE_MS)
+                    && matches!(charging_state, Some(1..=3))
+                {
+                    OrganPoll::Completed(json!({
+                        "charging": true,
+                        "source": "create_oi",
+                        "charging_state": charging_state,
+                        "body_packet_age_ms": self.status.body_packet_age_ms,
+                    }))
                 } else if context.elapsed_ms >= 1_000 {
                     OrganPoll::Failed(
                         SkillFailure::new(
                             SkillOutcome::PostconditionFailed,
                             "charging_not_verified",
-                            "Home Base contact did not produce charging",
+                            "fresh Create OI charging telemetry was not observed",
                         )
                         .for_operation(operation),
                     )

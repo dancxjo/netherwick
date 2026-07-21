@@ -258,6 +258,22 @@ impl LiveViewState {
             .expect("live view session mutex poisoned") = Some(session);
     }
 
+    pub fn update_session_control(
+        &self,
+        control_state: impl Into<String>,
+        control_detail: impl Into<String>,
+    ) {
+        if let Some(session) = self
+            .session
+            .lock()
+            .expect("live view session mutex poisoned")
+            .as_mut()
+        {
+            session.control_state = Some(control_state.into());
+            session.control_detail = Some(control_detail.into());
+        }
+    }
+
     pub fn session(&self) -> Option<SceneSession> {
         self.session
             .lock()
