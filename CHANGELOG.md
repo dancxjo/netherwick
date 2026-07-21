@@ -26,6 +26,13 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Ready: Make possession reconnect cancellation-aware during both connection
+  attempts and exponential backoff, keep the dashboard in an explicit
+  stopped/reconnecting state, and allow SIGINT/SIGTERM to close capture and
+  ledger output when the brainstem remains unavailable.
+- Ready: Update real-robot runtime documentation for reconnection shutdown
+  behavior so transport-loss possession exits explain the fail-closed stop path
+  and control-state signaling.
 - Require a fresh complete Create OI packet reporting an active electrical
   charging state before Lua docking skills claim charging, keeping Home Base
   contact, dock IR, charge-indicator GPIO state, and OI waiting/fault states

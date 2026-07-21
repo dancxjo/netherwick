@@ -122,11 +122,13 @@ Only complete packet 0 refreshes `BodySense::last_update_ms`; old, missing, or
 partial packets therefore reach the normal stale-sensor STOP policy.
 
 Normal exit, SIGINT, and SIGTERM require acknowledged STOP, acknowledged
-exorcize, and final status. Exorcize releases motherbrain control but leaves
-Create OI power and Full-mode supervision with the brainstem. Final status must
-show no active motion; OI `armed` may remain true because Full mode is retained.
-Transport loss relies on the
-short command, heartbeat, and lease expiries and never triggers a power toggle.
+exorcize, and final status while the brainstem remains reachable. Exorcize
+releases motherbrain control but leaves Create OI power and Full-mode
+supervision with the brainstem. Final status must show no active motion; OI
+`armed` may remain true because Full mode is retained. After transport loss,
+acknowledgement is impossible: shutdown instead relies on the short command,
+heartbeat, and lease expiries, closes capture and ledger output normally, and
+never triggers a power toggle.
 
 After transport loss, the runner closes its local motor gate and retries the
 same stable USB path with exponential backoff (250 ms through 5 seconds by
@@ -138,6 +140,9 @@ configured device and boot IDs must both match. A reboot/boot-ID change stops re
 restart with the newly observed `--brainstem-boot-id`, making acceptance
 explicit. Override only the bounded timing with
 `--reconnect-initial-backoff-ms` and `--reconnect-max-backoff-ms`.
+The dashboard reports `stopped-reconnecting` throughout this wait. Reconnect
+attempts and backoff both select against SIGINT/SIGTERM, so cancellation does
+not wait for the brainstem to return or for a backoff interval to expire.
 
 ## Physical recovery smoke and pending validation
 

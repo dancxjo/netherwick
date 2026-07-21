@@ -75,6 +75,9 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             seed: None,
             source: "real_robot".to_string(),
             tick_ms: Some(args.tick_ms),
+            control_state: (robot_mode == RobotMode::Slow).then(|| "active".to_string()),
+            control_detail: (robot_mode == RobotMode::Slow)
+                .then(|| "brainstem possession active".to_string()),
         });
         live_state.update_scene_metadata(LiveSceneMetadata {
             arena: None,
@@ -416,6 +419,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     tokio::pin!(shutdown);
     let mut played_reign_audio = HashSet::new();
     let mut played_skill_audio = HashSet::new();
+    let mut possession_connected = true;
     while max_steps
         .map(|limit| runner.tick_count < limit)
         .unwrap_or(true)
@@ -441,16 +445,50 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             {
                 eprintln!("possession transport/session lost; motor gate closed: {error}");
                 disconnect_possession_cockpit_for_reconnect(&mut runner.cockpit);
-                let replacement =
-                    reconnect_possession_cockpit(create_port.as_deref(), &args).await?;
-                let mut replacement = replacement;
-                establish_create_sensor_stream(replacement.as_mut(), true)?;
-                runner.cockpit.replace_client(replacement);
-                runner.note_brainstem_reconnect();
-                eprintln!(
-                    "possession reconnected with fresh session, lease, and complete body packet; stopped=true"
-                );
-                continue;
+                possession_connected = false;
+                if let Some(live_state) = &live_state {
+                    live_state.update_session_control(
+                        "stopped-reconnecting",
+                        format!("stopped; brainstem unavailable; reconnecting: {error}"),
+                    );
+                }
+                match reconnect_possession_cockpit(
+                    create_port.as_deref(),
+                    &args,
+                    shutdown.as_mut(),
+                )
+                .await?
+                {
+                    PossessionReconnect::Reconnected(replacement) => {
+                        runner.cockpit.replace_client(replacement);
+                        possession_connected = true;
+                        runner.note_brainstem_reconnect();
+                        if let Some(live_state) = &live_state {
+                            live_state.update_session_control(
+                                "active",
+                                "brainstem possession active after reconnect",
+                            );
+                        }
+                        eprintln!(
+                            "possession reconnected with fresh session, lease, and complete body packet; stopped=true"
+                        );
+                        continue;
+                    }
+                    PossessionReconnect::Shutdown(signal) => {
+                        if let Some(live_state) = &live_state {
+                            live_state.update_session_control(
+                                "stopped-shutdown",
+                                format!(
+                                    "stopped; received {signal} while waiting for brainstem"
+                                ),
+                            );
+                        }
+                        println!(
+                            "received {signal} while waiting for brainstem; closing capture and ledger"
+                        );
+                        break;
+                    }
+                }
             }
             Err(error) if robot_mode == RobotMode::Slow && is_charging_busy_error(&error) => {
                 eprintln!(
@@ -511,7 +549,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         }
     }
 
-    if robot_mode == RobotMode::Slow {
+    if robot_mode == RobotMode::Slow && possession_connected {
         // Preserve acknowledgement semantics: motion must be stopped before
         // surrendering the motherbrain gate. The brainstem continues owning
         // and supervising Create OI in Full mode.
@@ -530,6 +568,10 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             );
         }
         println!("possession exorcize acknowledged: stopped=true possessed=false; brainstem OI supervision retained");
+    } else if robot_mode == RobotMode::Slow {
+        eprintln!(
+            "possession shutdown acknowledgement unavailable: brainstem disconnected; motion remains fail-closed under command, heartbeat, and lease expiry"
+        );
     }
 
     let capture_summary = if let Some(writer) = capture {
@@ -588,28 +630,100 @@ async fn shutdown_signal() -> &'static str {
     }
 }
 
-async fn reconnect_possession_cockpit(
+enum PossessionReconnect<C> {
+    Reconnected(C),
+    Shutdown(&'static str),
+}
+
+#[derive(Clone)]
+struct PossessionReconnectConfig {
+    backend: CockpitBackendArg,
+    create_port: Option<String>,
+    expected_device_id: Option<String>,
+    expected_boot_id: Option<String>,
+    max_linear_mm_s: i16,
+    max_angular_mrad_s: i16,
+}
+
+async fn reconnect_possession_cockpit<Shutdown>(
     create_port: Option<&str>,
     args: &RobotArgs,
+    shutdown: Pin<&mut Shutdown>,
+) -> Result<PossessionReconnect<Box<dyn Cockpit + Send>>>
+where
+    Shutdown: Future<Output = &'static str> + ?Sized,
+{
+    let config = PossessionReconnectConfig {
+        backend: args.cockpit,
+        create_port: create_port.map(str::to_owned),
+        expected_device_id: args.brainstem_device_id.clone(),
+        expected_boot_id: args.brainstem_boot_id.clone(),
+        max_linear_mm_s: args.max_linear_mm_s,
+        max_angular_mrad_s: args.max_angular_mrad_s,
+    };
+    reconnect_possession_cockpit_with(
+        args.reconnect_initial_backoff_ms,
+        args.reconnect_max_backoff_ms,
+        move || open_ready_possession_cockpit(config.clone()),
+        shutdown,
+    )
+    .await
+}
+
+async fn open_ready_possession_cockpit(
+    config: PossessionReconnectConfig,
 ) -> Result<Box<dyn Cockpit + Send>> {
-    let mut backoff_ms = args.reconnect_initial_backoff_ms.max(1);
-    let max_backoff_ms = args.reconnect_max_backoff_ms.max(backoff_ms).min(60_000);
-    loop {
-        match open_robot_cockpit_or_fallback(
-            args.cockpit,
-            create_port,
+    tokio::task::spawn_blocking(move || {
+        let (mut cockpit, mode, _) = open_robot_cockpit_or_fallback(
+            config.backend,
+            config.create_port.as_deref(),
             RobotMode::Slow,
-            args.brainstem_device_id.as_deref(),
-            args.brainstem_boot_id.as_deref(),
-            args.max_linear_mm_s,
-            args.max_angular_mrad_s,
-        ) {
-            Ok((cockpit, RobotMode::Slow, _)) => return Ok(cockpit),
-            Ok(_) => anyhow::bail!("possession reconnect attempted an invalid fallback"),
+            config.expected_device_id.as_deref(),
+            config.expected_boot_id.as_deref(),
+            config.max_linear_mm_s,
+            config.max_angular_mrad_s,
+        )?;
+        if mode != RobotMode::Slow {
+            anyhow::bail!("possession reconnect attempted an invalid fallback");
+        }
+        establish_create_sensor_stream(cockpit.as_mut(), true)?;
+        Ok(cockpit)
+    })
+    .await
+    .context("possession reconnect worker failed")?
+}
+
+async fn reconnect_possession_cockpit_with<C, Connect, ConnectFuture, Shutdown>(
+    initial_backoff_ms: u64,
+    maximum_backoff_ms: u64,
+    mut connect: Connect,
+    mut shutdown: Pin<&mut Shutdown>,
+) -> Result<PossessionReconnect<C>>
+where
+    Connect: FnMut() -> ConnectFuture,
+    ConnectFuture: Future<Output = Result<C>>,
+    Shutdown: Future<Output = &'static str> + ?Sized,
+{
+    let mut backoff_ms = initial_backoff_ms.max(1);
+    let max_backoff_ms = maximum_backoff_ms.max(backoff_ms).min(60_000);
+    loop {
+        let attempt = tokio::select! {
+            biased;
+            signal = shutdown.as_mut() => return Ok(PossessionReconnect::Shutdown(signal)),
+            result = connect() => result,
+        };
+        match attempt {
+            Ok(cockpit) => return Ok(PossessionReconnect::Reconnected(cockpit)),
             Err(error) if is_identity_acceptance_error(&error) => return Err(error),
             Err(error) => {
                 eprintln!("possession reconnect failed: {error}; retrying in {backoff_ms} ms");
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                tokio::select! {
+                    biased;
+                    signal = shutdown.as_mut() => {
+                        return Ok(PossessionReconnect::Shutdown(signal));
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+                }
                 backoff_ms = next_reconnect_backoff_ms(backoff_ms, max_backoff_ms);
             }
         }

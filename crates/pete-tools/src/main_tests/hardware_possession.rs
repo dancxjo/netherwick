@@ -184,6 +184,52 @@ fn possession_reconnect_backoff_is_exponential_and_bounded() {
     assert_eq!(next_reconnect_backoff_ms(5_000, 5_000), 5_000);
 }
 
+#[tokio::test]
+async fn possession_reconnect_can_be_cancelled_during_an_inflight_attempt() {
+    let mut shutdown = Box::pin(async { "SIGTERM" });
+    let outcome = tokio::time::timeout(
+        Duration::from_millis(100),
+        reconnect_possession_cockpit_with(
+            250,
+            5_000,
+            || std::future::pending::<Result<()>>(),
+            shutdown.as_mut(),
+        ),
+    )
+    .await
+    .expect("shutdown should cancel an in-flight reconnect attempt")
+    .unwrap();
+
+    assert!(matches!(outcome, PossessionReconnect::Shutdown("SIGTERM")));
+}
+
+#[tokio::test]
+async fn possession_reconnect_can_be_cancelled_during_backoff() {
+    let mut attempts = 0;
+    let mut shutdown = Box::pin(async {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        "SIGINT"
+    });
+    let outcome = tokio::time::timeout(
+        Duration::from_millis(100),
+        reconnect_possession_cockpit_with(
+            60_000,
+            60_000,
+            || {
+                attempts += 1;
+                std::future::ready(Err(anyhow::anyhow!("brainstem remains unavailable")))
+            },
+            shutdown.as_mut(),
+        ),
+    )
+    .await
+    .expect("shutdown should not wait for the reconnect backoff")
+    .unwrap();
+
+    assert!(matches!(outcome, PossessionReconnect::Shutdown("SIGINT")));
+    assert_eq!(attempts, 1);
+}
+
 struct FreshPacketCockpit {
     status_reads: usize,
     stopped: bool,
