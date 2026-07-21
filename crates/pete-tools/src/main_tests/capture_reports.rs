@@ -9,6 +9,8 @@ fn sensor_only_live_publish_does_not_refresh_body_timestamp() {
         &live_state,
         &SensePacket::EyeFrame(EyeFrame {
             captured_at_ms: 9_999,
+            rgbd_frame_id: None,
+            device_timestamp_ms: None,
             width: 1,
             height: 1,
             format: EyeFrameFormat::Rgb8,
@@ -36,13 +38,17 @@ fn geometry_truth_rejects_stale_and_unsynchronized_kinect_imu_samples() {
         median_frame_dt_ms: Some(100),
         max_frame_dt_ms: Some(100),
         body_last_update_age_ms: Some(0),
+        body_timestamp_in_future: false,
         eye_frame_age_ms: None,
         ear_pcm_age_ms: None,
         kinect_capture_timestamp_present: true,
-        kinect_capture_age_ms: Some(50),
+        kinect_capture_age_ms: None,
+        kinect_timestamp_in_future: true,
         imu_capture_timestamp_present: true,
         imu_capture_age_ms: Some(23_000),
+        imu_timestamp_in_future: false,
         kinect_imu_skew_ms: Some(22_950),
+        kinect_body_skew_ms: Some(50),
         note: String::new(),
     };
     let imu = GeometryImuInterpretation {
@@ -81,6 +87,8 @@ fn geometry_truth_rejects_stale_and_unsynchronized_kinect_imu_samples() {
         max_kinect_timestamp_age_ms: 200,
         max_imu_timestamp_age_ms: 200,
         max_kinect_imu_skew_ms: 100,
+        max_kinect_body_skew_ms: 100,
+        max_rgbd_skew_ms: 50,
         min_depth_frames: 2,
         min_stationary_rotation_deg: 45.0,
         max_stationary_translation_m: 0.2,
@@ -88,10 +96,22 @@ fn geometry_truth_rejects_stale_and_unsynchronized_kinect_imu_samples() {
         max_stationary_stable_z_span_m: 1.5,
     };
 
-    let report = sensor_truth_report(false, &timestamps, &imu, 0.0, &stationary, &args);
+    let report = sensor_truth_report(
+        &WorldSnapshot::default(),
+        false,
+        &timestamps,
+        &imu,
+        0.0,
+        &stationary,
+        &args,
+    );
 
     assert!(!report.ready_for_real_slam);
-    for name in ["imu_timestamp_fresh", "kinect_imu_synchronized"] {
+    for name in [
+        "kinect_timestamp_fresh",
+        "imu_timestamp_fresh",
+        "kinect_imu_synchronized",
+    ] {
         assert_eq!(
             report
                 .gates

@@ -1035,6 +1035,10 @@ struct GeometryDebugArgs {
     max_imu_timestamp_age_ms: u64,
     #[arg(long, default_value_t = 100)]
     max_kinect_imu_skew_ms: u64,
+    #[arg(long, default_value_t = 100)]
+    max_kinect_body_skew_ms: u64,
+    #[arg(long, default_value_t = 50)]
+    max_rgbd_skew_ms: u64,
     #[arg(long, default_value_t = 2)]
     min_depth_frames: usize,
     #[arg(long, default_value_t = 45.0)]

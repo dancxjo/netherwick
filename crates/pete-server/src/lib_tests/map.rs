@@ -192,6 +192,8 @@ async fn live_scene_returns_body_pose_and_range_beams() {
         ],
     });
     snapshot.eye_frame = Some(EyeFrame {
+        rgbd_frame_id: None,
+        device_timestamp_ms: None,
         captured_at_ms: 1200,
         width: 1,
         height: 1,
@@ -551,7 +553,65 @@ fn corrected_2d_graph_keeps_raw_odometry_3d_projection_explicitly_untrusted() {
 
     assert!(!projection.geometry_trusted);
     assert!(!projection.navigation_trusted);
-    assert!(projection.reasons.iter().any(|reason| reason.contains(
-        "pose-graph corrections have not been applied to the accumulated 3D voxels"
-    )));
+    assert!(projection.reasons.iter().any(|reason| reason
+        .contains("pose-graph corrections have not been applied to the accumulated 3D voxels")));
+}
+
+#[test]
+fn corrected_graph_trusts_voxels_only_after_retained_observations_are_rebuilt() {
+    let mut cloud = VoxelPointCloud::default();
+    let observation = pete_map::PointCloudObservation {
+        frame: pete_map::PointCloudFrame::RobotBase,
+        pose: pete_map::PoseEstimate {
+            pose: Pose2::default(),
+            confidence: 1.0,
+            covariance: [0.0; 3],
+            source: "pose_graph_corrected".to_string(),
+            t_ms: 100,
+        },
+        orientation: pete_map::OrientationEstimate {
+            roll_rad: Some(0.0),
+            pitch_rad: Some(0.0),
+            yaw_rad: Some(0.0),
+            roll_pitch_from_imu: true,
+            yaw_source: pete_map::YawSource::OdometryHeading,
+        },
+        points: vec![pete_map::PointCloudPoint {
+            position: pete_map::Point3D {
+                x_m: 1.0,
+                y_m: 0.0,
+                z_m: 0.5,
+            },
+            color_rgb: None,
+            confidence: 1.0,
+            depth_index: None,
+            depth_uv: None,
+            depth_image_size: None,
+            source_frame_id: None,
+        }],
+        source: "kinect_depth".to_string(),
+        t_ms: 100,
+        metadata: serde_json::Value::Null,
+    };
+    for _ in 0..3 {
+        cloud.integrate_observation(observation.clone());
+    }
+    cloud.pose_graph_corrections_applied = true;
+    let mut summary = LocalMap::default().summary();
+    summary.slam_status.mode = SlamMode::LoopClosedPoseGraph;
+    summary.pose_graph_optimization.max_node_update_m = 0.1;
+    let snapshot = WorldSnapshot::default();
+    let metadata = LiveSceneMetadata {
+        sensor_calibration: Some(SceneSensorCalibration::sim_default()),
+        ..LiveSceneMetadata::default()
+    };
+
+    let projection = map_world_projection(&cloud, &summary, &snapshot, Some(&metadata), 400);
+
+    assert!(projection.geometry_trusted);
+    assert!(projection.navigation_trusted);
+    assert!(!projection
+        .reasons
+        .iter()
+        .any(|reason| reason.contains("pose-graph corrections have not been applied")));
 }

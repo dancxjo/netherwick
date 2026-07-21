@@ -3,9 +3,20 @@ fn scene_kinect_from_snapshot(
     calibration: Option<SceneSensorCalibration>,
     warnings: &mut Vec<String>,
 ) -> SceneKinect {
-    let color = snapshot
-        .eye_frame
-        .as_ref()
+    let paired_color = snapshot.kinect.color_frame.as_ref().filter(|frame| {
+        frame.rgbd_frame_id.is_some()
+            && frame.rgbd_frame_id == snapshot.kinect.rgbd_frame_id
+            && frame
+                .captured_at_ms
+                .abs_diff(snapshot.kinect.captured_at_ms)
+                <= 50
+    });
+    let color = paired_color
+        .or_else(|| {
+            (snapshot.kinect.schema_version < 2)
+                .then_some(snapshot.eye_frame.as_ref())
+                .flatten()
+        })
         .and_then(DepthColorImage::from_eye_frame);
     let (points, diagnostics) = depth_points(&snapshot.kinect, calibration, color.as_ref());
     if points.is_empty() {
@@ -64,6 +75,9 @@ fn depth_points(
             stats.render_frame = Some("scene: +x left, +y up, +z forward".to_string());
             return (points, stats);
         }
+    }
+    if kinect.geometry_calibration.is_some() {
+        return project_calibrated_depth_image(kinect, color);
     }
     if let Some(frame) = KinectDepthProjection::from_kinect(kinect) {
         return project_depth_image(depth_m, frame, calibration, color);
@@ -133,6 +147,54 @@ fn depth_points(
             height as u32,
         ),
     )
+}
+
+fn project_calibrated_depth_image(
+    kinect: &KinectSense,
+    color: Option<&DepthColorImage>,
+) -> (Vec<ScenePoint>, SceneKinectDiagnostics) {
+    const MAX_POINTS: usize = 2_000;
+    let Some(geometry) = pete_now::DepthGeometry::from_kinect(kinect) else {
+        return (Vec::new(), SceneKinectDiagnostics::default());
+    };
+    let width = geometry.calibration.depth.width as usize;
+    let height = geometry.calibration.depth.height as usize;
+    let stride = kinect.depth_m.len().div_ceil(MAX_POINTS).max(1);
+    let mut points = Vec::new();
+    for (index, depth) in kinect.depth_m.iter().enumerate().step_by(stride) {
+        if !depth.is_finite() || *depth <= 0.0 {
+            continue;
+        }
+        let u = (index % width) as f32;
+        let v = (index / width) as f32;
+        let Some(camera) = geometry.depth_pixel_to_camera(u, v, *depth) else {
+            continue;
+        };
+        let base = geometry.depth_point_to_base(camera);
+        let [r, g, b] = color
+            .and_then(|color| {
+                geometry.depth_point_to_rgb_pixel(camera).and_then(|pixel| {
+                    color.sample(pixel[0].round() as usize, pixel[1].round() as usize)
+                })
+            })
+            .unwrap_or_else(|| depth_shade(camera[2], kinect.max_depth_m.max(8.0)));
+        points.push(scene_point_from_robot(base, r, g, b));
+    }
+    let mut diagnostics = depth_stats(
+        &kinect.depth_m,
+        stride,
+        kinect.min_depth_m,
+        kinect.max_depth_m,
+        "scene_robot_render",
+        width as u32,
+        height as u32,
+    )
+    .with_floor_stats(floor_stats_from_scene_points(&points));
+    diagnostics.point_coordinate_system =
+        Some("calibrated depth optical to robot base".to_string());
+    diagnostics.math_frame = Some("robot/base: +x forward, +y left, +z up; floor z=0".to_string());
+    diagnostics.render_frame = Some("scene: +x left, +y up, +z forward".to_string());
+    (points, diagnostics)
 }
 
 #[derive(Clone, Debug)]

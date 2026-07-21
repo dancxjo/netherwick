@@ -283,6 +283,7 @@ const DEFAULT_REAL_DEPTH_CAMERA_YAW_DEG: f32 = -90.0;
 fn real_robot_depth_calibration_from_env() -> SceneSensorCalibration {
     let height_m = env_f32("PETE_DEPTH_CAMERA_HEIGHT_M", 0.46);
     let forward_m = env_f32("PETE_DEPTH_CAMERA_FORWARD_M", 0.0);
+    let left_m = env_f32("PETE_DEPTH_CAMERA_LEFT_M", 0.0);
     let pitch_rad = env_f32("PETE_DEPTH_CAMERA_PITCH_DEG", 0.0).to_radians();
     let roll_rad = env_f32("PETE_DEPTH_CAMERA_ROLL_DEG", 0.0).to_radians();
     let yaw_rad = env_f32(
@@ -300,6 +301,7 @@ fn real_robot_depth_calibration_from_env() -> SceneSensorCalibration {
         depth_forward_offset_m: forward_m,
         depth_pitch_down_rad: pitch_rad,
         camera_forward_m: forward_m,
+        camera_left_m: left_m,
         camera_height_m: height_m,
         camera_pitch_rad: pitch_rad,
         camera_roll_rad: roll_rad,

@@ -1,0 +1,32 @@
+{
+  "calibrated": false,
+  "depth": {
+    "width": 640,
+    "height": 480,
+    "fx": 594.0,
+    "fy": 591.0,
+    "cx": 339.0,
+    "cy": 242.0,
+    "distortion": [0.0, 0.0, 0.0, 0.0, 0.0]
+  },
+  "rgb": {
+    "width": 640,
+    "height": 480,
+    "fx": 525.0,
+    "fy": 525.0,
+    "cx": 319.5,
+    "cy": 239.5,
+    "distortion": [0.0, 0.0, 0.0, 0.0, 0.0]
+  },
+  "depth_scale": 1.0,
+  "depth_bias_m": 0.0,
+  "depth_to_rgb": {
+    "translation_m": [0.0, 0.0, 0.0],
+    "rotation_rpy_rad": [0.0, 0.0, 0.0]
+  },
+  "depth_to_base": {
+    "translation_m": [0.0, 0.0, 0.46],
+    "rotation_rpy_rad": [-1.5707964, 0.0, -1.5707964]
+  },
+  "validation": null
+}

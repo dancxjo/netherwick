@@ -139,6 +139,8 @@ async fn post_retina_frame(
 
     let eye_frame = pete_sensors::EyeFrame {
         captured_at_ms: payload.t_ms,
+        rgbd_frame_id: None,
+        device_timestamp_ms: None,
         width,
         height,
         format,
@@ -727,4 +729,3 @@ fn behavior_from_checkpoint_name(name: &str) -> Option<&'static str> {
         None
     }
 }
-

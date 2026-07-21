@@ -416,6 +416,8 @@ fn kinect_depth_image_projects_rgb_frame_colors_onto_points() {
         ..KinectSense::default()
     };
     let eye = EyeFrame {
+        rgbd_frame_id: None,
+        device_timestamp_ms: None,
         captured_at_ms: 10,
         width: 2,
         height: 2,

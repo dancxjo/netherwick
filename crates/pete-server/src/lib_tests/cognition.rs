@@ -361,6 +361,8 @@ async fn live_view_page_draws_common_camera_formats() {
 #[test]
 fn yuyv_eye_frame_encodes_to_png_data_url() {
     let frame = EyeFrame {
+        rgbd_frame_id: None,
+        device_timestamp_ms: None,
         captured_at_ms: 1,
         width: 2,
         height: 1,
@@ -384,6 +386,8 @@ fn yuyv_eye_frame_encodes_to_png_data_url() {
 #[test]
 fn grbg_bayer_eye_frame_encodes_to_png_data_url() {
     let frame = EyeFrame {
+        rgbd_frame_id: None,
+        device_timestamp_ms: None,
         captured_at_ms: 1,
         width: 2,
         height: 2,
@@ -407,6 +411,8 @@ fn grbg_bayer_eye_frame_encodes_to_png_data_url() {
 #[test]
 fn grbg_bayer_eye_frame_encodes_latest_png_bytes() {
     let frame = EyeFrame {
+        rgbd_frame_id: None,
+        device_timestamp_ms: None,
         captured_at_ms: 1,
         width: 2,
         height: 2,

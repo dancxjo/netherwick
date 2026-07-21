@@ -29,8 +29,7 @@ fn map_response_from_parts(
         .values()
         .map(|cell| map_view_cell(cell, map.config.resolution_m, now_ms))
         .collect();
-    let world_projection =
-        map_world_projection(point_cloud, &summary, latest, metadata, now_ms);
+    let world_projection = map_world_projection(point_cloud, &summary, latest, metadata, now_ms);
     let semantic_cells = map_semantic_cells(latest, metadata, now_ms);
     let events = map_event_markers(latest, metadata, now_ms);
     let pose_graph = map_pose_graph_summary(map);
@@ -145,12 +144,20 @@ fn map_world_projection(
     let aligned_with_3d = point_cloud.observations > 0 && !cells.is_empty();
     let corrected_slam_ready = map_summary.slam_status.mode == SlamMode::LoopClosedPoseGraph;
     let graph_correction_not_applied_to_voxels = corrected_slam_ready
-        && map_summary.pose_graph_optimization.max_node_update_m > 0.001;
+        && map_summary.pose_graph_optimization.max_node_update_m > 0.001
+        && !point_cloud.pose_graph_corrections_applied;
     let has_depth = !latest.kinect.depth_m.is_empty();
     let calibrated_depth = !has_depth
-        || metadata
-            .and_then(|metadata| metadata.sensor_calibration)
-            .is_some();
+        || if latest.kinect.schema_version >= 2 {
+            latest
+                .kinect
+                .geometry_calibration
+                .is_some_and(|calibration| calibration.physical_validation_ready())
+        } else {
+            metadata
+                .and_then(|metadata| metadata.sensor_calibration)
+                .is_some()
+        };
     let depth_orientation_trusted =
         !has_depth || point_cloud.orientation_status.roll_pitch_corrected;
     let mut reasons = Vec::new();
@@ -181,8 +188,7 @@ fn map_world_projection(
     }
     if graph_correction_not_applied_to_voxels {
         reasons.push(
-            "pose-graph corrections have not been applied to the accumulated 3D voxels"
-                .to_string(),
+            "pose-graph corrections have not been applied to the accumulated 3D voxels".to_string(),
         );
     }
     let geometry_trusted = aligned_with_3d

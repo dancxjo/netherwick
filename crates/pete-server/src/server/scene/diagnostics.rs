@@ -108,6 +108,7 @@ fn floor_stats_from_scene_points(points: &[ScenePoint]) -> FloorPointStats {
 #[derive(Clone, Copy, Debug)]
 struct DepthExtrinsics {
     forward_m: f32,
+    left_m: f32,
     height_m: f32,
     pitch_rad: f32,
     roll_rad: f32,
@@ -118,6 +119,7 @@ impl From<SceneSensorCalibration> for DepthExtrinsics {
     fn from(calibration: SceneSensorCalibration) -> Self {
         Self {
             forward_m: calibration.depth_camera_forward_m(),
+            left_m: calibration.depth_camera_left_m(),
             height_m: calibration.depth_camera_height_m(),
             pitch_rad: calibration.depth_camera_pitch_rad(),
             roll_rad: calibration.camera_roll_rad,
@@ -140,7 +142,7 @@ fn apply_robot_extrinsics(base: [f32; 3], extrinsics: DepthExtrinsics) -> [f32; 
     );
     [
         rotated[0] + extrinsics.forward_m,
-        rotated[1],
+        rotated[1] + extrinsics.left_m,
         rotated[2] + extrinsics.height_m,
     ]
 }

@@ -45,9 +45,12 @@ The report also includes `sensor_truth.ready_for_real_slam`. Do not start real S
 - `frame_timestamps_monotonic`: capture frame timestamps are ordered and sane.
 - `body_timestamp_fresh`: odometry/body time is close to the selected depth frame time.
 - `multi_frame_depth_capture`: the report contains at least two distinct depth frames.
+- `camera_geometry_calibrated`: the current camera supplies measured intrinsics, distortion, depth scale/bias, RGB-D extrinsics, and full 6-DoF depth-to-base extrinsics.
+- `rgb_depth_paired`: color and depth share one RGB-D frame ID and meet the device-clock skew limit.
 - `kinect_timestamp_fresh`: Kinect depth has its own `captured_at_ms` and it is within the selected freshness limit.
 - `imu_timestamp_fresh`: IMU has its own `captured_at_ms` and it is within the selected freshness limit.
 - `kinect_imu_synchronized`: the Kinect and IMU capture timestamps are within the selected skew limit.
+- `kinect_body_pose_synchronized`: a buffered body pose was interpolated sufficiently close to the depth exposure.
 - `imu_roll_pitch_contract`: IMU shape is recognized as `[roll, pitch]` or `[roll, pitch, yaw]` radians and roll/pitch correction is active.
 - `stationary_rotation_cloud_stability`: a rotate-in-place capture has enough stable voxels with limited vertical spread.
 
@@ -79,9 +82,10 @@ cargo run -p pete-tools -- representation-report \
 
 Require `return_to_start.passed = true`. That gate requires a measured loop
 constraint, lower final RMS graph error, improved registered wall overlap, and
-a corrected final pose within 0.25 m of the start. The accumulated 3D voxel
-cloud is still placed by raw odometry and is therefore explicitly untrusted
-after a nontrivial pose-graph correction until per-node clouds can be rebuilt.
+a corrected final pose within 0.25 m of the start. Depth observations are
+retained and the voxel world is rebuilt through corrected graph-node poses. The
+dashboard keeps the projection untrusted if any retained observation cannot be
+associated with the corrected graph.
 
 ## Calibration Procedure
 
@@ -93,14 +97,18 @@ after a nontrivial pose-graph correction until per-node clouds can be rebuilt.
 6. Adjust camera height and pitch until observed floor samples land near robot/world `z = 0`.
 7. Adjust roll until left and right floor samples have matching height.
 8. Check yaw by rotating a known forward point into the expected world axis.
-9. Enable IMU roll/pitch correction only after confirming the producer emits radians in `[roll, pitch]` or `[roll, pitch, yaw]` order.
+9. Supply the measured IMU-to-base mounting rotation, hold the robot stationary through gyro-bias acquisition, and require the filtered orientation confidence gate. The first sample is never treated as an arbitrary "flat" zero.
 10. Enable world accumulation. Rotate in place and verify stable voxels stay fixed instead of smearing or sinking.
 11. Re-run `geometry-debug` on the rotation capture and require `sensor_truth.ready_for_real_slam = true`.
 12. Trust `LocalWorldBelief` surfaces/blobs only when below-floor ratio is near zero and accumulated voxels remain stable under in-place rotation.
 
-Real robot depth calibration defaults assume the Kinect/depth cloud needs a clockwise
-90 degree yaw correction before entering the robot math frame. Override with
-`PETE_DEPTH_CAMERA_YAW_DEG` if the physical camera mount differs.
+Copy `configs/kinect-calibration.example.json`, replace every nominal/zero value
+with per-device measurements, set `calibrated` to `true`, and start the hardware
+runtime with `PETE_KINECT_CALIBRATION_JSON=/absolute/path/to/calibration.json`.
+The example deliberately has `calibrated: false` and cannot clear the physical
+gate. Configure the IMU mount with `PETE_IMU_TO_BASE_RPY_DEG=roll,pitch,yaw` and
+`PETE_IMU_MOUNT_CALIBRATED=true`; the orientation remains untrusted until the
+stationary gyro-bias sample window also completes.
 
 ## Live View Checks
 

@@ -158,6 +158,7 @@ enum SensorTruthStatus {
 struct GeometryExtrinsics {
     camera_height_m: f32,
     camera_forward_m: f32,
+    camera_left_m: f32,
     camera_pitch_rad: f32,
     camera_roll_rad: f32,
     camera_yaw_rad: f32,
@@ -190,13 +191,17 @@ struct GeometryTimestampDiagnostics {
     median_frame_dt_ms: Option<u64>,
     max_frame_dt_ms: Option<u64>,
     body_last_update_age_ms: Option<u64>,
+    body_timestamp_in_future: bool,
     eye_frame_age_ms: Option<u64>,
     ear_pcm_age_ms: Option<u64>,
     kinect_capture_timestamp_present: bool,
     kinect_capture_age_ms: Option<u64>,
+    kinect_timestamp_in_future: bool,
     imu_capture_timestamp_present: bool,
     imu_capture_age_ms: Option<u64>,
+    imu_timestamp_in_future: bool,
     kinect_imu_skew_ms: Option<u64>,
+    kinect_body_skew_ms: Option<u64>,
     note: String,
 }
 
@@ -257,10 +262,18 @@ async fn generate_geometry_debug_report(args: &GeometryDebugArgs) -> Result<Geom
     let mut warnings = Vec::new();
     let mut hard_failures = Vec::new();
     let projection = geometry_projection(kinect, &mut warnings);
+    let geometry = pete_now::DepthGeometry::from_kinect(kinect)
+        .context("depth frame has no usable calibrated or declared intrinsics")?;
     let config = PointCloudConfig::default();
-    let orientation = pete_map::orientation_from_snapshot(snapshot);
-    let imu_interpretation = geometry_imu_interpretation(&snapshot.imu.orientation, orientation);
-    let pose = snapshot.body.odometry;
+    let alignment = kinect.fusion_alignment.as_ref();
+    let pose = alignment
+        .map(|alignment| alignment.pose)
+        .unwrap_or(snapshot.body.odometry);
+    let imu = alignment
+        .map(|alignment| &alignment.imu)
+        .unwrap_or(&snapshot.imu);
+    let orientation = pete_map::orientation_from_imu(imu, pose.heading_rad);
+    let imu_interpretation = geometry_imu_interpretation(&imu.orientation, orientation);
     let timestamp_diagnostics = geometry_timestamp_diagnostics(&frames, record);
     let stationary_rotation_diagnostics = stationary_rotation_diagnostics(&frames, args);
     let sample_stride = kinect.depth_m.len().div_ceil(args.samples.max(1)).max(1);
@@ -292,13 +305,26 @@ async fn generate_geometry_debug_report(args: &GeometryDebugArgs) -> Result<Geom
         }
         let u = index % projection.width;
         let v = index / projection.width;
-        let camera = Point3D {
-            x_m: (u as f32 - projection.cx) * *depth / projection.fx.max(f32::EPSILON),
-            y_m: (v as f32 - projection.cy) * *depth / projection.fy.max(f32::EPSILON),
-            z_m: *depth,
+        let Some(camera_xyz) = geometry.depth_pixel_to_camera(u as f32, v as f32, *depth) else {
+            continue;
         };
-        let robot = geometry_camera_to_robot(camera, config);
-        let world = transform_point_to_world(camera, projection.frame, pose, orientation, config);
+        let camera = Point3D {
+            x_m: camera_xyz[0],
+            y_m: camera_xyz[1],
+            z_m: camera_xyz[2],
+        };
+        let robot = if kinect.geometry_calibration.is_some() {
+            let base = geometry.depth_point_to_base(camera_xyz);
+            Point3D {
+                x_m: base[0],
+                y_m: base[1],
+                z_m: base[2],
+            }
+        } else {
+            geometry_camera_to_robot(camera, config)
+        };
+        let world =
+            transform_point_to_world(robot, PointCloudFrame::RobotBase, pose, orientation, config);
         let render = Point3D {
             x_m: robot.y_m,
             y_m: robot.z_m,
@@ -355,6 +381,7 @@ async fn generate_geometry_debug_report(args: &GeometryDebugArgs) -> Result<Geom
         ));
     }
     let sensor_truth = sensor_truth_report(
+        snapshot,
         projection.source_is_fallback,
         &timestamp_diagnostics,
         &imu_interpretation,
@@ -367,8 +394,28 @@ async fn generate_geometry_debug_report(args: &GeometryDebugArgs) -> Result<Geom
             hard_failures.push(format!("{}: {}", gate.name, gate.detail));
         }
     }
+    let (camera_forward_m, camera_left_m, camera_height_m, camera_rotation_rpy) = kinect
+        .geometry_calibration
+        .map(|calibration| {
+            (
+                calibration.depth_to_base.translation_m[0],
+                calibration.depth_to_base.translation_m[1],
+                calibration.depth_to_base.translation_m[2],
+                calibration.depth_to_base.rotation_rpy_rad,
+            )
+        })
+        .unwrap_or((
+            config.camera_forward_m,
+            config.camera_left_m,
+            config.camera_height_m,
+            [
+                config.camera_roll_rad,
+                config.camera_pitch_rad,
+                config.camera_yaw_rad,
+            ],
+        ));
     Ok(GeometryDebugReport {
-        schema_version: 1,
+        schema_version: 2,
         input_source: input.source,
         frame_index: record.index,
         t_ms: record.t_ms,
@@ -390,12 +437,15 @@ async fn generate_geometry_debug_report(args: &GeometryDebugArgs) -> Result<Geom
             sample_stride,
         },
         calibration_extrinsics: GeometryExtrinsics {
-            camera_height_m: config.camera_height_m,
-            camera_forward_m: config.camera_forward_m,
-            camera_pitch_rad: config.camera_pitch_rad,
-            camera_roll_rad: config.camera_roll_rad,
-            camera_yaw_rad: config.camera_yaw_rad,
-            rotation_order: "camera -> base [z,-x,-y], then pitch, roll, yaw, then translate".to_string(),
+            camera_height_m,
+            camera_forward_m,
+            camera_left_m,
+            camera_pitch_rad: camera_rotation_rpy[1],
+            camera_roll_rad: camera_rotation_rpy[0],
+            camera_yaw_rad: camera_rotation_rpy[2],
+            rotation_order:
+                "calibrated source roll, pitch, yaw, then destination-frame translation"
+                    .to_string(),
             base_mapping: "Kinect camera +x right, +y down, +z forward -> robot +x forward, +y left, +z up".to_string(),
         },
         imu_orientation: imu_interpretation,
@@ -505,7 +555,6 @@ struct GeometryProjection {
     fy: f32,
     cx: f32,
     cy: f32,
-    frame: PointCloudFrame,
     source: String,
     source_is_fallback: bool,
 }
@@ -521,7 +570,6 @@ fn geometry_projection(kinect: &KinectSense, warnings: &mut Vec<String>) -> Geom
             fy: positive_depth_or(kinect.depth_fy, 591.0),
             cx: positive_depth_or(kinect.depth_cx, (width as f32 - 1.0) * 0.5),
             cy: positive_depth_or(kinect.depth_cy, (height as f32 - 1.0) * 0.5),
-            frame: PointCloudFrame::KinectCamera,
             source: if kinect.depth_fx > 0.0 && kinect.depth_fy > 0.0 {
                 "real_intrinsics".to_string()
             } else {
@@ -542,13 +590,13 @@ fn geometry_projection(kinect: &KinectSense, warnings: &mut Vec<String>) -> Geom
         fy: width as f32,
         cx: (width as f32 - 1.0) * 0.5,
         cy: (kinect.depth_m.len().div_ceil(width).max(1) as f32 - 1.0) * 0.5,
-        frame: PointCloudFrame::DepthImageUnknown,
         source: "fallback_legacy_square_projection".to_string(),
         source_is_fallback: true,
     }
 }
 
 fn sensor_truth_report(
+    snapshot: &WorldSnapshot,
     depth_projection_is_fallback: bool,
     timestamps: &GeometryTimestampDiagnostics,
     imu: &GeometryImuInterpretation,
@@ -596,7 +644,8 @@ fn sensor_truth_report(
     });
     let body_age_ok = timestamps
         .body_last_update_age_ms
-        .is_some_and(|age| age <= args.max_body_timestamp_age_ms);
+        .is_some_and(|age| age <= args.max_body_timestamp_age_ms)
+        && !timestamps.body_timestamp_in_future;
     gates.push(SensorTruthGate {
         name: "body_timestamp_fresh".to_string(),
         status: if body_age_ok {
@@ -605,8 +654,10 @@ fn sensor_truth_report(
             SensorTruthStatus::Fail
         },
         detail: format!(
-            "body_last_update_age_ms={:?}, threshold={}",
-            timestamps.body_last_update_age_ms, args.max_body_timestamp_age_ms
+            "body_last_update_age_ms={:?}, future={}, threshold={}",
+            timestamps.body_last_update_age_ms,
+            timestamps.body_timestamp_in_future,
+            args.max_body_timestamp_age_ms
         ),
     });
     gates.push(SensorTruthGate {
@@ -621,7 +672,44 @@ fn sensor_truth_report(
             timestamps.depth_frame_count, args.min_depth_frames
         ),
     });
+    let camera_calibrated = snapshot
+        .kinect
+        .geometry_calibration
+        .is_some_and(|calibration| calibration.physical_validation_ready());
+    gates.push(SensorTruthGate {
+        name: "camera_geometry_calibrated".to_string(),
+        status: if camera_calibrated {
+            SensorTruthStatus::Pass
+        } else {
+            SensorTruthStatus::Fail
+        },
+        detail: "requires measured depth intrinsics/distortion, depth scale, full depth-to-base and RGB-D extrinsics, four 0.5-3.0m validation distances, <=2cm plane error, and <=3px RGB-D boundary error".to_string(),
+    });
+    let rgbd_skew_ms = snapshot.kinect.color_frame.as_ref().map(|color| {
+        color
+            .captured_at_ms
+            .abs_diff(snapshot.kinect.captured_at_ms)
+    });
+    let rgbd_paired = snapshot.kinect.color_frame.as_ref().is_some_and(|color| {
+        color.rgbd_frame_id.is_some()
+            && color.rgbd_frame_id == snapshot.kinect.rgbd_frame_id
+            && rgbd_skew_ms.is_some_and(|skew| skew <= args.max_rgbd_skew_ms)
+    });
+    gates.push(SensorTruthGate {
+        name: "rgb_depth_paired".to_string(),
+        status: if rgbd_paired {
+            SensorTruthStatus::Pass
+        } else {
+            SensorTruthStatus::Fail
+        },
+        detail: format!(
+            "shared_frame_id={}, capture_skew_ms={rgbd_skew_ms:?}, threshold={}",
+            snapshot.kinect.rgbd_frame_id.is_some(),
+            args.max_rgbd_skew_ms
+        ),
+    });
     let kinect_fresh = timestamps.kinect_capture_timestamp_present
+        && !timestamps.kinect_timestamp_in_future
         && timestamps
             .kinect_capture_age_ms
             .is_some_and(|age| age <= args.max_kinect_timestamp_age_ms);
@@ -633,13 +721,15 @@ fn sensor_truth_report(
             SensorTruthStatus::Fail
         },
         detail: format!(
-            "present={}, age_ms={:?}, threshold={}",
+            "present={}, future={}, age_ms={:?}, threshold={}",
             timestamps.kinect_capture_timestamp_present,
+            timestamps.kinect_timestamp_in_future,
             timestamps.kinect_capture_age_ms,
             args.max_kinect_timestamp_age_ms
         ),
     });
     let imu_fresh = timestamps.imu_capture_timestamp_present
+        && !timestamps.imu_timestamp_in_future
         && timestamps
             .imu_capture_age_ms
             .is_some_and(|age| age <= args.max_imu_timestamp_age_ms);
@@ -651,8 +741,9 @@ fn sensor_truth_report(
             SensorTruthStatus::Fail
         },
         detail: format!(
-            "present={}, age_ms={:?}, threshold={}",
+            "present={}, future={}, age_ms={:?}, threshold={}",
             timestamps.imu_capture_timestamp_present,
+            timestamps.imu_timestamp_in_future,
             timestamps.imu_capture_age_ms,
             args.max_imu_timestamp_age_ms
         ),
@@ -672,6 +763,23 @@ fn sensor_truth_report(
         detail: format!(
             "capture_skew_ms={:?}, threshold={}",
             timestamps.kinect_imu_skew_ms, args.max_kinect_imu_skew_ms
+        ),
+    });
+    let pose_synchronized = kinect_fresh
+        && body_age_ok
+        && timestamps
+            .kinect_body_skew_ms
+            .is_some_and(|skew| skew <= args.max_kinect_body_skew_ms);
+    gates.push(SensorTruthGate {
+        name: "kinect_body_pose_synchronized".to_string(),
+        status: if pose_synchronized {
+            SensorTruthStatus::Pass
+        } else {
+            SensorTruthStatus::Fail
+        },
+        detail: format!(
+            "capture_skew_ms={:?}, threshold={}",
+            timestamps.kinect_body_skew_ms, args.max_kinect_body_skew_ms
         ),
     });
     let imu_ready = imu.contract_known && imu.roll_pitch_correction_active;
@@ -747,7 +855,8 @@ fn geometry_timestamp_diagnostics(
         frame_timestamps_monotonic,
         median_frame_dt_ms,
         max_frame_dt_ms,
-        body_last_update_age_ms: Some(selected.t_ms.saturating_sub(snapshot.body.last_update_ms)),
+        body_last_update_age_ms: selected.t_ms.checked_sub(snapshot.body.last_update_ms),
+        body_timestamp_in_future: snapshot.body.last_update_ms > selected.t_ms,
         eye_frame_age_ms: snapshot
             .eye_frame
             .as_ref()
@@ -758,13 +867,26 @@ fn geometry_timestamp_diagnostics(
             .map(|frame| selected.t_ms.saturating_sub(frame.captured_at_ms)),
         kinect_capture_timestamp_present: snapshot.kinect.captured_at_ms > 0,
         kinect_capture_age_ms: (snapshot.kinect.captured_at_ms > 0)
-            .then(|| selected.t_ms.abs_diff(snapshot.kinect.captured_at_ms)),
+            .then(|| selected.t_ms.checked_sub(snapshot.kinect.captured_at_ms))
+            .flatten(),
+        kinect_timestamp_in_future: snapshot.kinect.captured_at_ms > selected.t_ms,
         imu_capture_timestamp_present: snapshot.imu.captured_at_ms > 0,
         imu_capture_age_ms: (snapshot.imu.captured_at_ms > 0)
-            .then(|| selected.t_ms.abs_diff(snapshot.imu.captured_at_ms)),
+            .then(|| selected.t_ms.checked_sub(snapshot.imu.captured_at_ms))
+            .flatten(),
+        imu_timestamp_in_future: snapshot.imu.captured_at_ms > selected.t_ms,
         kinect_imu_skew_ms: (snapshot.kinect.captured_at_ms > 0
             && snapshot.imu.captured_at_ms > 0)
             .then(|| snapshot.kinect.captured_at_ms.abs_diff(snapshot.imu.captured_at_ms)),
+        kinect_body_skew_ms: snapshot
+            .kinect
+            .fusion_alignment
+            .as_ref()
+            .map(|alignment| alignment.pose_sample_skew_ms)
+            .or_else(|| {
+                (snapshot.kinect.captured_at_ms > 0 && snapshot.body.last_update_ms > 0)
+                    .then(|| snapshot.kinect.captured_at_ms.abs_diff(snapshot.body.last_update_ms))
+            }),
         note: "KinectSense and ImuSense carry individual capture timestamps when produced by current sensor providers; old captures may deserialize as 0 and fail these gates".to_string(),
     }
 }

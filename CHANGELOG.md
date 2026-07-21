@@ -21,9 +21,14 @@ All notable changes are grouped by date.
 
 - Integrate legacy cumulative physical odometry as stateful SE(2) deltas,
   require measured scan/submap registration for live loop constraints, publish
-  the runtime map as the dashboard's canonical map, keep unwarped corrected-run
-  3D voxels explicitly untrusted, and gate physical SLAM on fresh synchronized
+  the runtime map as the dashboard's canonical map, rebuild retained 3D depth
+  observations through corrected graph poses, and gate physical SLAM on fresh synchronized
   multi-frame Kinect/IMU evidence plus return-to-start quality metrics.
+- Pair Kinect RGB and depth atomically on the mapped device clock, interpolate
+  body pose and filtered calibrated IMU orientation to depth exposure time,
+  reproject color through measured RGB-D intrinsics/extrinsics, add full camera
+  translation and LFCD2 beam motion de-skew, and reject future, stale,
+  unsynchronized, or nominal-only physical calibration evidence.
 - Integrate Brainstem Create distance/angle deltas into coherent planar pose,
   carry that pose through JSON and compact status into runtime body sensing, and
   enable the Pico W hardware watchdog from the runtime safety lane with a

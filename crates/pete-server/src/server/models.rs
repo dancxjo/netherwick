@@ -29,6 +29,8 @@ pub struct SceneSensorCalibration {
     #[serde(default)]
     pub camera_forward_m: f32,
     #[serde(default)]
+    pub camera_left_m: f32,
+    #[serde(default)]
     pub camera_height_m: f32,
     #[serde(default)]
     pub camera_pitch_rad: f32,
@@ -52,6 +54,7 @@ impl SceneSensorCalibration {
             depth_forward_offset_m: 0.0,
             depth_pitch_down_rad: 0.0,
             camera_forward_m: 0.0,
+            camera_left_m: 0.0,
             camera_height_m: 0.18,
             camera_pitch_rad: 0.0,
             camera_roll_rad: 0.0,
@@ -75,6 +78,10 @@ impl SceneSensorCalibration {
         } else {
             self.point_y_m
         }
+    }
+
+    fn depth_camera_left_m(self) -> f32 {
+        self.camera_left_m
     }
 
     fn depth_camera_pitch_rad(self) -> f32 {

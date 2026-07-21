@@ -610,6 +610,8 @@ impl SenseProducer for MockEyeProducer {
         let base = (self.tick % 16) as f32 / 16.0;
         let b = (base * 255.0).round() as u8;
         Ok(SensePacket::EyeFrame(EyeFrame {
+            rgbd_frame_id: None,
+            device_timestamp_ms: None,
             captured_at_ms: Utc::now().timestamp_millis().max(0) as u64,
             width: 2,
             height: 2,
@@ -1234,4 +1236,3 @@ fn join_or_none(items: &[String]) -> String {
         items.join(", ")
     }
 }
-

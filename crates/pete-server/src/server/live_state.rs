@@ -142,11 +142,7 @@ impl LiveViewState {
         self.update_with_runtime_map(snapshot, None);
     }
 
-    pub fn update_with_runtime_map(
-        &self,
-        snapshot: WorldSnapshot,
-        runtime_map: Option<&LocalMap>,
-    ) {
+    pub fn update_with_runtime_map(&self, snapshot: WorldSnapshot, runtime_map: Option<&LocalMap>) {
         let now = snapshot.to_now(snapshot.body.last_update_ms);
         let mut map = self.map.lock().expect("live map mutex poisoned");
         if let Some(runtime_map) = runtime_map {
@@ -165,6 +161,9 @@ impl LiveViewState {
                 .expect("live point cloud mutex poisoned");
             if apply_live_point_cloud_calibration(&mut cloud, calibration, &snapshot) {
                 cloud.observe_snapshot(&snapshot, snapshot.body.last_update_ms);
+                if let Some(runtime_map) = runtime_map {
+                    cloud.rebuild_from_pose_graph(runtime_map);
+                }
             } else {
                 reset_point_cloud(&mut cloud);
             }
@@ -341,11 +340,26 @@ impl LiveViewState {
             calibration.compact_depth_fov_rad,
             calibration.depth_scale,
         );
-        let mut perception = SceneSurfacePerception::from(extractor.process(
-            &snapshot.kinect,
-            snapshot.body.odometry,
-            snapshot.body.last_update_ms,
-        ));
+        let alignment = snapshot.kinect.fusion_alignment.as_ref();
+        let pose = alignment
+            .map(|alignment| alignment.pose)
+            .unwrap_or(snapshot.body.odometry);
+        let imu = alignment
+            .map(|alignment| &alignment.imu)
+            .unwrap_or(&snapshot.imu);
+        let orientation = pete_now::trusted_imu_orientation(imu);
+        let mut perception = SceneSurfacePerception::from(
+            extractor.process_with_orientation(
+                &snapshot.kinect,
+                pose,
+                orientation.roll_rad,
+                orientation.pitch_rad,
+                snapshot
+                    .kinect
+                    .captured_at_ms
+                    .max(snapshot.body.last_update_ms),
+            ),
+        );
         if let Some(action) = action {
             let frames = pete_sensors::anticipate_surfaces(
                 &pete_sensors::SurfaceExtractorOutput {
@@ -464,6 +478,9 @@ fn apply_live_point_cloud_calibration(
     if snapshot.kinect.depth_m.is_empty() {
         return true;
     }
+    if snapshot.kinect.geometry_calibration.is_some() {
+        return true;
+    }
     let full_depth_image = snapshot.kinect.depth_width > 0 && snapshot.kinect.depth_height > 0;
     let Some(calibration) = calibration else {
         return !full_depth_image;
@@ -472,6 +489,7 @@ fn apply_live_point_cloud_calibration(
     let previous = cloud.config;
     cloud.config.camera_height_m = calibration.depth_camera_height_m();
     cloud.config.camera_forward_m = calibration.depth_camera_forward_m();
+    cloud.config.camera_left_m = calibration.depth_camera_left_m();
     cloud.config.camera_pitch_rad = calibration.depth_camera_pitch_rad();
     cloud.config.camera_roll_rad = calibration.camera_roll_rad;
     cloud.config.camera_yaw_rad = calibration.camera_yaw_rad;
@@ -489,18 +507,14 @@ fn point_cloud_extrinsics_changed(
     const EPS: f32 = 1.0e-4;
     (previous.camera_height_m - current.camera_height_m).abs() > EPS
         || (previous.camera_forward_m - current.camera_forward_m).abs() > EPS
+        || (previous.camera_left_m - current.camera_left_m).abs() > EPS
         || (previous.camera_pitch_rad - current.camera_pitch_rad).abs() > EPS
         || (previous.camera_roll_rad - current.camera_roll_rad).abs() > EPS
         || (previous.camera_yaw_rad - current.camera_yaw_rad).abs() > EPS
 }
 
 fn reset_point_cloud(cloud: &mut VoxelPointCloud) {
-    cloud.voxels.clear();
-    cloud.observations = 0;
-    cloud.raw_points_seen = 0;
-    cloud.orientation_status = Default::default();
-    cloud.last_kinect_capture_ms = None;
-    cloud.last_range_capture_ms = None;
+    *cloud = VoxelPointCloud::new(cloud.config);
 }
 
 fn default_behavior_nodes() -> Vec<BehaviorNodeState> {
