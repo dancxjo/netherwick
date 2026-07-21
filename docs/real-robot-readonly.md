@@ -93,6 +93,13 @@ select a specific cognition policy, or `--llm-provider disabled` to isolate the
 physical sensors. `just possess-sensorium-rpi5` selects the same sensorium
 profile over the local RPi 5 brainstem backend.
 
+Both direct-RPi recipes default to `--wheels-off-floor` because the local
+Brainstem process has no watchdog independent of the RPi 5. To authorize floor
+motion despite that reduced safety class, use the deliberately specific
+`--acknowledge-no-independent-watchdog` flag and provide an external hard stop
+that removes drive power. See [RPi 5 direct Create brainstem](029-rpi5-direct-brainstem.md)
+for the residual whole-Pi freeze failure mode and the dashboard/capture evidence.
+
 A successful sensorium run proves only the inputs that initialization reports
 as active and the behaviors actually exercised during that run. For example,
 an open microphone alone is not proof that a hotword or speech episode reached

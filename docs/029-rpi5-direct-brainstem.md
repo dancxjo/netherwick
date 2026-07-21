@@ -21,6 +21,15 @@ Brainstem process continues enforcing command TTLs, heartbeat expiry, sensor
 latches, contact withdrawal, Full-mode freshness, and STOP. Loopback transport
 does not grant authority; the normal session and possession lease still apply.
 
+That process boundary is not an independent watchdog. Brainstem and
+Motherbrain still share the RPi 5 kernel, scheduler, power, and hardware. A
+whole-Pi freeze after a nonzero Create drive command can prevent both the next
+renewal and the STOP that would normally end it; Create OI can retain that last
+drive command. The direct-RPi contract therefore advertises
+`independent_watchdog=false` and is a reduced safety class compared with the
+Pico W brainstem, whose hardware watchdog continues to supervise the body when
+Motherbrain or its host fails.
+
 ## Cable and electrical boundary
 
 Use the iRobot Create serial cable, or an equivalent cable that explicitly
@@ -63,6 +72,24 @@ In another terminal, verify the unchanged Cockpit contract and then possess:
 just brainstem-rpi5-check
 just possess-rpi5
 ```
+
+The direct-RPi recipes declare `--wheels-off-floor` by default. Autonomous
+motion on the physical floor is refused unless the operator replaces that
+declaration with the explicit residual-risk acknowledgement:
+
+```sh
+just possess-rpi5 --acknowledge-no-independent-watchdog
+```
+
+Use that floor-motion form only with an independent, immediately reachable
+external hard stop that removes drive power, such as a latching battery
+disconnect installed for the robot. Do not count the RPi process supervisor,
+network access, keyboard interrupt, or Create OI STOP command as independent:
+all depend on software or hardware implicated in the residual failure mode.
+The launcher prints the reduced class, the live dashboard session reports
+`safety_class=reduced-shared-host` and `independent_watchdog=false`, and real
+capture manifests record the same classification plus the selected motion
+surface and acknowledgement state.
 
 That command is deliberately body-only. After it succeeds, exercise configured
 higher senses through the same local Brainstem and possession safeguards with:
@@ -117,7 +144,7 @@ group need the corresponding local adjustment.
 With the wheels lifted clear of the floor:
 
 1. `just brainstem-rpi5-check` reports the Create body contract without
-   power-toggle or IMU capabilities.
+   power-toggle or IMU capabilities and with `independent_watchdog=false`.
 2. Status advances `create_rx_packets` and `create_body_packets`, and OI mode
    reaches `full`.
 3. A 125 ms velocity pulse stops at its TTL without a possessor STOP.
