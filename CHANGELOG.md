@@ -9,8 +9,9 @@ All notable changes are grouped by date.
 - Add Brainstem-owned Solresol auditory annunciation with typed hazard,
   control, power, health, recovery, docking, and service cues; bounded
   urgent/informational scheduling; transition deduplication; playback
-  observability; and transport-compatible `pete-cockpit audio
-  silent|audible` control that never changes safety behavior.
+  observability; transport-compatible `pete-cockpit audio silent|audible`
+  control; and a status-synchronized silent-mode toggle in the embedded browser
+  pilot panel, neither of which changes safety behavior.
 - Add a deterministic seven-case social acceptance exam spanning simulator
   perception, canonical social/temporal/epistemic state, sleep interruption,
   asynchronous cognition delay, and forebrain failure, with a `just
