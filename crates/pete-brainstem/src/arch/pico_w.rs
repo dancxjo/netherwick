@@ -2690,7 +2690,10 @@ fn command_requires_session(command: BrainstemCommand) -> bool {
 }
 fn command_requires_authority(command: BrainstemCommand) -> bool {
     command_requires_session(command)
-        && !matches!(command, BrainstemCommand::Disarm)
+        && !matches!(
+            command,
+            BrainstemCommand::Disarm | BrainstemCommand::SetAudioSilent { .. }
+        )
         && !matches!(
             command,
             BrainstemCommand::RequestSensors { .. } | BrainstemCommand::StreamSensors { .. }

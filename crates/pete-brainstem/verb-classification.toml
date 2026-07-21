@@ -80,7 +80,7 @@ lifecycle = "typed command and sensor events"
 exposed = true
 
 [[verbs]]
-names = ["song_define", "song_play", "define_chirp", "play_feedback", "set_silent", "set_lights"]
+names = ["song_define", "song_play", "define_chirp", "play_feedback", "set_lights"]
 category = "body-native"
 authority = "control lease"
 sensors = "responsive Create OI"
@@ -88,6 +88,17 @@ bounds = "fixed slots, tone count, and output ranges"
 preempted_by = "transport/session loss"
 owner = "brainstem"
 lifecycle = "typed command and feedback events"
+exposed = true
+
+[[verbs]]
+names = ["set_silent"]
+category = "body-native"
+authority = "session"
+sensors = "none"
+bounds = "boolean audio preference"
+preempted_by = "transport/session loss"
+owner = "brainstem"
+lifecycle = "typed command and audio state events"
 exposed = true
 
 [[verbs]]

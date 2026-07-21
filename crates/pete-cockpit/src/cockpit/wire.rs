@@ -217,6 +217,7 @@ impl CockpitRequest {
             | Self::AcquireServiceLease { .. }
             | Self::RequestSensors { .. }
             | Self::StreamSensors { .. }
+            | Self::SetAudioSilent { .. }
             | Self::Disarm => AuthorizationClass::Session,
             Self::Bootsel | Self::RestartCreate | Self::ResetMotherbrain => {
                 AuthorizationClass::ServiceLease
@@ -1096,4 +1097,3 @@ pub struct BrowserBridgeEnvelope {
     pub command_id: u32,
     pub request: CockpitRequest,
 }
-

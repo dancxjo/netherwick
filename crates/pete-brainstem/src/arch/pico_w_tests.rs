@@ -57,6 +57,16 @@
     }
 
     #[test]
+    fn silent_mode_requires_a_session_but_not_control_authority() {
+        let command = BrainstemCommand::SetAudioSilent {
+            silent: true,
+            seq: 104,
+        };
+        assert!(command_requires_session(command));
+        assert!(!command_requires_authority(command));
+    }
+
+    #[test]
     fn compact_get_events_requires_a_numeric_cursor() {
         assert!(matches!(
             parse_forebrain_uart_command("GET_EVENTS 103 491"),

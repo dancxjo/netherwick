@@ -896,6 +896,10 @@ fn authorization_classes_separate_emergency_control_and_service() {
         .authorization_class(),
         AuthorizationClass::Session
     );
+    assert_eq!(
+        CockpitRequest::SetAudioSilent { silent: true }.authorization_class(),
+        AuthorizationClass::Session
+    );
     for request in [
         CockpitRequest::Bootsel,
         CockpitRequest::RestartCreate,
@@ -1135,6 +1139,61 @@ fn simulator_audio_state_round_trips_through_status_and_events() {
         sim.get_status().unwrap().summary().audio_silent,
         Some(false)
     );
+}
+
+#[test]
+fn audio_session_toggle_preserves_motherbrain_lease_and_active_motion() {
+    let mut sim = SimCockpit::new();
+    let mother = sim.handshake(hello()).unwrap();
+    let mother_lease = match sim
+        .execute_in_session(
+            &mother.session,
+            CockpitRequest::AcquireControlLease {
+                authority: ControlAuthority::Motherbrain,
+                ttl_ms: 1_000,
+            },
+        )
+        .unwrap()
+    {
+        CockpitResponse::ControlLeaseGranted(lease) => lease,
+        other => panic!("{other:?}"),
+    };
+    sim.execute_with_lease(&mother.session, &mother_lease, CockpitRequest::Arm)
+        .unwrap();
+    sim.execute_with_lease(
+        &mother.session,
+        &mother_lease,
+        CockpitRequest::CmdVel {
+            linear_mm_s: 100,
+            angular_mrad_s: 0,
+            ttl_ms: 1_000,
+        },
+    )
+    .unwrap();
+
+    let operator = sim
+        .handshake(HandshakeHello::operator("operator-laptop"))
+        .unwrap();
+    sim.execute_in_session(
+        &operator.session,
+        CockpitRequest::SetAudioSilent { silent: true },
+    )
+    .unwrap();
+
+    let status = sim.get_status().unwrap();
+    assert_eq!(status.summary().armed, Some(true));
+    assert_eq!(status.summary().audio_silent, Some(true));
+    assert!(status.raw.contains("active_cmd_vel=true"));
+    sim.execute_with_lease(
+        &mother.session,
+        &mother_lease,
+        CockpitRequest::CmdVel {
+            linear_mm_s: 80,
+            angular_mrad_s: 0,
+            ttl_ms: 1_000,
+        },
+    )
+    .expect("audio preference must not replace the motherbrain control lease");
 }
 
 #[test]

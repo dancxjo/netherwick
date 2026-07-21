@@ -113,7 +113,6 @@ fn main() -> Result<()> {
         }
         Command::Audio { mode } => {
             let silent = matches!(mode, AudioCommand::Silent);
-            session.acquire_control(ControlAuthority::OperatorDebug, 10_000)?;
             accepted(session.execute(CockpitRequest::SetAudioSilent { silent })?)?;
             let status = read_status(&mut session)?;
             if status.audio_silent != Some(silent) {

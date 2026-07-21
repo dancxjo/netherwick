@@ -377,7 +377,10 @@ fn command_requires_session(command: BrainstemCommand) -> bool {
 
 fn command_requires_authority(command: BrainstemCommand) -> bool {
     command_requires_session(command)
-        && !matches!(command, BrainstemCommand::Disarm)
+        && !matches!(
+            command,
+            BrainstemCommand::Disarm | BrainstemCommand::SetAudioSilent { .. }
+        )
         && !matches!(
             command,
             BrainstemCommand::RequestSensors { .. } | BrainstemCommand::StreamSensors { .. }
@@ -848,6 +851,16 @@ mod tests {
                 }
             ))
         ));
+    }
+
+    #[test]
+    fn silent_mode_requires_a_session_but_not_control_authority() {
+        let command = BrainstemCommand::SetAudioSilent {
+            silent: true,
+            seq: 9,
+        };
+        assert!(command_requires_session(command));
+        assert!(!command_requires_authority(command));
     }
 
     #[test]

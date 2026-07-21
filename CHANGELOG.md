@@ -18,6 +18,8 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Make audio silent-mode changes session-authorized so cockpit preference
+  toggles cannot replace a motherbrain control lease or interrupt active motion.
 - Honor a cognition provider's declared availability before scheduling work, so
   a disabled forebrain is immediately represented as unavailable while local
   control continues without generating background requests.
