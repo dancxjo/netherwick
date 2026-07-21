@@ -54,6 +54,9 @@ All notable changes are grouped by date.
   bounded velocity refreshes and could create stop gaps.
 - Make brainstem contact withdrawal react to an asserted bumper state without
   requiring a new edge or forward wheel output.
+- Add calibrated 3D world point-cloud projection metadata to the live map API:
+  emit a new `world_projection` payload with source attribution, coordinate
+  frame, trust gates, reasons, and per-cell stability/confidence/age data.
 
 ### Auto-sync (2026-07-15)
 

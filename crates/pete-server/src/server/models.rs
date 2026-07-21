@@ -223,11 +223,40 @@ pub struct LiveMapResponse {
     pub current_pose: Option<MapPosePoint>,
     pub range_beams: Vec<MapProjectedBeam>,
     pub cells: Vec<MapViewCell>,
+    pub world_projection: MapWorldProjection,
     pub semantic_cells: Vec<MapSemanticCell>,
     pub events: Vec<MapEventMarker>,
     pub pose_graph: MapPoseGraphSummary,
     pub remap: RemapSummary,
     pub entity_graph: MapEntityGraph,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MapWorldProjection {
+    pub label: &'static str,
+    pub source: &'static str,
+    pub coordinate_frame: &'static str,
+    pub resolution_m: f32,
+    pub aligned_with_3d: bool,
+    pub geometry_trusted: bool,
+    pub navigation_trusted: bool,
+    pub reasons: Vec<String>,
+    pub source_voxels: usize,
+    pub projected_cells: usize,
+    pub stable_cells: usize,
+    pub cells: Vec<MapWorldProjectionCell>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MapWorldProjectionCell {
+    pub x: i32,
+    pub y: i32,
+    pub center_x_m: f32,
+    pub center_y_m: f32,
+    pub confidence: f32,
+    pub age_ms: TimeMs,
+    pub voxel_count: usize,
+    pub stable: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -606,4 +635,3 @@ pub struct CaptureSceneQuery {
     #[serde(default)]
     pub frame: usize,
 }
-

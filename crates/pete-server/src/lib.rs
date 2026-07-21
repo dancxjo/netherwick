@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -25,7 +25,8 @@ use pete_experience::EmbodiedContext;
 use pete_map::{
     orientation_from_imu, project_beam_endpoint, LocalMap, LocalWorldBelief, MapObservation,
     MapSummary, OccupancyCell as OdomMapCell, PointCloudSummary, PoseEdgeSource,
-    PoseGraphOptimizationSummary, RemapSummary, VoxelPoint, VoxelPointCloud, MAP_LABEL,
+    PoseGraphOptimizationSummary, RemapSummary, SlamMode, VoxelPoint, VoxelPointCloud, MAP_LABEL,
+    WORLD_POINT_CLOUD_LABEL,
 };
 use pete_memory::{
     CognitiveDiagnosticsReport, EntityConstellationState, EntityLifecycleState, EntityMemory,

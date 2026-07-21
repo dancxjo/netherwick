@@ -495,9 +495,11 @@ async fn get_live_map(
         .latest()
         .ok_or_else(|| LiveViewError::unavailable("no live world snapshot has arrived yet"))?;
     let map = state.map_snapshot();
+    let point_cloud = state.point_cloud_snapshot();
     let entity_report = state.entity_memory_report();
     Ok(Json(map_response_from_parts(
         &map,
+        &point_cloud,
         &snapshot,
         state.scene_metadata().as_ref(),
         &entity_report,
@@ -561,4 +563,3 @@ async fn get_cognitive_questions(
 ) -> Json<pete_memory::ActiveLearningDiagnostics> {
     Json(state.cognitive_diagnostics_report().active_learning)
 }
-

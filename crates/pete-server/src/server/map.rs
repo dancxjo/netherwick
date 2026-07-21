@@ -1,5 +1,6 @@
 fn map_response_from_parts(
     map: &LocalMap,
+    point_cloud: &VoxelPointCloud,
     latest: &WorldSnapshot,
     metadata: Option<&LiveSceneMetadata>,
     entity_report: &EntityMemoryReport,
@@ -28,6 +29,7 @@ fn map_response_from_parts(
         .values()
         .map(|cell| map_view_cell(cell, map.config.resolution_m, now_ms))
         .collect();
+    let world_projection = map_world_projection(point_cloud, &summary, now_ms);
     let semantic_cells = map_semantic_cells(latest, metadata, now_ms);
     let events = map_event_markers(latest, metadata, now_ms);
     let pose_graph = map_pose_graph_summary(map);
@@ -62,11 +64,120 @@ fn map_response_from_parts(
         current_pose,
         range_beams,
         cells,
+        world_projection,
         semantic_cells,
         events,
         pose_graph,
         remap: map.remap_summary,
         entity_graph,
+    }
+}
+
+const WORLD_PROJECTION_LABEL: &str =
+    "2D obstacle projection of the calibrated 3D odometry-world voxel cloud";
+const WORLD_PROJECTION_MIN_OBSTACLE_Z_M: f32 = 0.05;
+const WORLD_PROJECTION_MAX_OBSTACLE_Z_M: f32 = 2.0;
+const MAX_TRUSTED_BELOW_FLOOR_RATIO: f32 = 0.02;
+
+#[derive(Clone, Copy, Debug)]
+struct ProjectedCellAccumulator {
+    confidence: f32,
+    last_seen_ms: TimeMs,
+    voxel_count: usize,
+    stable: bool,
+}
+
+fn map_world_projection(
+    point_cloud: &VoxelPointCloud,
+    map_summary: &MapSummary,
+    now_ms: TimeMs,
+) -> MapWorldProjection {
+    let resolution_m = map_summary.resolution_m;
+    let points = point_cloud.points();
+    let source_voxels = points.len();
+    let below_floor_count = points
+        .iter()
+        .filter(|point| point.position.z_m < -WORLD_PROJECTION_MIN_OBSTACLE_Z_M)
+        .count();
+    let below_floor_ratio = if source_voxels == 0 {
+        0.0
+    } else {
+        below_floor_count as f32 / source_voxels as f32
+    };
+    let mut projected = BTreeMap::<(i32, i32), ProjectedCellAccumulator>::new();
+    for point in points.iter().filter(|point| {
+        point.position.z_m >= WORLD_PROJECTION_MIN_OBSTACLE_Z_M
+            && point.position.z_m <= WORLD_PROJECTION_MAX_OBSTACLE_Z_M
+            && !point.transient
+    }) {
+        let key = (
+            (point.position.x_m / resolution_m).floor() as i32,
+            (point.position.y_m / resolution_m).floor() as i32,
+        );
+        let cell = projected.entry(key).or_insert(ProjectedCellAccumulator {
+            confidence: 0.0,
+            last_seen_ms: 0,
+            voxel_count: 0,
+            stable: false,
+        });
+        cell.confidence = cell.confidence.max(point.confidence);
+        cell.last_seen_ms = cell.last_seen_ms.max(point.last_seen_ms);
+        cell.voxel_count = cell.voxel_count.saturating_add(1);
+        cell.stable |= point.stable;
+    }
+    let cells = projected
+        .into_iter()
+        .map(|((x, y), cell)| MapWorldProjectionCell {
+            x,
+            y,
+            center_x_m: (x as f32 + 0.5) * resolution_m,
+            center_y_m: (y as f32 + 0.5) * resolution_m,
+            confidence: cell.confidence,
+            age_ms: now_ms.saturating_sub(cell.last_seen_ms),
+            voxel_count: cell.voxel_count,
+            stable: cell.stable,
+        })
+        .collect::<Vec<_>>();
+    let stable_cells = cells.iter().filter(|cell| cell.stable).count();
+    let aligned_with_3d = point_cloud.observations > 0 && !cells.is_empty();
+    let navigation_trusted = map_summary.slam_status.mode == SlamMode::LoopClosedPoseGraph;
+    let mut reasons = Vec::new();
+    if point_cloud.observations == 0 {
+        reasons.push("no calibrated 3D world observations have arrived".to_string());
+    } else if cells.is_empty() {
+        reasons.push("the shared 3D world has no projectable obstacle voxels".to_string());
+    }
+    if below_floor_ratio > MAX_TRUSTED_BELOW_FLOOR_RATIO {
+        reasons.push(format!(
+            "below-floor voxel ratio {below_floor_ratio:.3} exceeds {MAX_TRUSTED_BELOW_FLOOR_RATIO:.3}"
+        ));
+    }
+    if stable_cells == 0 && !cells.is_empty() {
+        reasons.push("the projection has no repeatedly observed stable cells yet".to_string());
+    }
+    if !navigation_trusted {
+        reasons.push(format!(
+            "navigation remains gated while SLAM mode is {:?}",
+            map_summary.slam_status.mode
+        ));
+    }
+    let geometry_trusted = aligned_with_3d
+        && below_floor_ratio <= MAX_TRUSTED_BELOW_FLOOR_RATIO
+        && stable_cells > 0;
+
+    MapWorldProjection {
+        label: WORLD_PROJECTION_LABEL,
+        source: WORLD_POINT_CLOUD_LABEL,
+        coordinate_frame: "odometry_world",
+        resolution_m,
+        aligned_with_3d,
+        geometry_trusted,
+        navigation_trusted,
+        reasons,
+        source_voxels,
+        projected_cells: cells.len(),
+        stable_cells,
+        cells,
     }
 }
 
@@ -967,4 +1078,3 @@ fn map_event_at_pose(
         label: None,
     }
 }
-
