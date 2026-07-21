@@ -71,6 +71,33 @@ With the wheels off the floor:
 just possess
 ```
 
+`just possess` is the first-stage, body-control profile. It deliberately forces
+Kinect, V4L camera, microphone, GPS, local IMU, and the LLM provider off. It
+therefore validates BodySense, Now, the drives and conductor, safety/autonomic
+vetoes, goals, Lua skills, possessor recovery, motion gating, ledger/capture,
+and brainstem events, but it does not validate the higher-sense paths.
+
+Once that path succeeds, use the second-stage profile:
+
+```bash
+just possess-sensorium
+```
+
+This enters the same guarded possession path while restoring normal configured
+sensor discovery: Kinect RGB/depth by default (set `PETE_KINECT_DEPTH=0` to use
+`CAMERA_DEVICE` through V4L), `MIC_DEVICE`, `GPS_SERIAL_PORT`, `IMU_DEVICE` or a
+discovered supported local IMU, and Ollama-backed cognition. Individual inputs
+remain best effort unless their matching `--require-camera`, `--require-mic`,
+`--require-gps`, or `--require-imu` flag is passed. Use `--llm-config PATH` to
+select a specific cognition policy, or `--llm-provider disabled` to isolate the
+physical sensors. `just possess-sensorium-rpi5` selects the same sensorium
+profile over the local RPi 5 brainstem backend.
+
+A successful sensorium run proves only the inputs that initialization reports
+as active and the behaviors actually exercised during that run. For example,
+an open microphone alone is not proof that a hotword or speech episode reached
+the runtime.
+
 The recipe requires `PETE_BRAINSTEM_DEVICE_ID` in `.env`;
 `PETE_COCKPIT_PORT` may pin the `/dev/serial/by-id/DEVICE` path. On a boot-ID
 mismatch, it accepts the newly observed boot only after the device-ID check has

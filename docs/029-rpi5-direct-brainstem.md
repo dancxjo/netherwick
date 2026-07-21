@@ -64,6 +64,16 @@ just brainstem-rpi5-check
 just possess-rpi5
 ```
 
+That command is deliberately body-only. After it succeeds, exercise configured
+higher senses through the same local Brainstem and possession safeguards with:
+
+```bash
+just possess-sensorium-rpi5
+```
+
+See `docs/real-robot-readonly.md` for sensor selection, required-sensor flags,
+and the evidence boundary of a successful sensorium run.
+
 The first local possession reads the RPi-derived Brainstem identity and current
 Linux boot identity, then pins them in `.env`. A different RPi 5 identity still
 requires the existing explicit replacement acceptance.

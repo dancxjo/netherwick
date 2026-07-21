@@ -1,6 +1,7 @@
 use super::{
     boot_identity_mismatch, bootsel_host, evolution_dataset_files, long_option_value,
-    neat_generation_limit, prefixed_value, terminal_title_text, Cli,
+    neat_generation_limit, possession_sense_args, possession_sense_overrides, prefixed_value,
+    terminal_title_text, Cli, PossessionSenseProfile,
 };
 use clap::Parser;
 use std::fs;
@@ -60,6 +61,7 @@ fn public_alias_commands_remain_parseable() {
         "check",
         "flash",
         "possess",
+        "possess-sensorium",
         "go",
         "train",
         "evolve-infinite",
@@ -80,4 +82,40 @@ fn possession_tick_override_accepts_split_and_joined_forms() {
         Some("8")
     );
     assert_eq!(long_option_value(&[], "--tick-ms"), None);
+}
+
+#[test]
+fn possession_profiles_keep_body_only_off_and_sensorium_opted_in() {
+    let body_args = possession_sense_args(PossessionSenseProfile::BodyOnly, &[]);
+    assert_eq!(
+        body_args,
+        [
+            "--imu",
+            "none",
+            "--gps",
+            "none",
+            "--llm-provider",
+            "disabled"
+        ]
+    );
+    assert_eq!(
+        possession_sense_overrides(PossessionSenseProfile::BodyOnly).len(),
+        5
+    );
+
+    assert_eq!(
+        possession_sense_args(PossessionSenseProfile::Sensorium, &[]),
+        ["--llm-provider", "ollama"]
+    );
+    assert!(possession_sense_overrides(PossessionSenseProfile::Sensorium).is_empty());
+    assert!(possession_sense_args(
+        PossessionSenseProfile::Sensorium,
+        &["--llm-provider=disabled".to_owned()]
+    )
+    .is_empty());
+    assert!(possession_sense_args(
+        PossessionSenseProfile::Sensorium,
+        &["--llm-config".to_owned(), "config.toml".to_owned()]
+    )
+    .is_empty());
 }

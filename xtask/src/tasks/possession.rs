@@ -194,7 +194,26 @@ fn optional_arg(command: &mut Vec<String>, env_name: &str, default: &str, flag: 
     }
 }
 
-fn possess(args: &[String]) -> Result<()> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PossessionSenseProfile {
+    BodyOnly,
+    Sensorium,
+}
+
+impl PossessionSenseProfile {
+    fn label(self) -> &'static str {
+        match self {
+            Self::BodyOnly => "body-only",
+            Self::Sensorium => "sensorium",
+        }
+    }
+}
+
+fn possess_body_only(args: &[String]) -> Result<()> {
+    possess(args, PossessionSenseProfile::BodyOnly)
+}
+
+fn possess(args: &[String], sense_profile: PossessionSenseProfile) -> Result<()> {
     let (robot_args, robot_mode) = split_mode_override(args);
     let robot_mode = normalize_possession_mode(&robot_mode);
     let backend_was_explicit =
@@ -256,7 +275,15 @@ fn possess(args: &[String]) -> Result<()> {
         backend = "uart".to_owned();
     }
     let (mut status, mut log) =
-        possession_attempt(&robot_args, &robot_mode, &device, &boot, &backend, &port)?;
+        possession_attempt(
+            &robot_args,
+            &robot_mode,
+            sense_profile,
+            &device,
+            &boot,
+            &backend,
+            &port,
+        )?;
     if status.success() {
         return Ok(());
     }
@@ -265,7 +292,15 @@ fn possess(args: &[String]) -> Result<()> {
         backend = "wifi".to_owned();
         println!("Brainstem USB/UART failed; retrying possession over Pete Wi-Fi at {host}.");
         (status, log) =
-            possession_attempt(&robot_args, &robot_mode, &device, &boot, &backend, &port)?;
+            possession_attempt(
+                &robot_args,
+                &robot_mode,
+                sense_profile,
+                &device,
+                &boot,
+                &backend,
+                &port,
+            )?;
         if status.success() {
             return Ok(());
         }
@@ -274,7 +309,15 @@ fn possess(args: &[String]) -> Result<()> {
         println!("Wi-Fi identity continuity is not established; bootstrapping the pinned brainstem over USB.");
         bootstrap_brainstem(single_brainstem_port().as_deref())?;
         (status, log) =
-            possession_attempt(&robot_args, &robot_mode, &device, &boot, &backend, &port)?;
+            possession_attempt(
+                &robot_args,
+                &robot_mode,
+                sense_profile,
+                &device,
+                &boot,
+                &backend,
+                &port,
+            )?;
         if status.success() {
             return Ok(());
         }
@@ -287,6 +330,7 @@ fn possess(args: &[String]) -> Result<()> {
         (status, _) = possession_attempt(
             &robot_args,
             &robot_mode,
+            sense_profile,
             &device,
             &live_boot,
             &backend,
@@ -303,6 +347,7 @@ fn possess(args: &[String]) -> Result<()> {
 fn possession_attempt(
     args: &[String],
     robot_mode: &str,
+    sense_profile: PossessionSenseProfile,
     device: &str,
     boot: &str,
     backend: &str,
@@ -318,7 +363,8 @@ fn possession_attempt(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| env_or("PETE_POSSESSION_TICK_MS", DEFAULT_POSSESSION_TICK_MS));
     println!(
-        "Taking brainstem possession over {backend} at {endpoint}\ndevice={device} boot={boot}\ncontrol target: {tick_ms} ms; limits: 50 mm/s linear, 500 mrad/s angular; exit performs STOP then exorcize"
+        "Taking brainstem possession over {backend} at {endpoint}\ndevice={device} boot={boot}\nsenses: {}; control target: {tick_ms} ms; limits: 50 mm/s linear, 500 mrad/s angular; exit performs STOP then exorcize",
+        sense_profile.label()
     );
     let mut robot_args = vec![
         "--brainstem-device-id".to_owned(),
@@ -330,37 +376,77 @@ fn possession_attempt(
         "--max-angular-mrad-s".to_owned(),
         "500".to_owned(),
         "--autonomous-motion".to_owned(),
-        "--imu".to_owned(),
-        "none".to_owned(),
-        "--gps".to_owned(),
-        "none".to_owned(),
-        "--llm-provider".to_owned(),
-        "disabled".to_owned(),
         "--capture".to_owned(),
         env_or("PETE_POSSESSION_CAPTURE", "data/captures/real/possession"),
     ];
+    robot_args.extend(possession_sense_args(sense_profile, args));
     if explicit_tick_ms.is_none() {
         robot_args.extend(["--tick-ms".to_owned(), tick_ms]);
     }
     robot_args.extend(args.iter().cloned());
-    let mut command = robot_process(
-        &robot_args,
-        &[
-            ("PETE_ROBOT_MODE", robot_mode.to_owned()),
-            ("PETE_COCKPIT_BACKEND", backend.to_owned()),
-            ("PETE_COCKPIT_PORT", port.to_owned()),
-            (
-                "PETE_ROBOT_LEDGER",
-                env_or("PETE_POSSESSION_LEDGER", "data/ledger/real/possession"),
-            ),
-            ("CAMERA_DEVICE", "".to_owned()),
-            ("MIC_DEVICE", "".to_owned()),
-            ("IMU_DEVICE", "".to_owned()),
-            ("GPS_SERIAL_PORT", "".to_owned()),
-            ("PETE_KINECT_DEPTH", "0".to_owned()),
-        ],
-    )?;
+    let mut overrides = vec![
+        ("PETE_ROBOT_MODE", robot_mode.to_owned()),
+        ("PETE_COCKPIT_BACKEND", backend.to_owned()),
+        ("PETE_COCKPIT_PORT", port.to_owned()),
+        (
+            "PETE_ROBOT_LEDGER",
+            env_or("PETE_POSSESSION_LEDGER", "data/ledger/real/possession"),
+        ),
+    ];
+    overrides.extend(possession_sense_overrides(sense_profile));
+    let mut command = robot_process(&robot_args, &overrides)?;
     run_program_captured(&mut command)
+}
+
+fn possession_sense_args(
+    sense_profile: PossessionSenseProfile,
+    caller_args: &[String],
+) -> Vec<String> {
+    match sense_profile {
+        PossessionSenseProfile::BodyOnly => [
+            "--imu",
+            "none",
+            "--gps",
+            "none",
+            "--llm-provider",
+            "disabled",
+        ]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect(),
+        PossessionSenseProfile::Sensorium
+            if long_option_value(caller_args, "--llm-provider").is_none()
+                && long_option_value(caller_args, "--llm-config").is_none() =>
+        {
+            vec!["--llm-provider".to_owned(), "ollama".to_owned()]
+        }
+        PossessionSenseProfile::Sensorium => Vec::new(),
+    }
+}
+
+fn possession_sense_overrides(
+    sense_profile: PossessionSenseProfile,
+) -> Vec<(&'static str, String)> {
+    match sense_profile {
+        PossessionSenseProfile::BodyOnly => [
+            "CAMERA_DEVICE",
+            "MIC_DEVICE",
+            "IMU_DEVICE",
+            "GPS_SERIAL_PORT",
+            "PETE_KINECT_DEPTH",
+        ]
+        .into_iter()
+        .map(|name| {
+            let value = if name == "PETE_KINECT_DEPTH" {
+                "0".to_owned()
+            } else {
+                String::new()
+            };
+            (name, value)
+        })
+        .collect(),
+        PossessionSenseProfile::Sensorium => Vec::new(),
+    }
 }
 
 fn split_mode_override(args: &[String]) -> (Vec<String>, String) {

@@ -205,6 +205,32 @@ impl CaptureWriter {
         Ok(())
     }
 
+    pub async fn append_snapshot_with_exported_assets(
+        &mut self,
+        t_ms: u64,
+        snapshot: WorldSnapshot,
+        events: Vec<RecordedEvent>,
+        export_rgb: bool,
+        export_depth: bool,
+        export_audio: bool,
+    ) -> Result<()> {
+        let export = export_snapshot_assets(
+            &self.root,
+            self.frame_count,
+            &snapshot,
+            export_rgb,
+            export_depth,
+            export_audio,
+        )?;
+        let metadata = export
+            .metadata
+            .as_object()
+            .is_some_and(|metadata| !metadata.is_empty())
+            .then_some(export.metadata);
+        self.append_snapshot_with_assets(t_ms, snapshot, events, export.assets, metadata)
+            .await
+    }
+
     pub async fn finish(mut self) -> Result<CaptureManifest> {
         self.frames.flush().await?;
         self.manifest.frame_count = self.frame_count;
@@ -408,7 +434,15 @@ pub fn export_snapshot_assets(
             assets.rgb = Some(rel);
             metadata.insert(
                 "rgb".to_string(),
-                serde_json::json!({"width": width, "height": height, "format": "rgb8_png"}),
+                serde_json::json!({
+                    "width": width,
+                    "height": height,
+                    "format": "rgb8_png",
+                    "captured_at_ms": snapshot.eye_frame.as_ref().map(|frame| frame.captured_at_ms),
+                    "rgbd_frame_id": snapshot.eye_frame.as_ref().and_then(|frame| frame.rgbd_frame_id.as_deref()),
+                    "device_timestamp_ms": snapshot.eye_frame.as_ref().and_then(|frame| frame.device_timestamp_ms),
+                    "source": snapshot.eye_frame.as_ref().and_then(|frame| frame.source.as_deref()),
+                }),
             );
         }
     }
@@ -425,7 +459,11 @@ pub fn export_snapshot_assets(
                     "height": depth.height,
                     "format": "gray16_png",
                     "units": "millimeters",
-                    "scale": 0.001
+                    "scale": 0.001,
+                    "captured_at_ms": snapshot.kinect.captured_at_ms,
+                    "rgbd_frame_id": snapshot.kinect.rgbd_frame_id.as_deref(),
+                    "device_timestamp_ms": snapshot.kinect.device_timestamp_ms,
+                    "coordinate_system": snapshot.kinect.depth_coordinate_system.as_deref(),
                 }),
             );
         }
@@ -442,7 +480,8 @@ pub fn export_snapshot_assets(
                     "sample_rate_hz": audio.sample_rate_hz,
                     "channels": audio.channels,
                     "format": "pcm16_wav",
-                    "samples": audio.samples.len()
+                    "samples": audio.samples.len(),
+                    "captured_at_ms": audio.captured_at_ms,
                 }),
             );
         }

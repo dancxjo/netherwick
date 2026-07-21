@@ -67,6 +67,11 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Possess with configured higher senses while retaining the physical safety envelope.
+    PossessSensorium {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Guide a human through the physical safety QA checklist and record evidence.
     PhysicalQa {
         /// Print the complete QA plan without touching hardware or prompting.
@@ -233,8 +238,11 @@ fn run(command: Command) -> Result<()> {
         Command::Say { text } => pete_tools(["mouth", &text], &[("PETE_TTS_OUTPUT_DEVICE", env_or("PETE_TTS_OUTPUT_DEVICE", ""))]),
         Command::Transcribe { wav } => pete_tools(["whisper-transcribe", path(&wav)?], &[]),
         Command::Robot { args } => robot(&args, &[]),
-        Command::Possess { args } => possess(&args),
-        Command::PhysicalQa { plan, out } => physical_qa::run(plan, out, possess),
+        Command::Possess { args } => possess(&args, PossessionSenseProfile::BodyOnly),
+        Command::PossessSensorium { args } => {
+            possess(&args, PossessionSenseProfile::Sensorium)
+        }
+        Command::PhysicalQa { plan, out } => physical_qa::run(plan, out, possess_body_only),
         Command::Go { target } => go(target.as_deref().unwrap_or("virtual")),
         Command::Train { args } => train(&args),
         Command::Evolve { clear } => evolve(clear.as_deref(), false),

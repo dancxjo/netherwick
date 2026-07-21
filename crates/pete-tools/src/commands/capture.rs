@@ -824,7 +824,6 @@ where
     }
     let mut stream_counts = StreamCounts::default();
     let mut events_written = 0usize;
-    let mut frame_index = 0u64;
     for _ in 0..requested_frames {
         let tick_result = runner.tick_read_only().await;
         let (snapshot, tick) = match tick_result {
@@ -845,29 +844,16 @@ where
         {
             events_written = events_written.saturating_add(1);
         }
-        let export = export_snapshot_assets(
-            writer.root(),
-            frame_index,
-            &snapshot,
-            args.export_rgb,
-            args.export_depth,
-            args.export_audio,
-        )?;
         writer
-            .append_snapshot_with_assets(
+            .append_snapshot_with_exported_assets(
                 snapshot.body.last_update_ms,
                 snapshot,
                 Vec::new(),
-                export.assets,
-                (!export
-                    .metadata
-                    .as_object()
-                    .map(|m| m.is_empty())
-                    .unwrap_or(true))
-                .then_some(export.metadata),
+                args.export_rgb,
+                args.export_depth,
+                args.export_audio,
             )
             .await?;
-        frame_index = frame_index.saturating_add(1);
         tokio::time::sleep(Duration::from_millis(args.tick_ms)).await;
     }
 
@@ -1278,4 +1264,3 @@ fn publish_live_sensor_only_snapshot(live_state: &LiveViewState, packet: &SenseP
 
     live_state.update(snapshot);
 }
-

@@ -356,6 +356,23 @@ wheels-off-floor first:
 just possess
 ```
 
+This first-stage command deliberately runs body-only: Kinect, V4L camera,
+microphone, GPS, local IMU, and the LLM provider are disabled. After that path
+is healthy, run the same guarded possession envelope with the configured higher
+senses restored:
+
+```bash
+just possess-sensorium
+```
+
+The sensorium profile uses the normal robot sensor configuration and discovery
+path. Configure `CAMERA_DEVICE`, `MIC_DEVICE`, `IMU_DEVICE`, and
+`GPS_SERIAL_PORT` in `.env`; `PETE_KINECT_DEPTH=0` selects the V4L camera path
+instead of the default Kinect RGB/depth path. Ollama is enabled by default, or
+pass `--llm-config PATH` / `--llm-provider disabled` explicitly. Both profiles
+retain the same identity pinning, possession lease, motion limits, safety and
+autonomic vetoes, reconnect behavior, STOP, and exorcize shutdown.
+
 Set `PETE_BRAINSTEM_DEVICE_ID` in `.env` first; optionally pin
 `PETE_COCKPIT_PORT=/dev/serial/by-id/DEVICE`. The recipe learns the current boot
 ID from the pinned device, saves it as `PETE_BRAINSTEM_BOOT_ID`, and retries

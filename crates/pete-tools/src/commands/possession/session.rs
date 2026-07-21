@@ -391,6 +391,10 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
                 CaptureWriter::create(path, CaptureSource::RealRobot, Some(args.tick_ms)).await?;
             writer.manifest_mut().firmware_identity =
                 brainstem_firmware_identity(runner.cockpit.client_mut().as_mut());
+            writer.manifest_mut().notes.push(
+                "raw RGB, depth, and audio assets are exported when present; paths are relative to the capture root"
+                    .to_string(),
+            );
             Some(writer)
         }
         None => None,
@@ -420,171 +424,159 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     let mut played_reign_audio = HashSet::new();
     let mut played_skill_audio = HashSet::new();
     let mut possession_connected = true;
-    while max_steps
-        .map(|limit| runner.tick_count < limit)
-        .unwrap_or(true)
-    {
-        let tick_started_at = Instant::now();
-        let tick_result = tokio::select! {
-            signal = &mut shutdown => {
-                println!("received {signal}; stopping robot and surrendering possession");
-                break;
-            }
-            result = async {
-                match robot_mode {
-                    RobotMode::ReadOnly => runner.tick_read_only().await,
-                    RobotMode::Slow => runner.tick_slow_manual().await,
-                    RobotMode::Disabled => unreachable!("disabled mode bailed before runner start"),
+    // Keep every fallible control-loop exit inside this outcome. Returning from
+    // the async block cannot bypass the common STOP, exorcize, status, and
+    // capture finalization path below.
+    let control_result: Result<()> = async {
+        while max_steps
+            .map(|limit| runner.tick_count < limit)
+            .unwrap_or(true)
+        {
+            let tick_started_at = Instant::now();
+            let tick_result = tokio::select! {
+                signal = &mut shutdown => {
+                    println!("received {signal}; stopping robot and surrendering possession");
+                    break;
                 }
-            } => result,
-        };
-        let (snapshot, tick) = match tick_result {
-            Ok(values) => values,
-            Err(error)
-                if robot_mode == RobotMode::Slow && is_reconnectable_cockpit_error(&error) =>
-            {
-                eprintln!("possession transport/session lost; motor gate closed: {error}");
-                disconnect_possession_cockpit_for_reconnect(&mut runner.cockpit);
-                possession_connected = false;
-                if let Some(live_state) = &live_state {
-                    live_state.update_session_control(
-                        "stopped-reconnecting",
-                        format!("stopped; brainstem unavailable; reconnecting: {error}"),
-                    );
-                }
-                match reconnect_possession_cockpit(
-                    create_port.as_deref(),
-                    &args,
-                    shutdown.as_mut(),
-                )
-                .await?
+                result = async {
+                    match robot_mode {
+                        RobotMode::ReadOnly => runner.tick_read_only().await,
+                        RobotMode::Slow => runner.tick_slow_manual().await,
+                        RobotMode::Disabled => unreachable!("disabled mode bailed before runner start"),
+                    }
+                } => result,
+            };
+            let (snapshot, tick) = match tick_result {
+                Ok(values) => values,
+                Err(error)
+                    if robot_mode == RobotMode::Slow && is_reconnectable_cockpit_error(&error) =>
                 {
-                    PossessionReconnect::Reconnected(replacement) => {
-                        runner.cockpit.replace_client(replacement);
-                        possession_connected = true;
-                        runner.note_brainstem_reconnect();
-                        if let Some(live_state) = &live_state {
-                            live_state.update_session_control(
-                                "active",
-                                "brainstem possession active after reconnect",
-                            );
-                        }
-                        eprintln!(
-                            "possession reconnected with fresh session, lease, and complete body packet; stopped=true"
+                    eprintln!("possession transport/session lost; motor gate closed: {error}");
+                    disconnect_possession_cockpit_for_reconnect(&mut runner.cockpit);
+                    possession_connected = false;
+                    if let Some(live_state) = &live_state {
+                        live_state.update_session_control(
+                            "stopped-reconnecting",
+                            format!("stopped; brainstem unavailable; reconnecting: {error}"),
                         );
+                    }
+                    match reconnect_possession_cockpit(
+                        create_port.as_deref(),
+                        &args,
+                        shutdown.as_mut(),
+                    )
+                    .await?
+                    {
+                        PossessionReconnect::Reconnected(replacement) => {
+                            runner.cockpit.replace_client(replacement);
+                            possession_connected = true;
+                            runner.note_brainstem_reconnect();
+                            if let Some(live_state) = &live_state {
+                                live_state.update_session_control(
+                                    "active",
+                                    "brainstem possession active after reconnect",
+                                );
+                            }
+                            eprintln!(
+                                "possession reconnected with fresh session, lease, and complete body packet; stopped=true"
+                            );
+                            continue;
+                        }
+                        PossessionReconnect::Shutdown(signal) => {
+                            if let Some(live_state) = &live_state {
+                                live_state.update_session_control(
+                                    "stopped-shutdown",
+                                    format!(
+                                        "stopped; received {signal} while waiting for brainstem"
+                                    ),
+                                );
+                            }
+                            println!(
+                                "received {signal} while waiting for brainstem; closing capture and ledger"
+                            );
+                            break;
+                        }
+                    }
+                }
+                Err(error) if robot_mode == RobotMode::Slow && is_charging_busy_error(&error) => {
+                    eprintln!(
+                        "possession motor gate closed: brainstem reports charging_busy; Create charging indicator is wired to Pico GP17 physical pin 22"
+                    );
+                    return Err(error);
+                }
+                Err(error) if robot_mode == RobotMode::ReadOnly => {
+                    if is_transient_robot_timeout(&error) {
+                        eprintln!("read-only tick timed out; continuing");
+                        tokio::time::sleep(remaining_tick_delay(
+                            args.tick_ms,
+                            tick_started_at.elapsed(),
+                        ))
+                        .await;
                         continue;
                     }
-                    PossessionReconnect::Shutdown(signal) => {
-                        if let Some(live_state) = &live_state {
-                            live_state.update_session_control(
-                                "stopped-shutdown",
-                                format!(
-                                    "stopped; received {signal} while waiting for brainstem"
-                                ),
-                            );
-                        }
-                        println!(
-                            "received {signal} while waiting for brainstem; closing capture and ledger"
-                        );
-                        break;
-                    }
+                    return Err(error);
                 }
-            }
-            Err(error) if robot_mode == RobotMode::Slow && is_charging_busy_error(&error) => {
-                eprintln!(
-                    "possession motor gate closed: brainstem reports charging_busy; Create charging indicator is wired to Pico GP17 physical pin 22"
+                Err(error) => return Err(error),
+            };
+            if robot_mode != RobotMode::Slow {
+                play_event_script_outputs(&mouth, runner.cockpit.client_mut().as_mut(), &tick);
+                play_reign_audio_action(
+                    &mouth,
+                    runner.cockpit.client_mut().as_mut(),
+                    &tick,
+                    &mut played_reign_audio,
                 );
-                return Err(error);
             }
-            Err(error) if robot_mode == RobotMode::ReadOnly => {
-                if is_transient_robot_timeout(&error) {
-                    eprintln!("read-only tick timed out; continuing");
-                    tokio::time::sleep(remaining_tick_delay(
-                        args.tick_ms,
-                        tick_started_at.elapsed(),
-                    ))
-                    .await;
-                    continue;
+            play_lua_skill_audio(&mouth, &tick, &mut played_skill_audio);
+            if let Some(live_state) = &live_state {
+                let runtime_map = runner.runtime.canonical_map();
+                live_state.update_with_runtime_map(snapshot.clone(), runtime_map.as_ref());
+                live_state.update_embodied_context(tick.frame.embodied_context());
+            }
+            if let Some(writer) = capture.as_mut() {
+                append_real_robot_snapshot(writer, &snapshot, &tick).await?;
+            }
+            let motion_note = slow_motion_note(&snapshot);
+            println!(
+                "robot {:?} tick {}: battery {:.2}, chosen {:?}{}",
+                robot_mode,
+                runner.tick_count,
+                tick.frame.now.body.battery_level,
+                tick.chosen_action,
+                motion_note
+            );
+            tokio::select! {
+                signal = &mut shutdown => {
+                    println!("received {signal}; stopping robot and surrendering possession");
+                    break;
                 }
-                return Err(error);
+                _ = tokio::time::sleep(remaining_tick_delay(
+                    args.tick_ms,
+                    tick_started_at.elapsed(),
+                )) => {}
             }
-            Err(error) => return Err(error),
-        };
-        if robot_mode != RobotMode::Slow {
-            play_event_script_outputs(&mouth, runner.cockpit.client_mut().as_mut(), &tick);
-            play_reign_audio_action(
-                &mouth,
-                runner.cockpit.client_mut().as_mut(),
-                &tick,
-                &mut played_reign_audio,
-            );
         }
-        play_lua_skill_audio(&mouth, &tick, &mut played_skill_audio);
-        if let Some(live_state) = &live_state {
-            let runtime_map = runner.runtime.canonical_map();
-            live_state.update_with_runtime_map(snapshot.clone(), runtime_map.as_ref());
-            live_state.update_embodied_context(tick.frame.embodied_context());
-        }
-        if let Some(writer) = capture.as_mut() {
-            append_real_robot_snapshot(writer, &snapshot, &tick).await?;
-        }
-        let motion_note = slow_motion_note(&snapshot);
-        println!(
-            "robot {:?} tick {}: battery {:.2}, chosen {:?}{}",
-            robot_mode,
-            runner.tick_count,
-            tick.frame.now.body.battery_level,
-            tick.chosen_action,
-            motion_note
-        );
-        tokio::select! {
-            signal = &mut shutdown => {
-                println!("received {signal}; stopping robot and surrendering possession");
-                break;
-            }
-            _ = tokio::time::sleep(remaining_tick_delay(
-                args.tick_ms,
-                tick_started_at.elapsed(),
-            )) => {}
-        }
+        Ok(())
     }
+    .await;
 
-    if robot_mode == RobotMode::Slow && possession_connected {
-        // Preserve acknowledgement semantics: motion must be stopped before
-        // surrendering the motherbrain gate. The brainstem continues owning
-        // and supervising Create OI in Full mode.
-        run_possession_shutdown(runner.cockpit.client_mut().as_mut())?;
-        let final_status = runner
-            .cockpit
-            .client_mut()
-            .get_status()
-            .context("possession final status was not acknowledged")?
-            .summary();
-        if final_status.active_motion == Some(true) {
-            anyhow::bail!(
-                "possession shutdown did not prove stopped: moving={:?} armed={:?}",
-                final_status.active_motion,
-                final_status.armed
-            );
-        }
-        println!("possession exorcize acknowledged: stopped=true possessed=false; brainstem OI supervision retained");
-    } else if robot_mode == RobotMode::Slow {
+    if robot_mode == RobotMode::Slow && !possession_connected {
         eprintln!(
             "possession shutdown acknowledgement unavailable: brainstem disconnected; motion remains fail-closed under command, heartbeat, and lease expiry"
         );
     }
 
-    let capture_summary = if let Some(writer) = capture {
-        let manifest = writer.finish().await?;
-        format!(
-            ", capture {}, {} frames",
-            args.capture.as_deref().unwrap_or_default(),
-            manifest.frame_count
-        )
-    } else {
-        String::new()
-    };
+    let possession_cockpit = (robot_mode == RobotMode::Slow && possession_connected)
+        .then(|| runner.cockpit.client_mut().as_mut());
+    let (exit_result, capture_summary) = finalize_robot_exit(
+        control_result,
+        possession_cockpit,
+        capture,
+        args.capture.as_deref(),
+    )
+    .await;
     let transitions = ledger.transitions().await?;
+    exit_result?;
     println!(
         "robot {:?} complete: {} ticks, ledger {}, {} transitions{}",
         robot_mode,
@@ -596,13 +588,104 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     Ok(())
 }
 
+async fn finalize_robot_exit<C: Cockpit + ?Sized>(
+    control_result: Result<()>,
+    possession_cockpit: Option<&mut C>,
+    capture: Option<CaptureWriter>,
+    capture_path: Option<&str>,
+) -> (Result<()>, String) {
+    let shutdown_result = possession_cockpit
+        .map(run_acknowledged_possession_shutdown)
+        .unwrap_or(Ok(()));
+    let capture_result = match capture {
+        Some(writer) => writer.finish().await.map(|manifest| {
+            format!(
+                ", capture {}, {} frames",
+                capture_path.unwrap_or_default(),
+                manifest.frame_count
+            )
+        }),
+        None => Ok(String::new()),
+    };
+    let capture_summary = capture_result.as_ref().cloned().unwrap_or_default();
+    let result = combine_robot_exit_results(
+        control_result,
+        shutdown_result,
+        capture_result.map(|_| ()),
+    );
+    (result, capture_summary)
+}
+
+fn run_acknowledged_possession_shutdown<C: Cockpit + ?Sized>(cockpit: &mut C) -> Result<()> {
+    // Preserve acknowledgement semantics: motion must be stopped before
+    // surrendering the motherbrain gate. The brainstem continues owning and
+    // supervising Create OI in Full mode.
+    run_possession_shutdown(cockpit)?;
+    let final_status = cockpit
+        .get_status()
+        .context("possession final status was not acknowledged")?
+        .summary();
+    if final_status.active_motion == Some(true) {
+        anyhow::bail!(
+            "possession shutdown did not prove stopped: moving={:?} armed={:?}",
+            final_status.active_motion,
+            final_status.armed
+        );
+    }
+    println!("possession exorcize acknowledged: stopped=true possessed=false; brainstem OI supervision retained");
+    Ok(())
+}
+
+fn combine_robot_exit_results(
+    control_result: Result<()>,
+    shutdown_result: Result<()>,
+    capture_result: Result<()>,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    if let Err(error) = control_result {
+        failures.push(("robot control loop", error));
+    }
+    if let Err(error) = shutdown_result {
+        failures.push(("possession shutdown", error));
+    }
+    if let Err(error) = capture_result {
+        failures.push(("capture finalization", error));
+    }
+    match failures.len() {
+        0 => Ok(()),
+        1 => {
+            let (stage, error) = failures.pop().expect("one exit failure");
+            if stage == "robot control loop" {
+                Err(error)
+            } else {
+                Err(error.context(format!("{stage} failed")))
+            }
+        }
+        _ => anyhow::bail!(
+            "robot exit had multiple failures: {}",
+            failures
+                .into_iter()
+                .map(|(stage, error)| format!("{stage}: {error:#}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+    }
+}
+
 async fn append_real_robot_snapshot(
     writer: &mut CaptureWriter,
     snapshot: &WorldSnapshot,
     tick: &RuntimeTick,
 ) -> Result<()> {
     writer
-        .append_snapshot(tick.frame.now.t_ms, snapshot.clone(), Vec::new())
+        .append_snapshot_with_exported_assets(
+            tick.frame.now.t_ms,
+            snapshot.clone(),
+            Vec::new(),
+            true,
+            true,
+            true,
+        )
         .await
 }
 
@@ -770,7 +853,7 @@ fn slow_motion_note(snapshot: &WorldSnapshot) -> String {
         .unwrap_or_default()
 }
 
-fn run_possession_shutdown(cockpit: &mut dyn Cockpit) -> Result<()> {
+fn run_possession_shutdown<C: Cockpit + ?Sized>(cockpit: &mut C) -> Result<()> {
     run_possession_shutdown_with_retry(
         cockpit,
         POSSESSION_SHUTDOWN_BUSY_RETRY_ATTEMPTS,

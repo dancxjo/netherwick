@@ -6,6 +6,11 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Add `just possess-sensorium` and `just possess-sensorium-rpi5` as explicit
+  second-stage physical checks that retain possession safeguards while restoring
+  configured higher sensors and Ollama cognition; keep existing possession
+  commands deliberately body-only.
+
 - Add the complete brainstem inertial handoff: parity timing/trust fields in
   compact and JSON status, stationary firmware gyro-bias estimation, bounded
   host clock mapping with reboot/reconnect epochs, truthful roll/pitch-only MPU
@@ -26,6 +31,8 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Ready: Ensure real-robot possession always attempts STOP/exorcize and capture finalization through a unified exit path even when the control loop exits with an error, and report combined shutdown/capture/control failures instead of silently dropping finalization work.
+- Ready: Preserve RGB/depth/audio capture asset export in real-robot snapshot recording while enriching exported asset metadata with capture timing, frame identifiers, device timestamps, and source/coordinate provenance.
 - Connect the UDP cockpit socket to its configured brainstem peer so valid-looking
   datagrams from unrelated local senders cannot be accepted as brainstem replies.
 - Ready: Make possession reconnect cancellation-aware during both connection

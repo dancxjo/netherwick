@@ -97,6 +97,10 @@ possess *args:
     cargo run -q -p xtask -- possess --mode regular {{args}}
 possess-rpi5 *args:
     PETE_COCKPIT_BACKEND=local cargo run -q -p xtask -- possess --mode regular {{args}}
+possess-sensorium *args:
+    cargo run -q -p xtask -- possess-sensorium --mode regular {{args}}
+possess-sensorium-rpi5 *args:
+    PETE_COCKPIT_BACKEND=local cargo run -q -p xtask -- possess-sensorium --mode regular {{args}}
 physical-qa *args:
     cargo run -q -p xtask -- physical-qa {{args}}
 go target="virtual":
