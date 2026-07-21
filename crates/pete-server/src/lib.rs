@@ -32,7 +32,7 @@ use pete_memory::{
     CognitiveDiagnosticsReport, EntityConstellationState, EntityLifecycleState, EntityMemory,
     EntityMemoryReport,
 };
-use pete_now::{KinectSense, KinectSkeletonSense, ReignSense};
+use pete_now::{KinectSense, KinectSkeletonSense, ObjectSense, ReignSense};
 use pete_runtime::{
     nudge_action_block_reason_for_snapshot, InlineLearningConfig, InlineLearningMode, NudgePolicy,
     NudgeStatus, ReignQueue, RuntimeModelStack,

@@ -156,8 +156,37 @@ fn durable_runtime(
 }
 
 async fn real_robot_frame_processor(warnings: &mut Vec<String>) -> FrameProcessor {
+    let vision_config = pete_sensors::VisionPipelineConfig::raspberry_pi_5();
+    let vision_backend_name =
+        std::env::var("PETE_VISION_BACKEND").unwrap_or_else(|_| "classical".to_string());
+    let vision_backend: std::sync::Arc<dyn pete_sensors::VisionBackend> = match vision_backend_name
+        .as_str()
+    {
+        "classical" | "saliency" => std::sync::Arc::new(pete_sensors::ClassicalSaliencyBackend),
+        "off" | "none" | "disabled" => {
+            warnings.push(
+                "object recognition disabled by PETE_VISION_BACKEND; health remains visible"
+                    .to_string(),
+            );
+            std::sync::Arc::new(pete_sensors::UnavailableVisionBackend::new(
+                "disabled by PETE_VISION_BACKEND",
+            ))
+        }
+        other => {
+            warnings.push(format!(
+                "unknown PETE_VISION_BACKEND={other}; object recognition is explicitly unavailable"
+            ));
+            std::sync::Arc::new(pete_sensors::UnavailableVisionBackend::new(format!(
+                "unsupported backend {other}"
+            )))
+        }
+    };
     let processor = FrameProcessor::new()
-        .with_kinect_range_projection(real_robot_depth_range_projection_from_env());
+        .with_kinect_range_projection(real_robot_depth_range_projection_from_env())
+        .with_vision_pipeline(pete_sensors::VisionPipeline::spawn(
+            vision_config,
+            vision_backend,
+        ));
     if std::env::var("PETE_FACE_DETECTION")
         .map(|value| matches!(value.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
         .unwrap_or(false)

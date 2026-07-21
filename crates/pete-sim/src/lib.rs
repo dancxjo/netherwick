@@ -946,6 +946,7 @@ fn project_object_sense(body: &BodySense, objects: &[SimObject]) -> ObjectSense 
         schema_version: 1,
         observations,
         vectors,
+        ..ObjectSense::default()
     }
 }
 

@@ -162,6 +162,7 @@ pub struct FrameProcessor {
     object_detector: Option<Arc<dyn ObjectDetector>>,
     kinect_range_projection: Option<DepthRangeProjectionConfig>,
     kinect_calibration: Option<CalibrationStateMachine>,
+    vision_pipeline: Option<VisionPipeline>,
 }
 
 impl std::fmt::Debug for FrameProcessor {
@@ -172,6 +173,7 @@ impl std::fmt::Debug for FrameProcessor {
             .field("object_detector", &self.object_detector.is_some())
             .field("kinect_range_projection", &self.kinect_range_projection)
             .field("kinect_calibration", &self.kinect_calibration.is_some())
+            .field("vision_pipeline", &self.vision_pipeline.is_some())
             .finish()
     }
 }
@@ -1152,6 +1154,11 @@ impl FrameProcessor {
         self
     }
 
+    pub fn with_vision_pipeline(mut self, pipeline: VisionPipeline) -> Self {
+        self.vision_pipeline = Some(pipeline);
+        self
+    }
+
     pub fn with_kinect_range_projection(mut self, config: DepthRangeProjectionConfig) -> Self {
         self.kinect_range_projection = Some(config);
         self
@@ -1161,28 +1168,63 @@ impl FrameProcessor {
         self.process_kinect_calibration_packets(t_ms, packets);
         self.process_kinect_range_packets(packets);
 
-        let Some(frame) = packets.iter().rev().find_map(|packet| match packet {
-            SensePacket::EyeFrame(frame) => Some(frame),
-            _ => None,
-        }) else {
-            return;
-        };
-        let Some(processed) = self.process_frame(t_ms, frame) else {
-            return;
-        };
-        let summary_values = summary_extension_values(&processed);
-        packets.push(SensePacket::Eye(processed.eye));
-        if !processed.face.vectors.is_empty() {
-            packets.push(SensePacket::Face(processed.face));
+        let frame = packets
+            .iter()
+            .rev()
+            .find_map(|packet| match packet {
+                SensePacket::EyeFrame(frame) => Some(frame),
+                _ => None,
+            })
+            .cloned();
+        let kinect = packets
+            .iter()
+            .rev()
+            .find_map(|packet| match packet {
+                SensePacket::Kinect(kinect) => Some(kinect),
+                _ => None,
+            })
+            .cloned();
+
+        if let (Some(pipeline), Some(frame)) = (&self.vision_pipeline, frame.as_ref()) {
+            pipeline.enqueue(t_ms, frame.clone(), kinect.as_ref().cloned());
         }
-        if !processed.objects.observations.is_empty() || !processed.objects.vectors.is_empty() {
-            packets.push(SensePacket::Objects(processed.objects));
+
+        let mut combined_objects = ObjectSense {
+            schema_version: 2,
+            ..ObjectSense::default()
+        };
+        if let Some(frame) = frame.as_ref() {
+            if let Some(processed) = self.process_frame(t_ms, frame) {
+                let summary_values = summary_extension_values(&processed);
+                packets.push(SensePacket::Eye(processed.eye));
+                if !processed.face.vectors.is_empty() {
+                    packets.push(SensePacket::Face(processed.face));
+                }
+                combined_objects
+                    .observations
+                    .extend(processed.objects.observations);
+                combined_objects.vectors.extend(processed.objects.vectors);
+                packets.push(SensePacket::Extension(ExtensionSense {
+                    schema_version: 1,
+                    name: "vision.frame_summary".to_string(),
+                    values: summary_values,
+                }));
+            }
         }
-        packets.push(SensePacket::Extension(ExtensionSense {
-            schema_version: 1,
-            name: "vision.frame_summary".to_string(),
-            values: summary_values,
-        }));
+
+        if let Some(pipeline) = &self.vision_pipeline {
+            let objects = pipeline.drain(t_ms, kinect.as_ref());
+            combined_objects.observations.extend(objects.observations);
+            combined_objects.detections.extend(objects.detections);
+            combined_objects.vision_health = objects.vision_health;
+        }
+        if !combined_objects.observations.is_empty()
+            || !combined_objects.vectors.is_empty()
+            || !combined_objects.detections.is_empty()
+            || combined_objects.vision_health.is_some()
+        {
+            packets.push(SensePacket::Objects(combined_objects));
+        }
     }
 
     /// Supplies transform observations from odometry, persistent surfaces,
@@ -1265,8 +1307,17 @@ impl FrameProcessor {
     pub fn process_snapshot(&mut self, t_ms: TimeMs, snapshot: &mut WorldSnapshot) {
         self.update_kinect_calibration(t_ms, &mut snapshot.kinect);
         let Some(frame) = snapshot.eye_frame.clone() else {
+            if let Some(pipeline) = &self.vision_pipeline {
+                let objects = pipeline.drain(t_ms, Some(&snapshot.kinect));
+                if !objects.detections.is_empty() || objects.vision_health.is_some() {
+                    snapshot.objects = objects;
+                }
+            }
             return;
         };
+        if let Some(pipeline) = &self.vision_pipeline {
+            pipeline.enqueue(t_ms, frame.clone(), Some(snapshot.kinect.clone()));
+        }
         let Some(processed) = self.process_frame(t_ms, &frame) else {
             return;
         };
@@ -1283,6 +1334,14 @@ impl FrameProcessor {
             name: "vision.frame_summary".to_string(),
             values: summary_values,
         });
+        if let Some(pipeline) = &self.vision_pipeline {
+            let detected = pipeline.drain(t_ms, Some(&snapshot.kinect));
+            if !detected.detections.is_empty() || detected.vision_health.is_some() {
+                snapshot.objects.detections.extend(detected.detections);
+                snapshot.objects.observations.extend(detected.observations);
+                snapshot.objects.vision_health = detected.vision_health;
+            }
+        }
     }
 
     pub fn process_frame(&mut self, t_ms: TimeMs, frame: &EyeFrame) -> Option<ProcessedFrame> {

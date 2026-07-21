@@ -492,6 +492,150 @@ fn mutes_repeated_alsa_poll_descriptor_input_stream_error() {
         ));
 }
 
+fn vision_test_frame(captured_at_ms: u64, bright: bool) -> EyeFrame {
+    let mut bytes = vec![20_u8; 16 * 12 * 3];
+    if bright {
+        for y in 3..9 {
+            for x in 5..12 {
+                let offset = (y * 16 + x) * 3;
+                bytes[offset..offset + 3].copy_from_slice(&[245, 245, 245]);
+            }
+        }
+    }
+    EyeFrame {
+        captured_at_ms,
+        rgbd_frame_id: Some(format!("rgbd-{captured_at_ms}")),
+        device_timestamp_ms: None,
+        width: 16,
+        height: 12,
+        format: EyeFrameFormat::Rgb8,
+        bytes,
+        source: Some("kinect_rgb".to_string()),
+    }
+}
+
+#[test]
+fn classical_vision_backend_detects_local_saliency_and_keeps_labels_uncertain() {
+    let backend = ClassicalSaliencyBackend;
+    let config = VisionPipelineConfig {
+        input_width: 16,
+        input_height: 12,
+        ..VisionPipelineConfig::default()
+    };
+    let prepared = backend
+        .preprocess(&vision_test_frame(10, true), &config)
+        .unwrap();
+    let detections = backend.detect(&prepared, 8).unwrap();
+
+    assert_eq!(detections.len(), 1);
+    assert_eq!(detections[0].labels[0].label, "salient object");
+    assert!(detections[0].labels[0].confidence < 1.0);
+    let empty = backend
+        .preprocess(&vision_test_frame(20, false), &config)
+        .unwrap();
+    assert!(backend.detect(&empty, 8).unwrap().is_empty());
+}
+
+#[test]
+fn short_term_tracker_reuses_tracks_and_resets_on_calibration_epoch_change() {
+    let proposal = VisionProposal {
+        bbox: VisionBoundingBox {
+            x: 4,
+            y: 3,
+            width: 6,
+            height: 5,
+        },
+        labels: vec![VisionLabelHypothesis {
+            label: "possible cup".to_string(),
+            confidence: 0.6,
+        }],
+    };
+    let mut tracker = ShortTermTracker::default();
+    let config = VisionPipelineConfig::default();
+    let first = tracker.assign(std::slice::from_ref(&proposal), 100, Some(7), &config);
+    let second = tracker.assign(std::slice::from_ref(&proposal), 120, Some(7), &config);
+    let remounted = tracker.assign(&[proposal], 140, Some(8), &config);
+
+    assert_eq!(first, second);
+    assert_ne!(second, remounted);
+}
+
+#[derive(Clone, Debug)]
+struct SlowVisionBackend;
+
+impl VisionBackend for SlowVisionBackend {
+    fn identity(&self) -> VisionModelIdentity {
+        VisionModelIdentity {
+            backend: "test.slow".to_string(),
+            model_id: "test".to_string(),
+            version: "1".to_string(),
+            checksum: None,
+        }
+    }
+
+    fn preprocess(
+        &self,
+        frame: &EyeFrame,
+        config: &VisionPipelineConfig,
+    ) -> Result<PreparedVisionFrame> {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        ClassicalSaliencyBackend.preprocess(frame, config)
+    }
+
+    fn detect(
+        &self,
+        frame: &PreparedVisionFrame,
+        maximum_detections: usize,
+    ) -> Result<Vec<VisionProposal>> {
+        ClassicalSaliencyBackend.detect(frame, maximum_detections)
+    }
+}
+
+#[test]
+fn bounded_vision_queue_replaces_stale_work_without_blocking_caller() {
+    let config = VisionPipelineConfig {
+        maximum_fps: 100_000.0,
+        queue_capacity: 1,
+        inference_deadline_ms: 500,
+        ..VisionPipelineConfig::default()
+    };
+    let pipeline = VisionPipeline::spawn(config, Arc::new(SlowVisionBackend));
+    let started = std::time::Instant::now();
+    for index in 0..12 {
+        pipeline.enqueue(index, vision_test_frame(index, true), None);
+    }
+    assert!(started.elapsed() < std::time::Duration::from_millis(20));
+    std::thread::sleep(std::time::Duration::from_millis(90));
+
+    let health = pipeline.health();
+    assert!(health.replaced_frames > 0);
+    assert!(health.processed_frames > 0);
+    assert!(health.queue_depth <= 1);
+}
+
+#[test]
+fn unavailable_vision_backend_degrades_explicitly() {
+    let pipeline = VisionPipeline::spawn(
+        VisionPipelineConfig {
+            maximum_fps: 100_000.0,
+            inference_deadline_ms: 500,
+            ..VisionPipelineConfig::default()
+        },
+        Arc::new(UnavailableVisionBackend::new("model not installed")),
+    );
+    pipeline.enqueue(100, vision_test_frame(100, true), None);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let health = pipeline.health();
+    assert_eq!(health.state, VisionBackendState::Missing);
+    assert_eq!(health.failed_frames, 1);
+    assert!(health
+        .latest_error
+        .as_deref()
+        .unwrap()
+        .contains("model not installed"));
+}
+
 #[test]
 fn keeps_other_cpal_input_stream_errors_visible() {
     assert!(!is_muted_cpal_input_stream_error(
@@ -528,7 +672,14 @@ async fn kinect_replay_emits_kinect_then_eye_packet() {
     assert!(
         matches!(first, SensePacket::Kinect(KinectSense { depth_m, .. }) if depth_m == vec![1.0, 2.0])
     );
-    assert!(matches!(second, SensePacket::Eye(EyeSense { frames, .. }) if frames.len() == 1));
+    assert!(matches!(
+        second,
+        SensePacket::EyeFrame(EyeFrame {
+            width: 1,
+            height: 1,
+            ..
+        })
+    ));
     let _ = std::fs::remove_dir_all(root);
 }
 

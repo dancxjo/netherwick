@@ -2,6 +2,10 @@
 pub struct KinectReplayFrame {
     pub t_ms: u64,
     pub rgb_path: Option<String>,
+    #[serde(default)]
+    pub rgb_width: Option<u32>,
+    #[serde(default)]
+    pub rgb_height: Option<u32>,
     pub depth_path: Option<String>,
     pub color_features: Option<Vec<Vec<f32>>>,
     pub depth_m: Option<Vec<f32>>,
@@ -66,18 +70,30 @@ impl KinectReplayProvider {
                     .map(|bytes| vec![bytes_to_unit_signal(bytes)])
             })
             .unwrap_or_default();
-        let eye = rgb_bytes.map(|bytes| {
-            SensePacket::Eye(EyeSense {
-                schema_version: 1,
-                frames: vec![bytes_to_unit_signal(&bytes)],
-                image_vectors: Vec::new(),
-                image_description_vectors: Vec::new(),
-                scene_vectors: Vec::new(),
-            })
+        let frame_id = format!("kinect-replay-rgbd-{}", frame.t_ms);
+        let eye_frame = rgb_bytes.map(|bytes| {
+            let (width, height) = match (frame.rgb_width, frame.rgb_height) {
+                (Some(width), Some(height)) => (width, height),
+                _ if bytes.len() == 640 * 480 * 3 => (640, 480),
+                _ => ((bytes.len() / 3).max(1) as u32, 1),
+            };
+            EyeFrame {
+                captured_at_ms: frame.t_ms,
+                rgbd_frame_id: Some(frame_id.clone()),
+                device_timestamp_ms: None,
+                width,
+                height,
+                format: EyeFrameFormat::Rgb8,
+                bytes,
+                source: Some("kinect_replay_rgb".to_string()),
+            }
         });
+        let eye = eye_frame.clone().map(SensePacket::EyeFrame);
         let kinect = KinectSense {
             schema_version: 1,
             captured_at_ms: frame.t_ms,
+            rgbd_frame_id: Some(frame_id),
+            color_frame: eye_frame,
             color_features,
             depth_m,
             audio_angle_rad: frame.audio_angle_rad,

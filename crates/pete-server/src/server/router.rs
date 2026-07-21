@@ -5,6 +5,7 @@ pub fn live_view_router(state: LiveViewState) -> Router {
         .route("/models", get(get_models))
         .route("/view", get(live_view_page))
         .route("/view/snapshot", get(get_live_snapshot))
+        .route("/view/vision", get(get_live_vision))
         .route("/view/embodied", get(get_live_embodied))
         .route("/view/embodied/graph", get(get_live_embodied_graph))
         .route("/api/experience/lineage", get(get_live_embodied_graph))
@@ -115,6 +116,15 @@ async fn get_live_snapshot(
         gps: snapshot.gps,
         ear_pcm: snapshot.ear_pcm,
     }))
+}
+
+async fn get_live_vision(
+    State(state): State<LiveViewState>,
+) -> Result<Json<ObjectSense>, LiveViewError> {
+    let snapshot = state
+        .latest()
+        .ok_or_else(|| LiveViewError::unavailable("no live world snapshot has arrived yet"))?;
+    Ok(Json(snapshot.objects))
 }
 
 async fn get_live_embodied(

@@ -18,9 +18,10 @@ use pete_now::{
     ObjectSense, RangeExtrinsics, RangeSense, RotationCalibrationEpisode, SensorLatencyRegistry,
     SensorTimingObservation, StraightCalibrationEpisode, TranscriptCandidateEvent,
     TranscriptCandidateTracker, TranscriptStabilityState, TransformEstimateEvidence,
-    VectorArtifact, VoiceSense, FACE_VECTOR_COLLECTION, IMAGE_DESCRIPTION_VECTOR_COLLECTION,
-    IMAGE_VECTOR_COLLECTION, OBJECT_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION,
-    TRANSCRIPT_VECTOR_COLLECTION,
+    VectorArtifact, VisionBackendState, VisionBoundingBox, VisionDetection, VisionLabelHypothesis,
+    VisionModelIdentity, VisionPipelineHealth, VisionPositionEstimate, VoiceSense,
+    FACE_VECTOR_COLLECTION, IMAGE_DESCRIPTION_VECTOR_COLLECTION, IMAGE_VECTOR_COLLECTION,
+    OBJECT_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION, TRANSCRIPT_VECTOR_COLLECTION,
 };
 use pete_now::{Now, PredictionSense, SurpriseSense};
 use serde::{Deserialize, Serialize};
@@ -118,6 +119,7 @@ const KINECT_V1_DEPTH_CY: f32 = 242.0;
 include!("sensors/core.rs");
 include!("sensors/imu_arbitration.rs");
 include!("sensors/vision.rs");
+include!("sensors/vision_pipeline.rs");
 include!("sensors/audio.rs");
 include!("sensors/world.rs");
 include!("sensors/linux.rs");

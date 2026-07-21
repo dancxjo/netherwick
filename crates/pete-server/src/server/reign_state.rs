@@ -23,6 +23,7 @@ pub const HTTP_ENDPOINTS: &[&str] = &[
     "/view/embodied",
     "/view/embodied/graph",
     "/api/experience/lineage",
+    "/view/vision",
     "/view/scene",
     "/view/map",
     "/view/behavior-nodes",
