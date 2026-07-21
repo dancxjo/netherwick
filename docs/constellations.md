@@ -113,7 +113,11 @@ Useful LLM outputs include:
 - "If this is a wall, forward motion should not change its relative plane much."
 - "Do not move yet; the safety state says the body is docked or uncertain."
 
-The LLM can suggest motion intents, but the body path must still pass through controller state and safety. Current movement is not responding, so motion suggestions are presently diagnostic artifacts until the command-to-base path is restored.
+The LLM can preserve suggested motion intents as evidence, but it does not own
+action selection or motor authority. The command-to-base path is operational
+through local goals, skills, Reign, possession, controller state, and safety.
+Any resulting motion either passes those gates and executes or records an
+explicit refusal for later diagnosis.
 
 ## Promotion gates
 
