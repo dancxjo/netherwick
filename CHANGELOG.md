@@ -6,6 +6,9 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Keep `rich_language` available while a healthy cognition request is in flight,
+  and report request occupancy separately as `busy` instead of treating every
+  pending request as a service outage.
 - Read the r23 Create charging indicator from GP20/physical pin 26 in both Pico
   backends, and move the optional external status output to GP17 so firmware
   never drives the TXS channel 8 charging signal.

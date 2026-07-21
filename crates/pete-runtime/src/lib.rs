@@ -3678,6 +3678,9 @@ where
         }
         // Higher cognition is advisory. Even a valid response cannot become a
         // Cockpit proposal; local goals, skills, Reign, and safety own motion.
+        let combobulation = accepted_llm
+            .as_ref()
+            .and_then(|accepted| accepted.reflection.clone());
         let llm_tick = accepted_llm
             .map(|accepted| accepted.tick)
             .unwrap_or_default();
@@ -3773,15 +3776,17 @@ where
                     CognitionOutcome::Cancelled => Some("latest request was cancelled".to_string()),
                     _ => None,
                 });
-        let enhanced_cognition_available = !cognition_busy && cognition_failure.is_none();
+        // Occupancy and health are separate: advance_cognition immediately
+        // queues the next request after accepting a result, so a pending task
+        // means the healthy service is busy, not unavailable.
+        let enhanced_cognition_available = cognition_failure.is_none();
         world_context.cognitive_services.insert(
             "rich_language".to_string(),
             CognitiveServiceBelief {
                 available: enhanced_cognition_available,
+                busy: cognition_busy,
                 confidence: 1.0,
-                unavailable_reason: cognition_busy
-                    .then(|| "request in flight (busy)".to_string())
-                    .or(cognition_failure),
+                unavailable_reason: cognition_failure,
                 meta: BeliefMeta {
                     confidence: 1.0,
                     observed_at_ms: now.t_ms,
@@ -16844,6 +16849,53 @@ mod tests {
             .and_then(|value| serde_json::from_value::<ActionSelectionDecision>(value).ok())
             .unwrap();
         assert_eq!(decision.selected_action, Some(ActionPrimitive::Stop));
+    }
+
+    #[tokio::test]
+    async fn accepted_cognition_remains_available_while_next_request_is_in_flight() {
+        let ledger = JsonlLedger::new("/tmp/pete-runtime-cognition-service-health-test");
+        let memory = InMemoryExperienceStore::new();
+        let mut runtime = MinimalRuntime::new(
+            ledger,
+            memory.clone(),
+            memory,
+            FixedConductor::new(ActionPrimitive::Stop),
+            SimpleSafety::default(),
+            FixedLlmAgent {
+                action: ActionPrimitive::Stop,
+            },
+        );
+
+        let first = runtime
+            .tick(idle_now(100), ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+        let first_service =
+            &first.frame.now.world.self_model.service_state.services["rich_language"];
+        assert!(first_service.available);
+        assert!(first_service.busy);
+        assert_eq!(first_service.unavailable_reason, None);
+
+        tokio::task::yield_now().await;
+        let accepted = runtime
+            .tick(idle_now(200), ExperienceLatent::default(), Vec::new())
+            .await
+            .unwrap();
+        assert!(matches!(
+            runtime.cognition.last_outcome.as_ref(),
+            Some(CognitionOutcome::Accepted)
+        ));
+        assert!(runtime.cognition.pending.is_some());
+        let accepted_service =
+            &accepted.frame.now.world.self_model.service_state.services["rich_language"];
+        assert!(accepted_service.available);
+        assert!(accepted_service.busy);
+        assert_eq!(accepted_service.unavailable_reason, None);
+        assert!(accepted
+            .frame
+            .notes
+            .iter()
+            .any(|note| note == "LlmProviderOutcome: accepted"));
     }
 
     #[tokio::test]

@@ -388,6 +388,12 @@ pub struct CognitiveServiceBelief {
     pub capability: Option<String>,
     pub capability_version: Option<String>,
     pub available: bool,
+    /// The service is healthy but currently processing a request.
+    ///
+    /// Busy services remain available: callers may rely on the capability even
+    /// when they cannot expect a new request to begin immediately.
+    #[serde(default)]
+    pub busy: bool,
     pub confidence: f32,
     pub unavailable_reason: Option<String>,
     pub host_id: Option<HostId>,
@@ -1482,6 +1488,7 @@ fn integrate_cognitive_registry(now: &Now, services: &mut CognitiveServiceSummar
                 capability: Some(key.clone()),
                 capability_version: Some(capability.version.clone()),
                 available,
+                busy: false,
                 confidence: (provider.health.confidence * capability.performance_confidence)
                     .clamp(0.0, 1.0),
                 unavailable_reason: (!available).then(|| {
@@ -2148,6 +2155,7 @@ mod tests {
     fn higher_brain_loss_removes_enhanced_capability_not_organism_identity() {
         let service = CognitiveServiceBelief {
             available: true,
+            busy: true,
             confidence: 1.0,
             meta: simple_meta(10, BeliefSourceKind::Map, "service.rich_language"),
             ..CognitiveServiceBelief::default()
@@ -2173,11 +2181,25 @@ mod tests {
             .self_model
             .capabilities
             .is_available("service:rich_language"));
+        assert!(first.world.self_model.service_state.services["rich_language"].busy);
         assert!(!second
             .world
             .self_model
             .capabilities
             .is_available("service:rich_language"));
+    }
+
+    #[test]
+    fn cognitive_service_busy_defaults_false_for_older_snapshots() {
+        let mut value = serde_json::to_value(CognitiveServiceBelief::default()).unwrap();
+        value
+            .as_object_mut()
+            .expect("service belief object")
+            .remove("busy");
+
+        let service: CognitiveServiceBelief = serde_json::from_value(value).unwrap();
+
+        assert!(!service.busy);
     }
 
     #[test]

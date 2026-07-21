@@ -26,7 +26,9 @@ remain infrastructure identities.
 - `motivation`: bounded drive state, selected goal, commitment age, progress, uncertainty, and strategy-failure pressure;
 - `active_control`: goal/behavior/skill/action plus autonomous, operator, autonomic-reflex, or safety-veto provenance;
 - `continuity`: bounded references to episodes, experiences, relationships, places, self-actions, outcomes, and capability changes;
-- `service_state`: replaceable cognitive services and their host/process availability.
+- `service_state`: replaceable cognitive services and their host/process
+  availability, with request occupancy reported separately as `busy` so a
+  healthy in-flight service remains usable.
 
 Compatibility body projections remain temporarily for existing goal and safety consumers. They are views of the same integrated evidence, not a second self-model.
 
