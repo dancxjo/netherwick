@@ -20,6 +20,8 @@ pub struct WorldSnapshot {
     pub latency_calibration: BTreeMap<String, pete_now::StreamLatencyCalibration>,
     #[serde(default)]
     pub locomotion_calibration: pete_now::LocomotionCalibrationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_assessment: Option<serde_json::Value>,
     pub extensions: Vec<ExtensionSense>,
 }
 
@@ -67,6 +69,7 @@ impl Default for WorldSnapshot {
             },
             latency_calibration: BTreeMap::new(),
             locomotion_calibration: pete_now::LocomotionCalibrationState::default(),
+            power_assessment: None,
             extensions: Vec::new(),
         }
     }
@@ -97,6 +100,10 @@ impl WorldSnapshot {
             serde_json::to_value(&self.locomotion_calibration)
                 .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
         );
+        if let Some(assessment) = self.power_assessment.clone() {
+            now.extensions
+                .insert("power.consolidation_readiness".to_string(), assessment);
+        }
         now.predictions = PredictionSense {
             schema_version: 1,
             ..PredictionSense::default()

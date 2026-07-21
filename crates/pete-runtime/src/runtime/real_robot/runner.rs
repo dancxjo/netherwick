@@ -114,6 +114,7 @@ where
             brainstem_clock: BrainstemClockMapper::default(),
             imu_arbiter: ImuArbiter::default(),
             last_imu_selection: ImuSelection::default(),
+            last_ups_trend_sample: None,
         }
     }
 
@@ -247,6 +248,15 @@ where
         let t_ms = body.last_update_ms.max(wall_time_ms());
         self.frame_processor.process_packets(t_ms, &mut packets);
         self.arbitrate_imu(&observation, &mut packets, t_ms);
+        let power_assessment = assess_real_robot_power(
+            t_ms,
+            &observation.status,
+            &body,
+            &mut self.last_ups_trend_sample,
+        )
+        .await;
+        self.now_builder
+            .set_power_assessment(Some(power_assessment));
         let mut now = self.now_builder.build(t_ms, body, packets)?;
         insert_sensor_health(&mut now, &self.sensor_poll_health);
         self.insert_imu_selection(&mut now);
@@ -351,6 +361,15 @@ where
         let t_ms = body_before.last_update_ms.max(wall_time_ms());
         self.frame_processor.process_packets(t_ms, &mut packets);
         self.arbitrate_imu(&observation, &mut packets, t_ms);
+        let power_assessment = assess_real_robot_power(
+            t_ms,
+            status_before,
+            &body_before,
+            &mut self.last_ups_trend_sample,
+        )
+        .await;
+        self.now_builder
+            .set_power_assessment(Some(power_assessment));
         let mut now = self.now_builder.build(t_ms, body_before.clone(), packets)?;
         insert_sensor_health(&mut now, &self.sensor_poll_health);
         self.insert_imu_selection(&mut now);

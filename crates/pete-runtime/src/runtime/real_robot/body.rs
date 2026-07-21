@@ -87,6 +87,66 @@ fn imu_motion_context(body: &BodySense) -> ImuMotionContext {
     }
 }
 
+async fn assess_real_robot_power(
+    now_ms: TimeMs,
+    status: &StatusSummary,
+    body: &BodySense,
+    previous_ups: &mut Option<UpsTelemetry>,
+) -> serde_json::Value {
+    let status_path = std::env::var_os("PETE_UPS_STATUS_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/run/pete/ups.json"));
+    let current_ups = tokio::time::timeout(
+        std::time::Duration::from_millis(10),
+        tokio::fs::read(&status_path),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .and_then(|bytes| serde_json::from_slice::<UpsTelemetry>(&bytes).ok());
+    let create_observed_at_ms = if status.body_packet_complete == Some(true) {
+        body.last_update_ms
+    } else {
+        0
+    };
+    let dock_ir_visible = DockIrCue::from_character(body.infrared_character).is_some();
+    let create = CreatePowerEvidence {
+        observed_at_ms: create_observed_at_ms,
+        stopped: status.active_motion == Some(false)
+            && body.velocity.forward_m_s.abs() <= 0.01
+            && body.velocity.turn_rad_s.abs() <= 0.01,
+        docked: status.battery.home_base() || dock_ir_visible,
+        home_base_contact: status.battery.home_base(),
+        dock_ir_visible,
+        charging_state: status.battery.charging_state,
+        motion_authority_active: status.active_motion.unwrap_or(true),
+        confidence: if status.body_packet_complete == Some(true) {
+            1.0
+        } else {
+            0.0
+        },
+    };
+    let policy = PowerEvidencePolicy::default();
+    let assessment = assess_consolidation_power(
+        now_ms,
+        current_ups.as_ref(),
+        previous_ups.as_ref(),
+        Some(&create),
+        &policy,
+    );
+    if let Some(current) = current_ups {
+        let replace_baseline = previous_ups.as_ref().is_none_or(|previous| {
+            current.sampled_at_ms.saturating_sub(previous.sampled_at_ms)
+                >= policy.minimum_trend_window_ms
+        });
+        if replace_baseline {
+            *previous_ups = Some(current);
+        }
+    }
+    serde_json::to_value(assessment)
+        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
+}
+
 fn record_optional_sensor_failure(health: &mut SensorPollHealth, error: String, now_ms: TimeMs) {
     health.available = false;
     health.consecutive_failures = health.consecutive_failures.saturating_add(1);

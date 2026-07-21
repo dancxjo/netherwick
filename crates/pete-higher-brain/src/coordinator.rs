@@ -2,7 +2,7 @@ use crate::auth::{Principal, Scope};
 use crate::{atomic_write_json, read_json};
 use anyhow::Result;
 use chrono::Utc;
-use pete_ups::UpsTelemetry;
+use pete_ups::{ConsolidationPowerAssessment, UpsTelemetry};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -66,6 +66,8 @@ pub struct ConsolidationCycle {
     pub retry_count: u32,
     pub last_error: Option<String>,
     pub activation_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_assessment: Option<ConsolidationPowerAssessment>,
     pub events: Vec<ConsolidationEvent>,
 }
 
@@ -141,6 +143,7 @@ impl ConsolidationCoordinator {
             retry_count: 0,
             last_error: None,
             activation_requested: false,
+            power_assessment: None,
             events: vec![ConsolidationEvent {
                 at: Utc::now().to_rfc3339(),
                 phase,
@@ -148,6 +151,82 @@ impl ConsolidationCoordinator {
             }],
         });
         self.persist()
+    }
+
+    /// Starts consolidation from the confidence- and freshness-qualified
+    /// X1202/Create evidence model. This is the production entrypoint; the
+    /// narrower `start` method remains for compatibility with existing callers.
+    pub fn start_with_power_assessment(
+        &mut self,
+        assessment: ConsolidationPowerAssessment,
+        principal: &Principal,
+    ) -> Result<()> {
+        if !assessment.consolidation_ready {
+            anyhow::bail!(
+                "consolidation refused by power evidence: {}",
+                assessment.reasons.join("; ")
+            );
+        }
+        let dock = DockReadiness {
+            create_stopped: assessment.create_stopped == Some(true),
+            docked: assessment.create_docked == Some(true),
+            charging: assessment.create_charging == Some(true),
+            motion_authority_active: assessment.motion_authority_active != Some(false),
+        };
+        let power = PowerReadiness {
+            external_power_present: assessment.external_power_present == Some(true),
+            ups_battery_percent: assessment.battery_percent.unwrap_or_default(),
+            suitable_for_training: assessment.consolidation_ready,
+        };
+        self.start(dock, power, principal)?;
+        if let Some(cycle) = self.cycle.as_mut() {
+            cycle.power_assessment = Some(assessment);
+            cycle.events.push(ConsolidationEvent {
+                at: Utc::now().to_rfc3339(),
+                phase: cycle.phase,
+                detail: "fresh independent X1202/Create evidence accepted".to_string(),
+            });
+        }
+        self.persist()
+    }
+
+    /// Re-evaluates power before each expensive phase. Loss of external-power
+    /// or charging evidence pauses in place; it never issues a motion or
+    /// brainstem command and resumes only after fresh evidence returns.
+    pub fn tick_with_power_assessment(
+        &mut self,
+        assessment: ConsolidationPowerAssessment,
+        backend: &mut dyn ConsolidationBackend,
+    ) -> Result<ConsolidationPhase> {
+        let cycle = self
+            .cycle
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("no consolidation cycle"))?;
+        cycle.power_assessment = Some(assessment.clone());
+        if !assessment.consolidation_ready {
+            let detail = format!(
+                "consolidation paused: {} ({})",
+                assessment.action,
+                assessment.reasons.join("; ")
+            );
+            cycle.last_error = Some(detail.clone());
+            if cycle
+                .events
+                .last()
+                .is_none_or(|event| event.detail != detail)
+            {
+                cycle.events.push(ConsolidationEvent {
+                    at: Utc::now().to_rfc3339(),
+                    phase: cycle.phase,
+                    detail,
+                });
+            }
+            let phase = cycle.phase;
+            self.persist()?;
+            return Ok(phase);
+        }
+        self.persist()?;
+        self.tick(backend)
     }
 
     pub fn tick(&mut self, backend: &mut dyn ConsolidationBackend) -> Result<ConsolidationPhase> {
@@ -306,6 +385,37 @@ mod tests {
         )
     }
 
+    fn assessed_ready() -> ConsolidationPowerAssessment {
+        ConsolidationPowerAssessment {
+            evaluated_at_ms: 1_000,
+            external_power_present: Some(true),
+            charging_enabled: Some(true),
+            battery_voltage_v: Some(4.0),
+            battery_percent: Some(90.0),
+            battery_current_a: None,
+            battery_current_observable: false,
+            battery_charging: pete_ups::ChargingInference::LikelyCharging,
+            battery_charging_confidence: 0.75,
+            create_stopped: Some(true),
+            create_docked: Some(true),
+            home_base_contact: Some(true),
+            dock_ir_visible: Some(true),
+            create_charging: Some(true),
+            create_charging_state: Some(2),
+            motion_authority_active: Some(false),
+            ages: pete_ups::PowerEvidenceAge::default(),
+            consolidation_ready: true,
+            action: "proceed".to_string(),
+            reasons: vec![
+                "battery current is unavailable on MAX17040G; charging is inferred".to_string(),
+            ],
+            evidence_sources: vec![
+                "x1202_pogo_max17040g_gpio6_gpio16".to_string(),
+                "create_oi_and_dock_observation".to_string(),
+            ],
+        }
+    }
+
     #[derive(Default)]
     struct Backend {
         fail_phase: Option<ConsolidationPhase>,
@@ -448,6 +558,45 @@ mod tests {
             restarted.cycle().unwrap().phase,
             ConsolidationPhase::Complete
         );
+        assert_eq!(backend.brainstem_mutations, 0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fresh_power_assessment_starts_then_external_power_loss_pauses_in_place() {
+        let path = std::env::temp_dir().join(format!(
+            "pete-coordinator-power-assessment-{}.json",
+            Uuid::new_v4()
+        ));
+        let mut coordinator = ConsolidationCoordinator::open(&path).unwrap();
+        coordinator
+            .start_with_power_assessment(assessed_ready(), &principal())
+            .unwrap();
+        assert!(coordinator.cycle().unwrap().power_assessment.is_some());
+        let initial = coordinator.cycle().unwrap().phase;
+        let mut lost = assessed_ready();
+        lost.external_power_present = Some(false);
+        lost.consolidation_ready = false;
+        lost.action = "pause_external_power_lost".to_string();
+        lost.reasons = vec!["fresh GPIO6 external-power evidence is absent".to_string()];
+        let mut backend = Backend::default();
+        assert_eq!(
+            coordinator
+                .tick_with_power_assessment(lost, &mut backend)
+                .unwrap(),
+            initial
+        );
+        assert_eq!(coordinator.cycle().unwrap().phase, initial);
+        assert!(coordinator
+            .cycle()
+            .unwrap()
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("external_power_lost")));
+        coordinator
+            .tick_with_power_assessment(assessed_ready(), &mut backend)
+            .unwrap();
+        assert_ne!(coordinator.cycle().unwrap().phase, initial);
         assert_eq!(backend.brainstem_mutations, 0);
         std::fs::remove_file(path).unwrap();
     }

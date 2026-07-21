@@ -280,6 +280,10 @@ impl NowBuilder {
         self.locomotion_calibration.observe_rotation(episode)
     }
 
+    pub fn set_power_assessment(&mut self, assessment: Option<serde_json::Value>) {
+        self.last_snapshot.power_assessment = assessment;
+    }
+
     pub fn build(
         &mut self,
         t_ms: TimeMs,

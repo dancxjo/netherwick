@@ -6097,6 +6097,7 @@ dependencies = [
  "pete-sensors",
  "pete-sim",
  "pete-skills",
+ "pete-ups",
  "rand 0.8.7",
  "serde",
  "serde_json",

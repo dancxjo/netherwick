@@ -84,6 +84,9 @@ use pete_skills::{
     BodyResource, HazardKind, HostOperation, LuaSkillConfig, LuaSkillRuntime, OperationContext,
     OrganDriver, OrganPoll, PrimitiveIntent, SkillFailure,
 };
+use pete_ups::{
+    assess_consolidation_power, CreatePowerEvidence, PowerEvidencePolicy, UpsTelemetry,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::task::JoinHandle;

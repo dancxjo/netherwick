@@ -97,6 +97,7 @@ pub struct RealRobotRunner<R, C> {
     brainstem_clock: BrainstemClockMapper,
     imu_arbiter: ImuArbiter,
     last_imu_selection: ImuSelection,
+    last_ups_trend_sample: Option<UpsTelemetry>,
 }
 
 #[derive(Clone, Debug, Default)]

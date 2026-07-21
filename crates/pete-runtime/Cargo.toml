@@ -35,3 +35,4 @@ pete-now = { path = "../pete-now" }
 pete-sensors = { path = "../pete-sensors" }
 pete-sim = { path = "../pete-sim" }
 pete-skills = { path = "../pete-skills" }
+pete-ups = { path = "../pete-ups" }

@@ -195,12 +195,23 @@ fn read_telemetry(
     let (battery_voltage_v, battery_percent) = decode_max1704x(vcell, soc);
     let external_power_present =
         input_is_active(ac_present.get_value()?, profile.external_power_active_high);
+    let sampled_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
     Ok(UpsTelemetry {
         hardware_profile: profile.name.clone(),
         battery_voltage_v,
         battery_percent,
         external_power_present,
         charging_enabled,
+        sampled_at_ms,
+        fuel_gauge_observed_at_ms: sampled_at_ms,
+        external_power_observed_at_ms: sampled_at_ms,
+        charging_command_observed_at_ms: sampled_at_ms,
+        battery_current_a: None,
+        battery_current_observable: false,
+        confidence: 1.0,
     })
 }
 

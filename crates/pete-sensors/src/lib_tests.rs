@@ -222,6 +222,23 @@ fn now_builder_captures_advisory_locomotion_calibration_without_applying_it() {
 }
 
 #[test]
+fn now_builder_exposes_power_evidence_in_dashboard_and_capture_snapshot() {
+    let mut builder = NowBuilder::new();
+    let assessment = serde_json::json!({
+        "consolidation_ready": false,
+        "action": "pause_external_power_lost",
+        "external_power_present": false,
+        "battery_current_a": null,
+        "battery_current_observable": false,
+        "ages": {"external_power_ms": 12},
+    });
+    builder.set_power_assessment(Some(assessment.clone()));
+    let now = builder.build(1_000, BodySense::default(), Vec::new()).unwrap();
+    assert_eq!(now.extensions["power.consolidation_readiness"], assessment);
+    assert_eq!(builder.snapshot().power_assessment, Some(assessment));
+}
+
+#[test]
 fn imu_auto_rejects_stale_unhealthy_future_and_untrusted_override() {
     let mut arbiter = ImuArbiter::default();
     arbiter.observe(trustworthy_imu("brainstem_board_imu", 990, 0), 1_000);
