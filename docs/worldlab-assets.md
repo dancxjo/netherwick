@@ -46,11 +46,19 @@ created before those fields existed.
 
 ## Formats
 
-RGB assets are PNG files written as RGB8. Real camera frames are exported when a raw `EyeFrame` is available in a supported format. Mock captures produce deterministic tiny RGB frames so the pipeline can be tested without hardware.
+RGB assets are PNG files written as RGB8. Real camera frames are exported when a raw `EyeFrame` is available in a supported format. Mock captures produce deterministic tiny RGB frames so the pipeline can be tested without hardware. Producer time, source, device time, and RGB-D frame identity accompany the asset when available.
 
-Depth assets are 16-bit grayscale PNG files containing millimeters. The current mock depth source exports the compact Kinect depth vector as a one-row image. Real Kinect raw depth images are the next hook.
+Depth assets are 16-bit grayscale PNG files containing millimeters. Declared
+image dimensions are required, so a real Kinect frame remains a full 640x480
+depth specimen rather than being guessed from a compact feature vector.
 
-Audio assets are WAV PCM16 chunks from `PcmAudioFrame`, with sample rate and channel count recorded in frame metadata.
+Audio assets are WAV PCM16 chunks from `PcmAudioFrame`, with sample rate,
+channel count, and producer time recorded in frame metadata.
+
+`robot --capture` exports all three raw asset types automatically, including
+captures started by `just possess-sensorium`. The standalone `capture-real`
+command uses its `--export-rgb`, `--export-depth`, and `--export-audio`
+switches.
 
 Per-frame point-cloud v0 assets are ASCII PLY files generated from depth. The conversion uses a max-depth filter and a stride/downsample factor. Until calibrated intrinsics are supplied, Worldlab uses approximate placeholder intrinsics and writes an `uncalibrated point cloud` warning into the manifest.
 

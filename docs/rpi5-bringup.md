@@ -158,7 +158,11 @@ assets/audio/
 assets/pointcloud/
 ```
 
-The manifest includes machine info, command args, device availability, present/missing streams, start/end times, warnings, and the reserved asset layout. Compact body/sensor features are embedded in `frames.jsonl`; raw RGB/depth/audio export is reserved by path but not yet written.
+The manifest includes machine info, command args, device availability,
+present/missing streams, start/end times, warnings, and the asset layout.
+`robot --capture` writes lossless RGB PNG, depth16 PNG, and PCM16 WAV files when
+those source streams are present, while `frames.jsonl` retains the fused frame
+and calibration provenance that names each asset.
 
 `inspect-capture` should show frame count, duration, streams present/missing, first/last timestamps, event count, asset counts, and warnings.
 

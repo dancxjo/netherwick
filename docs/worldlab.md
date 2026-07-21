@@ -109,7 +109,14 @@ cargo run -p pete-tools -- capture-real \
   --out data/captures/real/rpi5-smoke
 ```
 
-Record a mocked session with RGB, depth, and audio assets:
+The normal `robot --capture` path, including `just possess-sensorium`,
+automatically writes lossless RGB PNG, depth16 PNG, and PCM16 WAV assets
+whenever those raw sensor payloads are present in the fused frame. Per-frame
+metadata keeps producer timestamps, Kinect device timestamps, and RGB-D frame
+identity so the original inputs can be reprocessed independently of the live
+map.
+
+Record a mocked standalone capture with RGB, depth, and audio assets:
 
 ```bash
 cargo run --bin pete -- capture-real \
