@@ -150,11 +150,11 @@ and simulated end-to-end exercise.
 
 Pete now has working real-world perception and guarded physical possession. Kinect RGB and depth data can be fused into aligned, Minecrafty but properly colored 3D voxels, while `just possess` establishes the motherbrain lease, streams body telemetry, and drives through bounded safety gates. The active milestone is behavior validation: proving that normal runs compose perception, action selection, autonomic vetoes, brainstem reflexes, recovery, and learning traces consistently.
 
-The project still keeps the larger PETE architecture in view. Pete gathers raw sensors, memory recalls, internal drives, model predictions, surprise, and LLM guidance into `Now`. `Now` is compressed into an `ExperienceLatent`, used to imagine futures, choose actions, and train from consequences.
+The project still keeps the larger PETE architecture in view. Pete gathers raw sensors, memory recalls, internal drives, model predictions, surprise, and LLM-derived evidence into `Now`. `Now` is compressed into an `ExperienceLatent`, used to imagine futures, choose actions, and train from consequences.
 
-Pete acts through high-level action primitives. A hard-coded autonomic layer keeps the body safe. The LLM may command, reflect, critique, and teach, but cannot bypass safety.
+Pete acts through high-level action primitives. A hard-coded autonomic layer keeps the body safe. The LLM may reflect, critique, teach, and produce counterfactuals, but its output returns only as evidence. It cannot select goals, become a Cockpit proposal, acquire motion authority, or issue motor commands.
 
-The LLM loop is active as a trainer, critic, and planner. It predicts counterfactual outcomes, critiques training data, and suggests motion intents. Physical motion now reaches the body through possession; the remaining work is to validate behavior and safety outcomes under real contact, charging, cliff, wheel-drop, heartbeat-loss, and transport-loss conditions.
+The LLM loop is active as a trainer, critic, and advisory planner. It predicts counterfactual outcomes, critiques training data, and records possible tests or motions as typed evidence. Local goals, skills, Reign, and safety own action selection and physical motion through possession. The remaining work is to validate behavior and safety outcomes under real contact, charging, cliff, wheel-drop, heartbeat-loss, and transport-loss conditions.
 
 Every hard-coded behavior is replaceable. It can run directly, shadow-train a model, compare with a model, promote a model, or fall back to safe hand-written logic.
 
@@ -163,7 +163,7 @@ Run `just train --neat locomotion` to evolve it through a staged, WorldLab-visib
 curriculum and promote it when the transfer audit beats the active baseline. See
 [docs/neat-locomotion.md](docs/neat-locomotion.md).
 
-Pete is an embodied predictive organism: a robot body with reflexes, an experience ledger, compact learned present, imagined futures, memory returning as sensation, swappable learned behaviors, an LLM consciousness that commands and teaches, and safety that protects the body.
+Pete is an embodied predictive organism: a robot body with reflexes, an experience ledger, compact learned present, imagined futures, memory returning as sensation, swappable learned behaviors, LLM cognition that contributes evidence and teaching, and safety that protects the body.
 
 Pete's higher-brain split now has a reproducible forebrain, a strictly separate
 bulk-data plane, immutable experience bundles, durable training jobs, and
@@ -251,7 +251,7 @@ A **constellation** is a repeatable pattern of experience, not merely a visual c
 - text labels and image descriptions,
 - memory recalls,
 - prediction error and surprise,
-- LLM counterfactuals, critiques, and suggested actions.
+- LLM counterfactuals, critiques, and advisory action hypotheses preserved as evidence.
 
 The search target is not yet "chair" or "kitchen." The search target is "I have seen this arrangement before." Once a constellation survives time, viewpoint changes, lighting changes, motion, and critique, it can be promoted into an object, place, affordance, or training specimen.
 
