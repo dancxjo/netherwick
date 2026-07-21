@@ -385,6 +385,7 @@ fn brainstem_imu_sense(
             clock_confidence,
             clock_source: Some(clock_source),
             source_epoch,
+            reported_sample_age_ms: imu.sample_age_ms,
             supported_axes: vec![
                 "roll".to_string(),
                 "pitch".to_string(),

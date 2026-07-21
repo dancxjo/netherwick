@@ -20,6 +20,7 @@ pub struct ImuCandidateMetadata {
     pub clock_confidence: f32,
     pub clock_source: Option<String>,
     pub source_epoch: u64,
+    pub reported_sample_age_ms: Option<u32>,
     pub supported_axes: Vec<String>,
     pub provenance: String,
 }
@@ -93,6 +94,7 @@ impl ImuArbiter {
                 clock_confidence: 1.0,
                 clock_source: Some("motherbrain_host_clock".to_string()),
                 source_epoch,
+                reported_sample_age_ms: None,
                 supported_axes,
                 provenance,
             },
@@ -360,6 +362,7 @@ impl ImuArbiter {
                     "healthy": metadata.is_some_and(|metadata| metadata.healthy),
                     "last_sample_timestamp_ms": sample.map(|sample| sample.captured_at_ms),
                     "sample_age_ms": sample.map(|sample| now_ms.saturating_sub(sample.captured_at_ms)),
+                    "producer_reported_sample_age_ms": metadata.and_then(|metadata| metadata.reported_sample_age_ms),
                     "fresh": sample.is_some_and(|sample| sample.captured_at_ms <= now_ms.saturating_add(IMU_FUTURE_TOLERANCE_MS) && now_ms.saturating_sub(sample.captured_at_ms) <= IMU_FRESH_MS),
                     "clock_confidence": metadata.map(|metadata| metadata.clock_confidence),
                     "clock_source": metadata.and_then(|metadata| metadata.clock_source.as_deref()),

@@ -26,6 +26,7 @@ fn candidate_metadata(source: &str, source_epoch: u64, healthy: bool) -> ImuCand
         clock_confidence: 0.9,
         clock_source: Some("test_host_clock".to_string()),
         source_epoch,
+        reported_sample_age_ms: Some(5),
         supported_axes: vec![
             "roll".to_string(),
             "pitch".to_string(),
