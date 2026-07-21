@@ -6,6 +6,11 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Add bounded offline object detection for Kinect/camera RGB with a backend-
+  neutral interface, latest-first Pi 5 worker, calibration-aware depth
+  association, short-term tracking, provenance-bearing descendant crops,
+  capture/live diagnostics, and deterministic fixture/capture evaluation.
+
 - Add exact-input learned-locomotion shadow records with baseline/candidate
   provenance, inference timing, explicit candidate failures, downstream safety
   evidence, and fail-closed promotion gates requiring valid held-out simulation

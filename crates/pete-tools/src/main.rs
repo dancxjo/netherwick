@@ -94,6 +94,7 @@ include!("commands/possession.rs");
 include!("commands/hardware.rs");
 include!("commands/models.rs");
 include!("commands/reports.rs");
+include!("commands/vision.rs");
 
 #[cfg(test)]
 #[path = "main_tests.rs"]

@@ -134,6 +134,8 @@ rehearse-models:
     cargo run -q -p xtask -- rehearse-models
 eval-scenario-smoke:
     cargo run -q -p xtask -- eval-scenario-smoke
+vision-eval *args:
+    cargo run -q -p pete-tools --no-default-features -- vision-eval {{args}}
 social-exam *args:
     cargo run -q -p pete-tools -- social-exam {{args}}
 inspect-ledger:

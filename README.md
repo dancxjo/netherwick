@@ -81,6 +81,9 @@ The strongest current perception artifact is an inspectable 3D voxel world.
 
 - Kinect depth and RGB can be aligned into coarse colored voxels that correspond
   to real structures in the room.
+- Kinect RGB and optional camera frames also feed a bounded local object-
+  recognition worker with provenance-bearing hypotheses, short-term tracks,
+  descendant crops, explicit degraded states, and no cloud dependency.
 - The 3D and WebXR views are the primary inspection surfaces.
 - HLS-LFCD2 lidar support can feed planar scans into the 2D map and the same
   Kinect/lidar 3D cloud using configured sensor extrinsics.
@@ -136,6 +139,8 @@ See:
   evaluation;
 - [docs/model-registry.md](docs/model-registry.md) for checkpoint registration
   and promotion gates.
+- [docs/vision-recognition.md](docs/vision-recognition.md) for the bounded local
+  detector, replay comparison command, and Pi 5 resource envelope.
 
 ### Higher-brain split
 

@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "frames": [
+    {
+      "id": "positive-1",
+      "path": "positive-1.pgm",
+      "tags": ["positive"],
+      "sequence": "object-a",
+      "timestamp_ms": 100,
+      "annotations": [{"label": "salient object", "bbox": {"x": 5, "y": 3, "width": 7, "height": 6}, "track_id": "object-a"}]
+    },
+    {
+      "id": "positive-2",
+      "path": "positive-2.pgm",
+      "tags": ["positive", "tracking"],
+      "sequence": "object-a",
+      "timestamp_ms": 200,
+      "annotations": [{"label": "salient object", "bbox": {"x": 6, "y": 3, "width": 7, "height": 6}, "track_id": "object-a"}]
+    },
+    {
+      "id": "occlusion",
+      "path": "occlusion.pgm",
+      "tags": ["positive", "occlusion"],
+      "sequence": "occlusion",
+      "timestamp_ms": 300,
+      "annotations": [{"label": "salient object", "bbox": {"x": 4, "y": 3, "width": 8, "height": 6}, "track_id": "occluded-object"}]
+    },
+    {
+      "id": "blur",
+      "path": "blur.pgm",
+      "tags": ["positive", "blur"],
+      "sequence": "blur",
+      "timestamp_ms": 400,
+      "annotations": [{"label": "salient object", "bbox": {"x": 4, "y": 2, "width": 9, "height": 8}, "track_id": "blurred-object"}]
+    },
+    {
+      "id": "low-light",
+      "path": "low-light.pgm",
+      "tags": ["positive", "low-light"],
+      "sequence": "low-light",
+      "timestamp_ms": 500,
+      "annotations": [{"label": "salient object", "bbox": {"x": 5, "y": 3, "width": 7, "height": 6}, "track_id": "low-light-object"}]
+    },
+    {
+      "id": "negative",
+      "path": "negative.pgm",
+      "tags": ["negative"],
+      "sequence": "negative",
+      "timestamp_ms": 600,
+      "annotations": []
+    },
+    {
+      "id": "empty-scene",
+      "path": "empty-scene.pgm",
+      "tags": ["negative", "empty-scene"],
+      "sequence": "empty",
+      "timestamp_ms": 700,
+      "annotations": []
+    }
+  ]
+}

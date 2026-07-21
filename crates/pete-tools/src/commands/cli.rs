@@ -52,6 +52,7 @@ enum Command {
     RetinaMockSend(RetinaMockSendArgs),
     EmbodiedDemo(EmbodiedDemoArgs),
     EmbodiedEval(EmbodiedEvalArgs),
+    VisionEval(VisionEvalArgs),
 }
 
 #[tokio::main]
@@ -91,6 +92,7 @@ async fn main() -> Result<()> {
         Command::RetinaMockSend(args) => run_retina_mock_send(args).await,
         Command::EmbodiedDemo(args) => run_embodied_demo(args).await,
         Command::EmbodiedEval(args) => run_embodied_eval(args).await,
+        Command::VisionEval(args) => run_vision_eval(args).await,
         other => {
             println!("selected command: {:?}", other);
             Ok(())
@@ -821,6 +823,23 @@ struct ReplayCounterfactualArgs {
     out_report: Option<String>,
     #[command(flatten)]
     llm: LlmArgs,
+}
+
+#[derive(Debug, Parser)]
+struct VisionEvalArgs {
+    /// Fixture manifest. Ignored when --capture is supplied.
+    #[arg(long, default_value = "data/vision-fixtures/manifest.json")]
+    fixtures: String,
+    /// Recorded capture to evaluate instead of fixtures.
+    #[arg(long)]
+    capture: Option<String>,
+    #[arg(long, default_value = "classical")]
+    candidate: String,
+    #[arg(long, default_value = "unavailable")]
+    baseline: String,
+    /// Optional report path; JSON is always printed to stdout.
+    #[arg(long)]
+    out: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
