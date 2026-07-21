@@ -1034,6 +1034,59 @@ async fn provenance_bearing_detection_becomes_a_vectorized_visual_descendant() {
 }
 
 #[test]
+fn asynchronous_detection_keeps_lineage_after_live_frame_advances() {
+    let mut now = Now::blank(240, BodySense::default());
+    now.eye_frame = Some(pete_now::EyeFrame {
+        rgbd_frame_id: Some("rgbd-new".to_string()),
+        device_timestamp_ms: None,
+        captured_at_ms: 230,
+        width: 4,
+        height: 4,
+        format: pete_now::EyeFrameFormat::Rgb8,
+        bytes: vec![10; 4 * 4 * 3],
+        source: Some("kinect_rgb".to_string()),
+    });
+    now.objects.detections.push(pete_now::VisionDetection {
+        source_frame_id: "rgbd-old".to_string(),
+        source_sensation_id: "vision-source-old".to_string(),
+        descendant_sensation_id: "vision-source-old-detection-0".to_string(),
+        source_snapshot_id: "rgbd-old:epoch:4".to_string(),
+        source_stream: "kinect_rgb".to_string(),
+        producer_timestamp_ms: 200,
+        image_width: 4,
+        image_height: 4,
+        bbox: pete_now::VisionBoundingBox {
+            x: 1,
+            y: 1,
+            width: 2,
+            height: 2,
+        },
+        labels: vec![pete_now::VisionLabelHypothesis {
+            label: "salient object".to_string(),
+            confidence: 0.6,
+        }],
+        crop_rgb8: vec![220; 2 * 2 * 3],
+        ..pete_now::VisionDetection::default()
+    });
+
+    let sensations = primary_sensations_from_now(&now);
+    let historical = sensations
+        .iter()
+        .find(|sensation| sensation.source == "eye.historical_frame")
+        .expect("historical source snapshot");
+    let detection = sensations
+        .iter()
+        .find(|sensation| sensation.kind == "vision.object_detection")
+        .expect("historical detection descendant");
+    assert_eq!(historical.occurred_at_ms, 200);
+    assert_eq!(detection.parent_id, Some(historical.id));
+    assert_eq!(
+        detection.payload["source_snapshot_id"],
+        json!("rgbd-old:epoch:4")
+    );
+}
+
+#[test]
 fn experience_fuser_links_sensations_impressions_and_summary() {
     let mut sensation = Sensation::primary(
         Modality::Vision,

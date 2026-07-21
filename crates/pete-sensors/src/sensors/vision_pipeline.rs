@@ -311,9 +311,34 @@ impl VisionJob {
 #[derive(Clone, Debug)]
 struct VisionBatch {
     detections: Vec<VisionDetection>,
-    source_rgbd_frame_id: Option<String>,
     calibration_epoch: Option<u64>,
-    deadline_ms: u64,
+}
+
+impl VisionBatch {
+    fn estimated_bytes(&self) -> usize {
+        self.detections
+            .iter()
+            .map(|detection| {
+                detection.crop_rgb8.len()
+                    + detection.source_frame_id.len()
+                    + detection.source_sensation_id.len()
+                    + detection.descendant_sensation_id.len()
+                    + detection.source_snapshot_id.len()
+                    + detection.source_stream.len()
+                    + detection.geometry_trust.len()
+                    + detection
+                        .labels
+                        .iter()
+                        .map(|label| label.label.len())
+                        .sum::<usize>()
+                    + detection
+                        .position_unavailable_reasons
+                        .iter()
+                        .map(String::len)
+                        .sum::<usize>()
+            })
+            .sum()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -335,6 +360,7 @@ struct VisionQueues {
     pending: VecDeque<VisionJob>,
     completed: VecDeque<VisionBatch>,
     pending_bytes: usize,
+    completed_bytes: usize,
 }
 
 struct VisionPipelineState {
@@ -464,7 +490,11 @@ impl VisionPipeline {
             .lock()
             .expect("vision queue mutex poisoned");
         while queues.pending.len() >= self.state.config.queue_capacity.max(1)
-            || queues.pending_bytes.saturating_add(job_bytes) > memory_limit
+            || queues
+                .pending_bytes
+                .saturating_add(queues.completed_bytes)
+                .saturating_add(job_bytes)
+                > memory_limit
         {
             let Some(replaced) = queues.pending.pop_front() else {
                 break;
@@ -484,7 +514,7 @@ impl VisionPipeline {
         self.state.wake.notify_one();
     }
 
-    pub fn drain(&self, now_ms: u64, current_kinect: Option<&KinectSense>) -> ObjectSense {
+    pub fn drain(&self, _now_ms: u64, current_kinect: Option<&KinectSense>) -> ObjectSense {
         let current_epoch = current_kinect
             .and_then(|value| value.live_geometry_calibration.as_ref())
             .map(|value| value.epoch.id);
@@ -495,14 +525,10 @@ impl VisionPipeline {
             .lock()
             .expect("vision queue mutex poisoned");
         while let Some(batch) = queues.completed.pop_front() {
-            if now_ms > batch.deadline_ms {
-                self.state
-                    .stats
-                    .lock()
-                    .expect("vision stats mutex poisoned")
-                    .expired_frames += 1;
-                continue;
-            }
+            queues.completed_bytes = queues
+                .completed_bytes
+                .saturating_sub(batch.estimated_bytes());
+            let mut batch = batch;
             if batch.calibration_epoch.is_some()
                 && current_epoch.is_some()
                 && batch.calibration_epoch != current_epoch
@@ -512,18 +538,19 @@ impl VisionPipeline {
                     .lock()
                     .expect("vision stats mutex poisoned")
                     .stale_results += 1;
-                continue;
-            }
-            if batch.source_rgbd_frame_id.is_some()
-                && current_kinect.and_then(|kinect| kinect.rgbd_frame_id.as_ref())
-                    != batch.source_rgbd_frame_id.as_ref()
-            {
-                self.state
-                    .stats
-                    .lock()
-                    .expect("vision stats mutex poisoned")
-                    .stale_results += 1;
-                continue;
+                for detection in &mut batch.detections {
+                    detection.position = None;
+                    detection.geometry_trust = "invalidated_by_epoch_change".to_string();
+                    if !detection
+                        .position_unavailable_reasons
+                        .iter()
+                        .any(|reason| reason == "calibration epoch changed after inference")
+                    {
+                        detection
+                            .position_unavailable_reasons
+                            .push("calibration epoch changed after inference".to_string());
+                    }
+                }
             }
             detections.extend(batch.detections);
         }
@@ -684,13 +711,18 @@ fn vision_worker(weak: std::sync::Weak<VisionPipelineState>) {
             job.calibration_epoch,
             &state.config,
         );
+        let depth_associations = associate_depth_batch(
+            &job,
+            &proposals.iter().map(|proposal| proposal.bbox).collect::<Vec<_>>(),
+        );
         let model = state.backend.identity();
         let detections = proposals
             .drain(..)
             .zip(track_ids)
+            .zip(depth_associations)
             .enumerate()
-            .map(|(index, (proposal, track_id))| {
-                let (position, position_unavailable_reasons) = associate_depth(&job, proposal.bbox);
+            .map(|(index, ((proposal, track_id), depth_association))| {
+                let (position, position_unavailable_reasons) = depth_association;
                 VisionDetection {
                     source_frame_id: job.source_frame_id.clone(),
                     source_sensation_id: job.source_sensation_id.clone(),
@@ -729,20 +761,42 @@ fn vision_worker(weak: std::sync::Weak<VisionPipelineState>) {
             }
         }
         let mut queues = state.queues.lock().expect("vision queue mutex poisoned");
-        while queues.completed.len() >= state.config.result_capacity.max(1) {
-            queues.completed.pop_front();
+        let batch = VisionBatch {
+            detections,
+            calibration_epoch: job.calibration_epoch,
+        };
+        let batch_bytes = batch.estimated_bytes();
+        let memory_limit = state.config.memory_limit_mb.saturating_mul(1024 * 1024);
+        while queues.completed.len() >= state.config.result_capacity.max(1)
+            || queues
+                .pending_bytes
+                .saturating_add(queues.completed_bytes)
+                .saturating_add(batch_bytes)
+                > memory_limit
+        {
+            let Some(dropped) = queues.completed.pop_front() else {
+                break;
+            };
+            queues.completed_bytes = queues
+                .completed_bytes
+                .saturating_sub(dropped.estimated_bytes());
             state
                 .stats
                 .lock()
                 .expect("vision stats mutex poisoned")
                 .dropped_frames += 1;
         }
-        queues.completed.push_back(VisionBatch {
-            detections,
-            source_rgbd_frame_id: job.frame.rgbd_frame_id.clone(),
-            calibration_epoch: job.calibration_epoch,
-            deadline_ms: job.deadline_ms,
-        });
+        if batch_bytes <= memory_limit {
+            queues.completed_bytes = queues.completed_bytes.saturating_add(batch_bytes);
+            queues.completed.push_back(batch);
+        } else {
+            let mut stats = state.stats.lock().expect("vision stats mutex poisoned");
+            stats.dropped_frames += 1;
+            stats.latest_error = Some(format!(
+                "completed evidence needs {batch_bytes} bytes, exceeding the {} MiB queued-evidence budget",
+                state.config.memory_limit_mb
+            ));
+        }
     }
 }
 
@@ -839,92 +893,140 @@ fn bbox_iou(left: VisionBoundingBox, right: VisionBoundingBox) -> f32 {
     }
 }
 
+#[cfg(test)]
 fn associate_depth(
     job: &VisionJob,
     bbox: VisionBoundingBox,
 ) -> (Option<VisionPositionEstimate>, Vec<String>) {
-    let mut reasons = Vec::new();
+    associate_depth_batch(job, &[bbox])
+        .pop()
+        .unwrap_or_else(|| (None, vec!["detection bounding box unavailable".to_string()]))
+}
+
+fn associate_depth_batch(
+    job: &VisionJob,
+    bboxes: &[VisionBoundingBox],
+) -> Vec<(Option<VisionPositionEstimate>, Vec<String>)> {
+    let unavailable = |reason: &str| {
+        bboxes
+            .iter()
+            .map(|_| (None, vec![reason.to_string()]))
+            .collect()
+    };
     let Some(kinect) = job.kinect.as_ref() else {
-        return (None, vec!["depth snapshot unavailable".to_string()]);
+        return unavailable("depth snapshot unavailable");
     };
     if job.frame.rgbd_frame_id.is_none() || job.frame.rgbd_frame_id != kinect.rgbd_frame_id {
-        return (
-            None,
-            vec!["RGB and depth frame identities do not match".to_string()],
-        );
-    }
-    if job.frame.width != kinect.depth_width || job.frame.height != kinect.depth_height {
-        return (
-            None,
-            vec!["RGB and depth dimensions are not directly aligned".to_string()],
-        );
+        return unavailable("RGB and depth frame identities do not match");
     }
     let Some(calibration) = kinect.geometry_calibration else {
-        return (None, vec!["depth calibration unavailable".to_string()]);
+        return unavailable("depth calibration unavailable");
     };
     if !calibration.physical_validation_ready() {
-        return (
-            None,
-            vec!["depth calibration is not physically validated".to_string()],
-        );
+        return unavailable("depth calibration is not physically validated");
     }
     if !pete_now::DepthGeometry::live_transform_trusted(kinect) {
-        return (
-            None,
-            vec!["active calibration epoch is not trusted".to_string()],
-        );
+        return unavailable("active calibration epoch is not trusted");
     }
     let Some(geometry) = pete_now::DepthGeometry::from_kinect(kinect) else {
-        return (None, vec!["depth geometry is invalid".to_string()]);
+        return unavailable("depth geometry is invalid");
     };
-    let center_x = bbox
-        .x
-        .saturating_add(bbox.width / 2)
-        .min(kinect.depth_width.saturating_sub(1));
-    let center_y = bbox
-        .y
-        .saturating_add(bbox.height / 2)
-        .min(kinect.depth_height.saturating_sub(1));
-    let radius_x = (bbox.width / 8).max(1);
-    let radius_y = (bbox.height / 8).max(1);
-    let mut samples = Vec::new();
-    for y in center_y.saturating_sub(radius_y)
-        ..=center_y
-            .saturating_add(radius_y)
-            .min(kinect.depth_height.saturating_sub(1))
+    let Some(rgb) = calibration.rgb else {
+        return unavailable("color-to-depth registration intrinsics are unavailable");
+    };
+    if calibration.depth_to_rgb.is_none() {
+        return unavailable("color-to-depth camera extrinsics are unavailable");
+    }
+    if rgb.width != job.frame.width || rgb.height != job.frame.height {
+        return unavailable("RGB frame dimensions do not match registration calibration");
+    }
+    if calibration.depth.width != kinect.depth_width
+        || calibration.depth.height != kinect.depth_height
     {
-        for x in center_x.saturating_sub(radius_x)
-            ..=center_x
-                .saturating_add(radius_x)
-                .min(kinect.depth_width.saturating_sub(1))
-        {
+        return unavailable("depth frame dimensions do not match registration calibration");
+    }
+
+    // Reproject each depth sample into the RGB optical frame once, then assign
+    // it to the central region of matching RGB detections. Equal image sizes
+    // are deliberately irrelevant: Kinect color and depth pixels are not the
+    // same rays.
+    let windows = bboxes
+        .iter()
+        .map(|bbox| {
+            let center_x = bbox.x as f32 + bbox.width as f32 * 0.5;
+            let center_y = bbox.y as f32 + bbox.height as f32 * 0.5;
+            let radius_x = (bbox.width as f32 * 0.125).max(1.0);
+            let radius_y = (bbox.height as f32 * 0.125).max(1.0);
+            [
+                center_x - radius_x,
+                center_y - radius_y,
+                center_x + radius_x,
+                center_y + radius_y,
+            ]
+        })
+        .collect::<Vec<_>>();
+    let mut samples = vec![Vec::<[f32; 3]>::new(); bboxes.len()];
+    for y in 0..kinect.depth_height {
+        for x in 0..kinect.depth_width {
             let index = y as usize * kinect.depth_width as usize + x as usize;
-            if let Some(value) = kinect
+            let Some(raw_depth_m) = kinect
                 .depth_m
                 .get(index)
                 .copied()
                 .filter(|value| value.is_finite() && *value > 0.0)
+            else {
+                continue;
+            };
+            let Some(camera) = geometry.depth_pixel_to_camera(x as f32, y as f32, raw_depth_m)
+            else {
+                continue;
+            };
+            if (kinect.min_depth_m > 0.0 && camera[2] < kinect.min_depth_m)
+                || (kinect.max_depth_m > 0.0 && camera[2] > kinect.max_depth_m)
             {
-                samples.push(value);
+                continue;
+            }
+            let Some([rgb_x, rgb_y]) = geometry.depth_point_to_rgb_pixel(camera) else {
+                continue;
+            };
+            for (index, [x0, y0, x1, y1]) in windows.iter().copied().enumerate() {
+                if rgb_x >= x0 && rgb_x <= x1 && rgb_y >= y0 && rgb_y <= y1 {
+                    samples[index].push(camera);
+                }
             }
         }
     }
-    if samples.is_empty() {
-        return (
-            None,
-            vec!["no valid depth samples inside detection".to_string()],
-        );
-    }
-    samples.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
-    let raw_depth_m = samples[samples.len() / 2];
-    let Some(camera) =
-        geometry.depth_pixel_to_camera(center_x as f32, center_y as f32, raw_depth_m)
-    else {
-        return (
-            None,
-            vec!["detection could not be projected through depth geometry".to_string()],
-        );
-    };
+
+    samples
+        .into_iter()
+        .map(|mut samples| {
+            if samples.is_empty() {
+                return (
+                    None,
+                    vec!["no registered depth samples inside RGB detection".to_string()],
+                );
+            }
+            samples.sort_by(|left, right| {
+                left[2]
+                    .partial_cmp(&right[2])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            position_from_registered_depth(job, geometry, calibration, samples[samples.len() / 2])
+        })
+        .collect()
+}
+
+fn position_from_registered_depth(
+    job: &VisionJob,
+    geometry: pete_now::DepthGeometry,
+    calibration: pete_now::DepthGeometryCalibration,
+    camera: [f32; 3],
+) -> (Option<VisionPositionEstimate>, Vec<String>) {
+    let mut reasons = Vec::new();
+    let kinect = job
+        .kinect
+        .as_ref()
+        .expect("registered depth requires a Kinect snapshot");
     let robot_position_m = geometry.depth_point_to_base(camera);
     let world_position_m = kinect.fusion_alignment.as_ref().and_then(|alignment| {
         if alignment.confidence < 0.5 {

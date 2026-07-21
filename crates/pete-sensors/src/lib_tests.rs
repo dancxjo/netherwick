@@ -674,7 +674,7 @@ fn unavailable_vision_backend_degrades_explicitly() {
 }
 
 #[test]
-fn vision_pipeline_rejects_expired_and_old_calibration_epoch_results() {
+fn vision_pipeline_keeps_historical_results_and_invalidates_only_old_epoch_geometry() {
     let pipeline = VisionPipeline::spawn(
         VisionPipelineConfig::default(),
         Arc::new(ClassicalSaliencyBackend),
@@ -691,30 +691,38 @@ fn vision_pipeline_rejects_expired_and_old_calibration_epoch_results() {
     {
         let mut queues = pipeline.state.queues.lock().unwrap();
         queues.completed.push_back(VisionBatch {
-            detections: vec![VisionDetection::default()],
-            source_rgbd_frame_id: None,
+            detections: vec![VisionDetection {
+                source_frame_id: "rgbd-old-epoch".to_string(),
+                position: Some(pete_now::VisionPositionEstimate {
+                    depth_m: 1.0,
+                    ..pete_now::VisionPositionEstimate::default()
+                }),
+                ..VisionDetection::default()
+            }],
             calibration_epoch: Some(current_epoch.saturating_add(1)),
-            deadline_ms: 1_000,
         });
         queues.completed.push_back(VisionBatch {
-            detections: vec![VisionDetection::default()],
-            source_rgbd_frame_id: None,
+            detections: vec![VisionDetection {
+                source_frame_id: "rgbd-earlier-frame".to_string(),
+                ..VisionDetection::default()
+            }],
             calibration_epoch: Some(current_epoch),
-            deadline_ms: 10,
-        });
-        queues.completed.push_back(VisionBatch {
-            detections: vec![VisionDetection::default()],
-            source_rgbd_frame_id: Some("rgbd-old".to_string()),
-            calibration_epoch: Some(current_epoch),
-            deadline_ms: 1_000,
         });
     }
 
     let objects = pipeline.drain(20, Some(&kinect));
     let health = objects.vision_health.unwrap();
-    assert!(objects.detections.is_empty());
-    assert_eq!(health.stale_results, 2);
-    assert_eq!(health.expired_frames, 1);
+    assert_eq!(objects.detections.len(), 2);
+    let old_epoch = &objects.detections[0];
+    assert!(old_epoch.position.is_none());
+    assert_eq!(old_epoch.geometry_trust, "invalidated_by_epoch_change");
+    assert!(old_epoch
+        .position_unavailable_reasons
+        .iter()
+        .any(|reason| reason.contains("epoch changed")));
+    assert_eq!(objects.detections[1].source_frame_id, "rgbd-earlier-frame");
+    assert_eq!(health.stale_results, 1);
+    assert_eq!(health.expired_frames, 0);
 }
 
 #[test]
@@ -765,6 +773,16 @@ fn vision_depth_association_uses_only_matching_physically_validated_rgbd() {
                 cy: 5.5,
                 distortion: [0.0; 5],
             },
+            rgb: Some(pete_now::CameraIntrinsics {
+                width: 16,
+                height: 12,
+                fx: 14.0,
+                fy: 14.0,
+                cx: 7.5,
+                cy: 5.5,
+                distortion: [0.0; 5],
+            }),
+            depth_to_rgb: Some(pete_now::RigidTransform3::default()),
             depth_scale: 1.0,
             validation: Some(pete_now::DepthCalibrationValidation {
                 distance_sample_count: 4,
@@ -809,6 +827,77 @@ fn vision_depth_association_uses_only_matching_physically_validated_rgbd() {
     let (position, reasons) = associate_depth(&mismatched, bbox);
     assert!(position.is_none());
     assert_eq!(reasons, vec!["RGB and depth frame identities do not match"]);
+}
+
+#[test]
+fn vision_depth_association_reprojects_depth_into_rgb_coordinates() {
+    let frame = vision_test_frame(100, true);
+    let mut depth_m = vec![0.0; 16 * 12];
+    depth_m[4 * 16 + 2] = 1.0;
+    let calibration = pete_now::DepthGeometryCalibration {
+        calibrated: true,
+        depth: pete_now::CameraIntrinsics {
+            width: 16,
+            height: 12,
+            fx: 10.0,
+            fy: 10.0,
+            cx: 0.0,
+            cy: 0.0,
+            ..pete_now::CameraIntrinsics::default()
+        },
+        rgb: Some(pete_now::CameraIntrinsics {
+            width: 16,
+            height: 12,
+            fx: 10.0,
+            fy: 10.0,
+            cx: 0.0,
+            cy: 0.0,
+            ..pete_now::CameraIntrinsics::default()
+        }),
+        depth_to_rgb: Some(pete_now::RigidTransform3 {
+            translation_m: [0.4, 0.0, 0.0],
+            ..pete_now::RigidTransform3::default()
+        }),
+        depth_scale: 1.0,
+        validation: Some(pete_now::DepthCalibrationValidation {
+            distance_sample_count: 4,
+            min_test_distance_m: 0.4,
+            max_test_distance_m: 3.0,
+            max_plane_distance_error_m: 0.01,
+            rgb_depth_boundary_error_px: 2.0,
+        }),
+        ..pete_now::DepthGeometryCalibration::default()
+    };
+    let job = VisionJob {
+        enqueued_at_ms: 100,
+        deadline_ms: 280,
+        source_frame_id: "rgbd-100".to_string(),
+        source_sensation_id: "vision-source-100".to_string(),
+        source_snapshot_id: "rgbd-100:epoch:none".to_string(),
+        source_stream: "kinect_rgb".to_string(),
+        calibration_epoch: None,
+        kinect: Some(KinectSense {
+            rgbd_frame_id: frame.rgbd_frame_id.clone(),
+            depth_width: 16,
+            depth_height: 12,
+            depth_m,
+            geometry_calibration: Some(calibration),
+            ..KinectSense::default()
+        }),
+        frame,
+    };
+
+    let (position, reasons) = associate_depth(
+        &job,
+        VisionBoundingBox {
+            x: 5,
+            y: 3,
+            width: 3,
+            height: 3,
+        },
+    );
+    assert!(position.is_some(), "{reasons:?}");
+    assert!(reasons.iter().any(|reason| reason.contains("world pose")));
 }
 
 #[test]

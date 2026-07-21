@@ -87,84 +87,9 @@ pub fn primary_sensations_from_now(now: &Now) -> Vec<Sensation> {
                 && detection.image_width == frame.width
                 && detection.image_height == frame.height
         }) {
-            let Some(label) = detection.labels.first() else {
-                continue;
-            };
-            let mut metadata = sensation.metadata.clone();
-            metadata.bbox = Some(BoundingBox {
-                x: detection.bbox.x,
-                y: detection.bbox.y,
-                width: detection.bbox.width,
-                height: detection.bbox.height,
-            });
-            metadata.confidence = Some(label.confidence);
-            metadata.labels = detection
-                .labels
-                .iter()
-                .map(|hypothesis| hypothesis.label.clone())
-                .collect();
-            metadata.properties.insert(
-                "detection_kind".to_string(),
-                Value::String("object".to_string()),
-            );
-            metadata.properties.insert(
-                "detection_label".to_string(),
-                Value::String(label.label.clone()),
-            );
-            metadata
-                .properties
-                .insert("track_id".to_string(), json!(detection.track_id));
-            metadata.properties.insert(
-                "source_snapshot_id".to_string(),
-                Value::String(detection.source_snapshot_id.clone()),
-            );
-            metadata.properties.insert(
-                "calibration_epoch".to_string(),
-                json!(detection.calibration_epoch),
-            );
-            metadata.properties.insert(
-                "geometry_trust".to_string(),
-                Value::String(detection.geometry_trust.clone()),
-            );
-            let mut payload = json!({
-                "parent_image": sensation.id,
-                "source_frame_id": detection.source_frame_id,
-                "source_sensation_id": detection.source_sensation_id,
-                "descendant_sensation_id": detection.descendant_sensation_id,
-                "source_stream": detection.source_stream,
-                "producer_timestamp_ms": detection.producer_timestamp_ms,
-                "bbox": detection.bbox,
-                "width": detection.bbox.width,
-                "height": detection.bbox.height,
-                "format": "rgb8",
-                "labels": detection.labels,
-                "model": detection.model,
-                "inference_started_at_ms": detection.inference_started_at_ms,
-                "inference_completed_at_ms": detection.inference_completed_at_ms,
-                "inference_duration_ms": detection.inference_duration_ms,
-                "deadline_ms": detection.deadline_ms,
-                "track_id": detection.track_id,
-                "calibration_epoch": detection.calibration_epoch,
-                "geometry_trust": detection.geometry_trust,
-                "position": detection.position,
-                "position_unavailable_reasons": detection.position_unavailable_reasons,
-            });
-            if !detection.crop_rgb8.is_empty() {
-                payload["raw_bytes_b64"] = Value::String(
-                    base64::engine::general_purpose::STANDARD.encode(&detection.crop_rgb8),
-                );
+            if let Some(descendant) = vision_detection_descendant(&sensation, detection) {
+                detection_descendants.push(descendant);
             }
-            detection_descendants.push(
-                Sensation::descendant(
-                    &sensation,
-                    "vision.object_detection",
-                    SensationPayloadKind::Crop,
-                    payload,
-                    metadata,
-                    "descendant.object_detection",
-                )
-                .with_summary(format!("I see an object that may be a {}.", label.label)),
-            );
         }
         sensations.push(sensation);
         sensations.extend(detection_descendants);
@@ -191,6 +116,59 @@ pub fn primary_sensations_from_now(now: &Now) -> Vec<Sensation> {
         .with_summary("I have visual features from my eye.");
         sensation.metadata.confidence = Some(0.55);
         sensations.push(sensation);
+    }
+
+    // Background inference commonly finishes after the live eye frame has
+    // advanced. Preserve those detections under a metadata-only primary for
+    // their immutable source snapshot instead of silently losing lineage.
+    let mut historical = std::collections::BTreeMap::<&str, Vec<&VisionDetection>>::new();
+    for detection in now.objects.detections.iter().filter(|detection| {
+        !now.eye_frame.as_ref().is_some_and(|frame| {
+            detection.producer_timestamp_ms == frame.captured_at_ms
+                && detection.image_width == frame.width
+                && detection.image_height == frame.height
+        })
+    }) {
+        historical
+            .entry(detection.source_snapshot_id.as_str())
+            .or_default()
+            .push(detection);
+    }
+    for detections in historical.into_values() {
+        let Some(first) = detections.first().copied() else {
+            continue;
+        };
+        let mut source = SensationSource::new("eye.historical_frame");
+        source.device_id = Some(first.source_stream.clone());
+        source.frame_id = Some(first.source_frame_id.clone());
+        let mut parent = Sensation::primary(
+            Modality::Vision,
+            source,
+            first.producer_timestamp_ms,
+            now.t_ms,
+            SensationPayload::image_metadata(
+                first.image_width,
+                first.image_height,
+                "Rgb8",
+                0,
+            ),
+        )
+        .with_summary("I retain a camera snapshot referenced by completed inference.");
+        parent.metadata.confidence = Some(0.65);
+        parent
+            .metadata
+            .properties
+            .insert("raw_bytes_present".to_string(), json!(false));
+        parent.metadata.properties.insert(
+            "source_snapshot_id".to_string(),
+            Value::String(first.source_snapshot_id.clone()),
+        );
+        let descendants = detections
+            .into_iter()
+            .filter_map(|detection| vision_detection_descendant(&parent, detection))
+            .collect::<Vec<_>>();
+        sensations.push(parent);
+        sensations.extend(descendants);
     }
 
     if !now.face.vectors.is_empty() {
@@ -445,6 +423,89 @@ pub fn primary_sensations_from_now(now: &Now) -> Vec<Sensation> {
     }
 
     sensations
+}
+
+fn vision_detection_descendant(
+    parent: &Sensation,
+    detection: &VisionDetection,
+) -> Option<Sensation> {
+    let label = detection.labels.first()?;
+    let mut metadata = parent.metadata.clone();
+    metadata.bbox = Some(BoundingBox {
+        x: detection.bbox.x,
+        y: detection.bbox.y,
+        width: detection.bbox.width,
+        height: detection.bbox.height,
+    });
+    metadata.confidence = Some(label.confidence);
+    metadata.labels = detection
+        .labels
+        .iter()
+        .map(|hypothesis| hypothesis.label.clone())
+        .collect();
+    metadata.properties.insert(
+        "detection_kind".to_string(),
+        Value::String("object".to_string()),
+    );
+    metadata.properties.insert(
+        "detection_label".to_string(),
+        Value::String(label.label.clone()),
+    );
+    metadata
+        .properties
+        .insert("track_id".to_string(), json!(detection.track_id));
+    metadata.properties.insert(
+        "source_snapshot_id".to_string(),
+        Value::String(detection.source_snapshot_id.clone()),
+    );
+    metadata.properties.insert(
+        "calibration_epoch".to_string(),
+        json!(detection.calibration_epoch),
+    );
+    metadata.properties.insert(
+        "geometry_trust".to_string(),
+        Value::String(detection.geometry_trust.clone()),
+    );
+    let mut payload = json!({
+        "parent_image": parent.id,
+        "source_frame_id": detection.source_frame_id,
+        "source_sensation_id": detection.source_sensation_id,
+        "descendant_sensation_id": detection.descendant_sensation_id,
+        "source_snapshot_id": detection.source_snapshot_id,
+        "source_stream": detection.source_stream,
+        "producer_timestamp_ms": detection.producer_timestamp_ms,
+        "bbox": detection.bbox,
+        "width": detection.bbox.width,
+        "height": detection.bbox.height,
+        "format": "rgb8",
+        "labels": detection.labels,
+        "model": detection.model,
+        "inference_started_at_ms": detection.inference_started_at_ms,
+        "inference_completed_at_ms": detection.inference_completed_at_ms,
+        "inference_duration_ms": detection.inference_duration_ms,
+        "deadline_ms": detection.deadline_ms,
+        "track_id": detection.track_id,
+        "calibration_epoch": detection.calibration_epoch,
+        "geometry_trust": detection.geometry_trust,
+        "position": detection.position,
+        "position_unavailable_reasons": detection.position_unavailable_reasons,
+    });
+    if !detection.crop_rgb8.is_empty() {
+        payload["raw_bytes_b64"] = Value::String(
+            base64::engine::general_purpose::STANDARD.encode(&detection.crop_rgb8),
+        );
+    }
+    Some(
+        Sensation::descendant(
+            parent,
+            "vision.object_detection",
+            SensationPayloadKind::Crop,
+            payload,
+            metadata,
+            "descendant.object_detection",
+        )
+        .with_summary(format!("I see an object that may be a {}.", label.label)),
+    )
 }
 
 fn embodied_tags(sensations: &[Sensation]) -> Vec<String> {

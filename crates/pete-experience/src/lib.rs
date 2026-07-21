@@ -8,7 +8,7 @@ use base64::Engine;
 use pete_actions::{action_to_motor_command, ActionPrimitive, ExploreStyle, TurnDir};
 use pete_body::BodySense;
 use pete_core::{ExperienceId, ImpressionId, Provenance, Reward, SensationId, TimeMs};
-use pete_now::{DriveSense, MemorySense, Now, SenseVectorizer, SurpriseSense};
+use pete_now::{DriveSense, MemorySense, Now, SenseVectorizer, SurpriseSense, VisionDetection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
