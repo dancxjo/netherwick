@@ -32,9 +32,11 @@ All notable changes are grouped by date.
 ### Fixed
 
 - Ready: Ensure real-robot possession always attempts STOP/exorcize and capture finalization through a unified exit path even when the control loop exits with an error, and report combined shutdown/capture/control failures instead of silently dropping finalization work.
+- Ready: Extend physical possession capture coverage with a regression test that uses runtime frame timing, writes raw RGB/depth/audio assets, and validates captured asset timestamps, IDs, and file outputs in snapshot metadata.
 - Ready: Preserve RGB/depth/audio capture asset export in real-robot snapshot recording while enriching exported asset metadata with capture timing, frame identifiers, device timestamps, and source/coordinate provenance.
 - Connect the UDP cockpit socket to its configured brainstem peer so valid-looking
   datagrams from unrelated local senders cannot be accepted as brainstem replies.
+- Ready: Remove stale `export_snapshot_assets` from `pete-tools` capture import usage while preserving behavior.
 - Ready: Make possession reconnect cancellation-aware during both connection
   attempts and exponential backoff, keep the dashboard in an explicit
   stopped/reconnecting state, and allow SIGINT/SIGTERM to close capture and

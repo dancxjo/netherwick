@@ -148,13 +148,36 @@ async fn possession_mode_never_falls_back_when_brainstem_is_missing() {
 }
 
 #[tokio::test]
-async fn physical_capture_uses_runtime_frame_time_when_body_time_is_stale() {
+async fn physical_capture_uses_runtime_time_and_writes_raw_sensor_assets() {
     let temp_dir = temp_path("pete_physical_capture_runtime_time");
     let mut writer = CaptureWriter::create(&temp_dir, CaptureSource::RealRobot, Some(100))
         .await
         .unwrap();
     let mut snapshot = WorldSnapshot::default();
     snapshot.body.last_update_ms = 100;
+    snapshot.eye_frame = Some(EyeFrame {
+        captured_at_ms: 225,
+        rgbd_frame_id: Some("rgbd-7".to_string()),
+        device_timestamp_ms: Some(7),
+        width: 2,
+        height: 1,
+        format: EyeFrameFormat::Rgb8,
+        bytes: vec![255, 0, 0, 0, 255, 0],
+        source: Some("test-camera".to_string()),
+    });
+    snapshot.ear_pcm = Some(PcmAudioFrame {
+        captured_at_ms: 230,
+        sample_rate_hz: 16_000,
+        channels: 1,
+        samples: vec![0, 1_000, -1_000],
+    });
+    snapshot.kinect.captured_at_ms = 220;
+    snapshot.kinect.rgbd_frame_id = Some("rgbd-7".to_string());
+    snapshot.kinect.device_timestamp_ms = Some(7);
+    snapshot.kinect.depth_width = 2;
+    snapshot.kinect.depth_height = 1;
+    snapshot.kinect.depth_m = vec![1.0, 2.0];
+    snapshot.kinect.depth_coordinate_system = Some("kinect_depth_image".to_string());
     let mut tick = tick_with_action(ActionPrimitive::Stop);
     tick.frame.t_ms = 250;
     tick.frame.now.t_ms = 250;
@@ -174,6 +197,29 @@ async fn physical_capture_uses_runtime_frame_time_when_body_time_is_stale() {
     assert_eq!(frames.len(), 1);
     assert_eq!(frames[0].t_ms, 250);
     assert_eq!(frames[0].snapshot.body.last_update_ms, 100);
+    assert_eq!(
+        frames[0].assets.rgb.as_deref(),
+        Some("assets/rgb/000000.png")
+    );
+    assert_eq!(
+        frames[0].assets.depth.as_deref(),
+        Some("assets/depth/000000.depth16.png")
+    );
+    assert_eq!(
+        frames[0].assets.audio.as_deref(),
+        Some("assets/audio/000000.wav")
+    );
+    let metadata = frames[0].stream_metadata.as_ref().unwrap();
+    assert_eq!(metadata["rgb"]["captured_at_ms"], 225);
+    assert_eq!(metadata["rgb"]["rgbd_frame_id"], "rgbd-7");
+    assert_eq!(metadata["depth"]["captured_at_ms"], 220);
+    assert_eq!(metadata["depth"]["rgbd_frame_id"], "rgbd-7");
+    assert_eq!(metadata["audio"]["captured_at_ms"], 230);
+    assert!(temp_dir.join("assets/rgb/000000.png").exists());
+    assert!(temp_dir
+        .join("assets/depth/000000.depth16.png")
+        .exists());
+    assert!(temp_dir.join("assets/audio/000000.wav").exists());
     let _ = fs::remove_dir_all(&temp_dir);
 }
 

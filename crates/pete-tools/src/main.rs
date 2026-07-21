@@ -74,8 +74,8 @@ use pete_training::{
     TrainUnifiedExperienceRequest, TrainableBehavior,
 };
 use pete_worldlab::{
-    export_pointcloud_for_frame, export_snapshot_assets, rewrite_frames, update_manifest,
-    CaptureReader, CaptureReplayRunner, CaptureSource, CaptureStreams, CaptureWriter,
+    export_pointcloud_for_frame, rewrite_frames, update_manifest, CaptureReader,
+    CaptureReplayRunner, CaptureSource, CaptureStreams, CaptureWriter,
 };
 use rand::{prelude::SliceRandom, rngs::StdRng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
