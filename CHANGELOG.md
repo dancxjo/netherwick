@@ -19,6 +19,10 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Restore the live 2D map as an explicit projection of the calibrated 3D
+  odometry-world voxel cloud, expose alignment, geometry, and navigation trust
+  separately, and cover depth-only projection through a rotated world-frame
+  regression fixture.
 - Make audio silent-mode changes session-authorized so cockpit preference
   toggles cannot replace a motherbrain control lease or interrupt active motion.
 - Honor a cognition provider's declared availability before scheduling work, so

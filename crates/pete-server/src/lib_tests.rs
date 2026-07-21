@@ -988,7 +988,7 @@ async fn live_map_projects_depth_only_world_voxels_in_the_same_frame_as_3d() {
         sensor_calibration: Some(SceneSensorCalibration::sim_default()),
         ..LiveSceneMetadata::default()
     });
-    for t_ms in [100, 200, 300] {
+    for t_ms in [100, 200, 300, 400] {
         let mut snapshot = WorldSnapshot::default();
         snapshot.body.odometry = Pose2 {
             x_m: 0.5,
@@ -1008,6 +1008,7 @@ async fn live_map_projects_depth_only_world_voxels_in_the_same_frame_as_3d() {
             depth_coordinate_system: Some("kinect_camera".to_string()),
             ..KinectSense::default()
         };
+        snapshot.imu.orientation = vec![0.0, 0.0];
         state.update(snapshot);
     }
 
@@ -1671,9 +1672,8 @@ async fn live_routes_include_3d_and_scene_endpoints() {
     assert!(page.contains("id=\"map-trust\""));
     assert!(page.contains("function updateMapTrust"));
     assert!(page.contains("liveMap?.world_projection?.cells"));
-    assert!(page.contains(
-        "Obstacle cells project the same calibrated odometry-world voxels shown in 3D."
-    ));
+    assert!(page
+        .contains("Obstacle cells project the same calibrated odometry-world voxels shown in 3D."));
     assert!(page.contains("const traceLocal = (x, y) =>"));
     assert!(page.contains("forward: dx * headingCos + dy * headingSin"));
     assert!(page.contains("function occupancyGridCellCenter"));

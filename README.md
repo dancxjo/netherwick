@@ -86,8 +86,10 @@ The strongest current perception artifact is an inspectable 3D voxel world.
   Kinect/lidar 3D cloud using configured sensor extrinsics.
 - The intentionally blocky representation favors spatial trust and debugging
   over visual polish.
-- The 2D occupancy path still needs systematic comparison against the shared
-  coordinate frame and known-good captures.
+- The live 2D panel now projects obstacle cells directly from the same
+  calibrated odometry-world voxels shown in 3D and reports alignment, geometry,
+  and navigation trust separately. A synchronized physical golden capture is
+  still needed to clear the real-sensor geometry and corrected-SLAM gates.
 
 The next important evidence is a golden run that preserves synchronized RGB,
 depth, lidar, IMU, odometry, body events, command traces, safety decisions, and
@@ -179,7 +181,8 @@ Possession and the live perception stack are operational. The current milestone 
 - The voxel output is coarse, blocky, and intentionally debuggable.
 - Visible structures in the voxel scene correspond to real things in the room.
 - The 3D/WebXR viewer is the main inspection surface for the current world model.
-- The 2D map path needs restoration after drifting out of alignment and then failing.
+- The 2D map is restored as a projection of the calibrated 3D voxel world;
+  physical capture comparison and corrected-SLAM trust remain explicit gates.
 - `just possess` acquires and maintains the motherbrain lease with bounded motion and explicit STOP/exorcize shutdown.
 - Normal-run tests cover random walk, bump stop, and conductor recovery.
 - Create packet age and completeness now drive body freshness; reconnect cannot reopen motion on cached telemetry.
@@ -227,7 +230,8 @@ architectural restart:
    fixture.
 4. Calibrate Kinect, lidar, IMU, and odometry frames against the same physical
    scene.
-5. Restore and validate the 2D map as a projection of shared spatial truth.
+5. Validate the restored 2D shared-world projection against a synchronized
+   physical golden capture.
 6. Exercise possession, heartbeat expiry, event loss, reconnection, stop, and
    exorcize across repeated cold boots.
 7. Move remaining Create controller tuning constants into the body contract.
@@ -270,14 +274,16 @@ just live-server
 
 When the world looks right, save screenshots and a short video. When it looks wrong, preserve the input capture rather than only the rendered failure.
 
-### 2D map restoration
+### 2D map validation
 
-The 2D map previously drifted out of alignment and then stopped working. Treat it as a derived product of the same spatial truth used by the voxel view:
-
-1. Verify that the coordinate frame used for voxel projection is the same frame the 2D map consumes.
-2. Confirm that map updates are still being emitted.
-3. Check whether the map renderer is alive but receiving empty or invalid data.
-4. Compare a known-good capture against the current map path.
+The live 2D panel is now a derived product of the same calibrated
+odometry-world voxel cloud used by the 3D view. Its status line distinguishes
+three claims: whether 2D and 3D share a frame, whether current sensor geometry
+has enough stable evidence to trust, and whether corrected SLAM is ready for
+navigation. The automated depth-only fixture covers rotated world-frame
+projection. The remaining closure gate is a synchronized physical capture that
+compares the rendered 2D cells against the 3D scene without weakening the
+sensor-truth or navigation gates.
 
 ### Behavior validation
 

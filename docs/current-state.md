@@ -41,19 +41,26 @@ The first question is not "What object is this?" The first question is "Have I s
 
 See [constellations.md](constellations.md) for the dedicated model.
 
-## What is being restored
+## What is being validated
 
 ### 2D map
 
-The 2D map path drifted out of alignment and then stopped working. It should now be treated as a projection of the same coordinate truth used by the 3D voxel world, not as a separate mapping universe.
+The live 2D map is now an explicit projection of the same calibrated
+odometry-world voxels used by the 3D view, rather than a separate mapping
+universe. The panel reports shared-frame alignment, geometry trust, and
+navigation trust independently so a working visualization cannot silently
+grant motion authority.
 
 Debug order:
 
-1. Confirm map update events still exist.
-2. Confirm the renderer is subscribed to the current event shape.
-3. Confirm the map uses the same robot/world frame as the voxel projection.
-4. Replay a known capture and compare voxel output against map output.
-5. Save the failure as a regression fixture.
+1. Confirm the shared-world projection continues updating from depth-only and
+   range-assisted inputs.
+2. Require stable projected cells and an acceptable below-floor ratio before
+   calling the sensor geometry trusted.
+3. Keep navigation gated until loop-closed corrected SLAM is ready.
+4. Replay a synchronized physical capture and compare voxel output against map
+   output.
+5. Save any physical mismatch as a regression fixture.
 
 ### Behavior validation
 

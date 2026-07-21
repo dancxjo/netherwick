@@ -29,7 +29,8 @@ fn map_response_from_parts(
         .values()
         .map(|cell| map_view_cell(cell, map.config.resolution_m, now_ms))
         .collect();
-    let world_projection = map_world_projection(point_cloud, &summary, now_ms);
+    let world_projection =
+        map_world_projection(point_cloud, &summary, latest, metadata, now_ms);
     let semantic_cells = map_semantic_cells(latest, metadata, now_ms);
     let events = map_event_markers(latest, metadata, now_ms);
     let pose_graph = map_pose_graph_summary(map);
@@ -90,6 +91,8 @@ struct ProjectedCellAccumulator {
 fn map_world_projection(
     point_cloud: &VoxelPointCloud,
     map_summary: &MapSummary,
+    latest: &WorldSnapshot,
+    metadata: Option<&LiveSceneMetadata>,
     now_ms: TimeMs,
 ) -> MapWorldProjection {
     let resolution_m = map_summary.resolution_m;
@@ -140,7 +143,14 @@ fn map_world_projection(
         .collect::<Vec<_>>();
     let stable_cells = cells.iter().filter(|cell| cell.stable).count();
     let aligned_with_3d = point_cloud.observations > 0 && !cells.is_empty();
-    let navigation_trusted = map_summary.slam_status.mode == SlamMode::LoopClosedPoseGraph;
+    let corrected_slam_ready = map_summary.slam_status.mode == SlamMode::LoopClosedPoseGraph;
+    let has_depth = !latest.kinect.depth_m.is_empty();
+    let calibrated_depth = !has_depth
+        || metadata
+            .and_then(|metadata| metadata.sensor_calibration)
+            .is_some();
+    let depth_orientation_trusted =
+        !has_depth || point_cloud.orientation_status.roll_pitch_corrected;
     let mut reasons = Vec::new();
     if point_cloud.observations == 0 {
         reasons.push("no calibrated 3D world observations have arrived".to_string());
@@ -155,7 +165,13 @@ fn map_world_projection(
     if stable_cells == 0 && !cells.is_empty() {
         reasons.push("the projection has no repeatedly observed stable cells yet".to_string());
     }
-    if !navigation_trusted {
+    if !calibrated_depth {
+        reasons.push("the depth stream has no explicit camera calibration".to_string());
+    }
+    if !depth_orientation_trusted {
+        reasons.push("the depth stream has no trusted IMU roll/pitch correction".to_string());
+    }
+    if !corrected_slam_ready {
         reasons.push(format!(
             "navigation remains gated while SLAM mode is {:?}",
             map_summary.slam_status.mode
@@ -163,7 +179,10 @@ fn map_world_projection(
     }
     let geometry_trusted = aligned_with_3d
         && below_floor_ratio <= MAX_TRUSTED_BELOW_FLOOR_RATIO
-        && stable_cells > 0;
+        && stable_cells > 0
+        && calibrated_depth
+        && depth_orientation_trusted;
+    let navigation_trusted = geometry_trusted && corrected_slam_ready;
 
     MapWorldProjection {
         label: WORLD_PROJECTION_LABEL,
