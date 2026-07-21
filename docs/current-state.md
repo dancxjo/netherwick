@@ -51,13 +51,26 @@ universe. The panel reports shared-frame alignment, geometry trust, and
 navigation trust independently so a working visualization cannot silently
 grant motion authority.
 
+The current claims are deliberately separate:
+
+- Inspectable 3D: implemented.
+- Shared-frame 2D projection: implemented.
+- Pose-graph correction machinery: implemented.
+- Physically validated navigation map: not yet established.
+
+Loop corrections rebuild 2D occupancy from retained submaps and rebuild retained
+3D observations through corrected graph poses. That proves the correction path
+exists; it does not prove that the corrected endpoints and walls agree with the
+physical room closely enough for navigation.
+
 Debug order:
 
 1. Confirm the shared-world projection continues updating from depth-only and
    range-assisted inputs.
 2. Require stable projected cells and an acceptable below-floor ratio before
    calling the sensor geometry trusted.
-3. Keep navigation gated until loop-closed corrected SLAM is ready.
+3. Keep navigation gated until a physical return-to-start route passes the
+   loop-closure error, wall-overlap, and corrected-endpoint checks.
 4. Replay a synchronized physical capture and compare voxel output against map
    output.
 5. Save any physical mismatch as a regression fixture.

@@ -88,8 +88,22 @@ The strongest current perception artifact is an inspectable 3D voxel world.
   over visual polish.
 - The live 2D panel now projects obstacle cells directly from the same
   calibrated odometry-world voxels shown in 3D and reports alignment, geometry,
-  and navigation trust separately. A synchronized physical golden capture is
-  still needed to clear the real-sensor geometry and corrected-SLAM gates.
+  and navigation trust separately.
+- Pose-graph correction is implemented: loop corrections rebuild occupancy from
+  retained submaps and rebuild retained 3D observations through corrected graph
+  poses.
+
+Those implementation claims do not establish a navigation-grade physical map.
+The current spatial status is:
+
+- Inspectable 3D: implemented.
+- Shared-frame 2D projection: implemented.
+- Pose-graph correction machinery: implemented.
+- Physically validated navigation map: not yet established.
+
+A synchronized physical golden capture and a return-to-start route must still
+clear the real-sensor geometry, loop-closure error, wall-overlap, and corrected-
+endpoint gates before navigation trust can be claimed.
 
 The next important evidence is a golden run that preserves synchronized RGB,
 depth, lidar, IMU, odometry, body events, command traces, safety decisions, and
@@ -182,7 +196,8 @@ Possession and the live perception stack are operational. The current milestone 
 - Visible structures in the voxel scene correspond to real things in the room.
 - The 3D/WebXR viewer is the main inspection surface for the current world model.
 - The 2D map is restored as a projection of the calibrated 3D voxel world;
-  physical capture comparison and corrected-SLAM trust remain explicit gates.
+  pose-graph correction machinery is implemented, while physical navigation-map
+  validation remains an explicit gate.
 - `just possess` acquires and maintains the motherbrain lease with bounded motion and explicit STOP/exorcize shutdown.
 - Normal-run tests cover random walk, bump stop, and conductor recovery.
 - Create packet age and completeness now drive body freshness; reconnect cannot reopen motion on cached telemetry.
@@ -282,11 +297,12 @@ by the 3D view. Its status line distinguishes
 three claims: whether 2D and 3D share a frame, whether current sensor geometry
 has enough stable evidence to trust, and whether corrected SLAM is ready for
 navigation. Pose-graph loop corrections rebuild 2D occupancy from retained
-submaps. They do not yet rebuild accumulated 3D voxels, so that overlay becomes
-explicitly untrusted after a nontrivial graph correction. The remaining closure
-gates are a synchronized multi-frame stationary-rotation capture and a physical
-return-to-start route that passes the report's graph-error, wall-overlap, and
-corrected-endpoint checks.
+submaps, and retained 3D observations are rebuilt through corrected graph-node
+poses. That correction machinery does not by itself validate the resulting map
+against the physical room. Navigation trust remains gated on a synchronized
+multi-frame stationary-rotation capture and a physical return-to-start route
+that passes the report's graph-error, wall-overlap, and corrected-endpoint
+checks.
 
 ### Behavior validation
 
