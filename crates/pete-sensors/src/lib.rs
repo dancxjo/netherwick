@@ -11,12 +11,13 @@ use pete_actions::{ActionPrimitive, LlmActionProposal};
 use pete_body::BodySense;
 use pete_core::Pose2;
 use pete_now::{
-    AsrSense, EarSense, ExtensionSense, EyeSense, FaceSense, GpsSense, ImuSense,
+    AsrSense, CalibrationEvidenceSource, CalibrationResiduals, CalibrationStateConfig,
+    CalibrationStateMachine, EarSense, ExtensionSense, EyeSense, FaceSense, GpsSense, ImuSense,
     KinectFusionAlignment, KinectSense, ObjectClass, ObjectObservation, ObjectObservationSource,
     ObjectSense, RangeExtrinsics, RangeSense, TranscriptCandidateEvent, TranscriptCandidateTracker,
-    TranscriptStabilityState, VectorArtifact, VoiceSense, FACE_VECTOR_COLLECTION,
-    IMAGE_DESCRIPTION_VECTOR_COLLECTION, IMAGE_VECTOR_COLLECTION, OBJECT_VECTOR_COLLECTION,
-    SCENE_VECTOR_COLLECTION, TRANSCRIPT_VECTOR_COLLECTION,
+    TranscriptStabilityState, TransformEstimateEvidence, VectorArtifact, VoiceSense,
+    FACE_VECTOR_COLLECTION, IMAGE_DESCRIPTION_VECTOR_COLLECTION, IMAGE_VECTOR_COLLECTION,
+    OBJECT_VECTOR_COLLECTION, SCENE_VECTOR_COLLECTION, TRANSCRIPT_VECTOR_COLLECTION,
 };
 use pete_now::{Now, PredictionSense, SurpriseSense};
 use serde::{Deserialize, Serialize};

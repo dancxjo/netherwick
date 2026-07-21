@@ -1,5 +1,8 @@
 # Depth Geometry Debugging
 
+For live mount epochs, transform covariance, observability, shift detection,
+and remount closure trials, see [Adaptive sensor calibration](adaptive-calibration.md).
+
 Pete uses these depth geometry conventions:
 
 - Kinect camera frame: `+x` right, `+y` down, `+z` forward.

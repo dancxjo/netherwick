@@ -105,6 +105,7 @@ struct GeometryDebugReport {
     sensor_truth: SensorTruthReport,
     depth_projection: GeometryDepthProjection,
     calibration_extrinsics: GeometryExtrinsics,
+    calibration_replay: CalibrationReplaySummary,
     imu_orientation: GeometryImuInterpretation,
     timestamp_diagnostics: GeometryTimestampDiagnostics,
     stationary_rotation_diagnostics: StationaryRotationDiagnostics,
@@ -113,6 +114,24 @@ struct GeometryDebugReport {
     floor_statistics: GeometryFloorStatistics,
     warnings: Vec<String>,
     hard_failures: Vec<String>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct CalibrationReplaySummary {
+    frames_with_estimate: usize,
+    epoch_ids: Vec<u64>,
+    epoch_changes: usize,
+    configured_frames: usize,
+    estimating_frames: usize,
+    trusted_frames: usize,
+    degraded_frames: usize,
+    invalidated_frames: usize,
+    maximum_covariance: [f32; pete_now::TRANSFORM_DOF_COUNT],
+    maximum_floor_residual_m: Option<f32>,
+    maximum_wall_residual_m: Option<f32>,
+    maximum_reprojection_residual_px: Option<f32>,
+    maximum_map_consistency_residual_m: Option<f32>,
+    evidence_counts: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -276,6 +295,7 @@ async fn generate_geometry_debug_report(args: &GeometryDebugArgs) -> Result<Geom
     let imu_interpretation = geometry_imu_interpretation(&imu.orientation, orientation);
     let timestamp_diagnostics = geometry_timestamp_diagnostics(&frames, record);
     let stationary_rotation_diagnostics = stationary_rotation_diagnostics(&frames, args);
+    let calibration_replay = calibration_replay_summary(&frames);
     let sample_stride = kinect.depth_m.len().div_ceil(args.samples.max(1)).max(1);
     let min_depth = positive_depth_or(kinect.min_depth_m, config.min_depth_m);
     let max_depth = positive_depth_or(kinect.max_depth_m, config.max_depth_m);
@@ -415,7 +435,7 @@ async fn generate_geometry_debug_report(args: &GeometryDebugArgs) -> Result<Geom
             ],
         ));
     Ok(GeometryDebugReport {
-        schema_version: 2,
+        schema_version: 3,
         input_source: input.source,
         frame_index: record.index,
         t_ms: record.t_ms,
@@ -448,6 +468,7 @@ async fn generate_geometry_debug_report(args: &GeometryDebugArgs) -> Result<Geom
                     .to_string(),
             base_mapping: "Kinect camera +x right, +y down, +z forward -> robot +x forward, +y left, +z up".to_string(),
         },
+        calibration_replay,
         imu_orientation: imu_interpretation,
         timestamp_diagnostics,
         stationary_rotation_diagnostics,
@@ -478,6 +499,65 @@ async fn generate_geometry_debug_report(args: &GeometryDebugArgs) -> Result<Geom
         warnings,
         hard_failures,
     })
+}
+
+fn calibration_replay_summary(
+    frames: &[pete_worldlab::CaptureFrameRecord],
+) -> CalibrationReplaySummary {
+    let mut summary = CalibrationReplaySummary::default();
+    let mut previous_epoch = None;
+    for estimate in frames
+        .iter()
+        .filter_map(|frame| frame.snapshot.kinect.live_geometry_calibration.as_ref())
+    {
+        summary.frames_with_estimate += 1;
+        if previous_epoch.is_some_and(|epoch| epoch != estimate.epoch.id) {
+            summary.epoch_changes += 1;
+        }
+        previous_epoch = Some(estimate.epoch.id);
+        if !summary.epoch_ids.contains(&estimate.epoch.id) {
+            summary.epoch_ids.push(estimate.epoch.id);
+        }
+        match estimate.trust_state {
+            pete_now::CalibrationTrustState::Configured => summary.configured_frames += 1,
+            pete_now::CalibrationTrustState::Estimating => summary.estimating_frames += 1,
+            pete_now::CalibrationTrustState::Trusted => summary.trusted_frames += 1,
+            pete_now::CalibrationTrustState::Degraded => summary.degraded_frames += 1,
+            pete_now::CalibrationTrustState::Invalidated => summary.invalidated_frames += 1,
+        }
+        for (index, covariance) in estimate.covariance.iter().enumerate() {
+            summary.maximum_covariance[index] =
+                summary.maximum_covariance[index].max(*covariance);
+        }
+        update_maximum(
+            &mut summary.maximum_floor_residual_m,
+            estimate.residuals.floor_m,
+        );
+        update_maximum(
+            &mut summary.maximum_wall_residual_m,
+            estimate.residuals.wall_m,
+        );
+        update_maximum(
+            &mut summary.maximum_reprojection_residual_px,
+            estimate.residuals.reprojection_px,
+        );
+        update_maximum(
+            &mut summary.maximum_map_consistency_residual_m,
+            estimate.residuals.map_consistency_m,
+        );
+        for (source, count) in &estimate.evidence_counts {
+            let label = format!("{source:?}").to_ascii_lowercase();
+            let total = summary.evidence_counts.entry(label).or_default();
+            *total = (*total).max(u64::from(*count));
+        }
+    }
+    summary
+}
+
+fn update_maximum(slot: &mut Option<f32>, value: Option<f32>) {
+    if let Some(value) = value.map(f32::abs) {
+        *slot = Some(slot.map_or(value, |current| current.max(value)));
+    }
 }
 
 struct GeometryDebugInput {
@@ -684,6 +764,41 @@ fn sensor_truth_report(
             SensorTruthStatus::Fail
         },
         detail: "requires measured depth intrinsics/distortion, depth scale, full depth-to-base and RGB-D extrinsics, four 0.5-3.0m validation distances, <=2cm plane error, and <=3px RGB-D boundary error".to_string(),
+    });
+    let live_calibration_trusted = snapshot
+        .kinect
+        .live_geometry_calibration
+        .as_ref()
+        .is_some_and(|estimate| {
+            estimate.trust_state == pete_now::CalibrationTrustState::Trusted
+        });
+    gates.push(SensorTruthGate {
+        name: "live_kinect_mount_calibration".to_string(),
+        status: if live_calibration_trusted {
+            SensorTruthStatus::Pass
+        } else {
+            SensorTruthStatus::Fail
+        },
+        detail: snapshot
+            .kinect
+            .live_geometry_calibration
+            .as_ref()
+            .map(|estimate| {
+                format!(
+                    "epoch={}, state={:?}, confidence={:.3}, covariance={:?}, evidence={:?}, residuals={:?}, reasons={}",
+                    estimate.epoch.id,
+                    estimate.trust_state,
+                    estimate.confidence,
+                    estimate.covariance,
+                    estimate.evidence_counts,
+                    estimate.residuals,
+                    estimate.rejection_reasons.join("; ")
+                )
+            })
+            .unwrap_or_else(|| {
+                "configured Kinect transform is only an initial guess; no live estimate is present"
+                    .to_string()
+            }),
     });
     let rgbd_skew_ms = snapshot.kinect.color_frame.as_ref().map(|color| {
         color

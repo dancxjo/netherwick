@@ -153,6 +153,7 @@ pub struct FrameProcessor {
     face_detector: Option<Arc<dyn FaceDetector>>,
     object_detector: Option<Arc<dyn ObjectDetector>>,
     kinect_range_projection: Option<DepthRangeProjectionConfig>,
+    kinect_calibration: Option<CalibrationStateMachine>,
 }
 
 impl std::fmt::Debug for FrameProcessor {
@@ -162,6 +163,7 @@ impl std::fmt::Debug for FrameProcessor {
             .field("face_detector", &self.face_detector.is_some())
             .field("object_detector", &self.object_detector.is_some())
             .field("kinect_range_projection", &self.kinect_range_projection)
+            .field("kinect_calibration", &self.kinect_calibration.is_some())
             .finish()
     }
 }
@@ -921,6 +923,7 @@ impl FrameProcessor {
     }
 
     pub fn process_packets(&mut self, t_ms: TimeMs, packets: &mut Vec<SensePacket>) {
+        self.process_kinect_calibration_packets(t_ms, packets);
         self.process_kinect_range_packets(packets);
 
         let Some(frame) = packets.iter().rev().find_map(|packet| match packet {
@@ -947,6 +950,61 @@ impl FrameProcessor {
         }));
     }
 
+    /// Supplies transform observations from odometry, persistent surfaces,
+    /// map consistency, loop closure, or optional lidar adapters. Trust and
+    /// epoch transitions remain centralized here.
+    pub fn observe_kinect_calibration_evidence(
+        &mut self,
+        evidence: TransformEstimateEvidence,
+        now_ms: u64,
+    ) -> Option<&pete_now::LiveCalibrationEstimate> {
+        self.kinect_calibration
+            .as_mut()
+            .map(|state| state.observe(evidence, now_ms))
+    }
+
+    fn process_kinect_calibration_packets(
+        &mut self,
+        t_ms: TimeMs,
+        packets: &mut [SensePacket],
+    ) {
+        let Some(kinect) = packets.iter_mut().rev().find_map(|packet| match packet {
+            SensePacket::Kinect(kinect) => Some(kinect),
+            _ => None,
+        }) else {
+            return;
+        };
+        self.update_kinect_calibration(t_ms, kinect);
+    }
+
+    fn update_kinect_calibration(&mut self, t_ms: TimeMs, kinect: &mut KinectSense) {
+        if self.kinect_calibration.is_none() {
+            let Some(configured) = kinect.geometry_calibration else {
+                return;
+            };
+            let started_at_ms = if kinect.captured_at_ms > 0 {
+                kinect.captured_at_ms
+            } else {
+                t_ms
+            };
+            self.kinect_calibration = Some(CalibrationStateMachine::new(
+                configured.depth_to_base,
+                started_at_ms,
+                CalibrationStateConfig::default(),
+            ));
+        }
+        if let (Some(state), Some(evidence)) = (
+            self.kinect_calibration.as_mut(),
+            floor_plane_calibration_evidence(kinect),
+        ) {
+            state.observe(evidence, t_ms);
+        }
+        kinect.live_geometry_calibration = self
+            .kinect_calibration
+            .as_ref()
+            .map(|state| state.estimate().clone());
+    }
+
     fn process_kinect_range_packets(&self, packets: &mut Vec<SensePacket>) {
         if packets
             .iter()
@@ -970,6 +1028,7 @@ impl FrameProcessor {
     }
 
     pub fn process_snapshot(&mut self, t_ms: TimeMs, snapshot: &mut WorldSnapshot) {
+        self.update_kinect_calibration(t_ms, &mut snapshot.kinect);
         let Some(frame) = snapshot.eye_frame.clone() else {
             return;
         };
@@ -1004,4 +1063,32 @@ impl FrameProcessor {
             self.object_detector.as_deref(),
         ))
     }
+}
+
+fn floor_plane_calibration_evidence(kinect: &KinectSense) -> Option<TransformEstimateEvidence> {
+    let configured = kinect.geometry_calibration?.depth_to_base;
+    let [a, b, c, d] = *<&[f32; 4]>::try_from(kinect.floor_clip_plane.as_slice()).ok()?;
+    let norm = (a * a + b * b + c * c).sqrt();
+    if !norm.is_finite() || norm <= f32::EPSILON {
+        return None;
+    }
+    let normal_camera = [a / norm, b / norm, c / norm];
+    let normal_base = configured.rotate_vector(normal_camera);
+    let mut transform = configured;
+    transform.translation_m[2] = (d / norm).abs();
+    transform.rotation_rpy_rad[0] -= normal_base[1].atan2(normal_base[2]);
+    transform.rotation_rpy_rad[1] +=
+        normal_base[0].atan2(normal_base[1].hypot(normal_base[2]));
+    let tilt_residual = normal_base[2].clamp(-1.0, 1.0).acos();
+    Some(TransformEstimateEvidence {
+        source: CalibrationEvidenceSource::FloorPlane,
+        captured_at_ms: kinect.captured_at_ms,
+        transform,
+        observable_dofs: [false, false, true, true, true, false],
+        covariance: [1.0, 1.0, 0.0025, 0.0012, 0.0012, 1.0],
+        residuals: CalibrationResiduals {
+            gravity_rad: Some(tilt_residual),
+            ..CalibrationResiduals::default()
+        },
+    })
 }

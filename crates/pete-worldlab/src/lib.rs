@@ -1144,6 +1144,7 @@ fn export_snapshot_assets_with_context(
 
     let calibration = serde_json::json!({
         "kinect_geometry": snapshot.kinect.geometry_calibration,
+        "kinect_live_geometry": snapshot.kinect.live_geometry_calibration,
         "depth_intrinsics_fallback": {
             "width": snapshot.kinect.depth_width, "height": snapshot.kinect.depth_height,
             "fx": snapshot.kinect.depth_fx, "fy": snapshot.kinect.depth_fy,
@@ -1166,6 +1167,8 @@ fn export_snapshot_assets_with_context(
             "format": "sensor_calibration_json",
             "identity": sha256_bytes(&serde_json::to_vec(&calibration)?),
             "physically_calibrated": snapshot.kinect.geometry_calibration.is_some_and(|value| value.calibrated),
+            "live_trust_state": snapshot.kinect.live_geometry_calibration.as_ref().map(|value| value.trust_state),
+            "calibration_epoch": snapshot.kinect.live_geometry_calibration.as_ref().map(|value| value.epoch.id),
         }),
     )?;
     metadata.insert("calibration".to_string(), calibration_metadata.clone());

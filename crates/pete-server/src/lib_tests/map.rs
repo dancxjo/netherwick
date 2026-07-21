@@ -620,3 +620,88 @@ fn corrected_graph_trusts_voxels_only_after_retained_observations_are_rebuilt() 
         .iter()
         .any(|reason| reason.contains("pose-graph corrections have not been applied")));
 }
+
+#[test]
+fn configured_mount_guess_cannot_grant_live_geometry_trust() {
+    let mut cloud = VoxelPointCloud::default();
+    let observation = pete_map::PointCloudObservation {
+        frame: pete_map::PointCloudFrame::RobotBase,
+        pose: pete_map::PoseEstimate {
+            pose: Pose2::default(),
+            confidence: 1.0,
+            covariance: [0.0; 3],
+            source: "test".to_string(),
+            t_ms: 100,
+        },
+        orientation: pete_map::OrientationEstimate {
+            roll_rad: Some(0.0),
+            pitch_rad: Some(0.0),
+            yaw_rad: Some(0.0),
+            roll_pitch_from_imu: true,
+            yaw_source: pete_map::YawSource::OdometryHeading,
+        },
+        points: vec![pete_map::PointCloudPoint {
+            position: pete_map::Point3D {
+                x_m: 1.0,
+                y_m: 0.0,
+                z_m: 0.5,
+            },
+            color_rgb: None,
+            confidence: 1.0,
+            depth_index: None,
+            depth_uv: None,
+            depth_image_size: None,
+            source_frame_id: None,
+        }],
+        source: "kinect_depth".to_string(),
+        t_ms: 100,
+        metadata: serde_json::Value::Null,
+    };
+    for _ in 0..3 {
+        cloud.integrate_observation(observation.clone());
+    }
+    let calibration = pete_now::DepthGeometryCalibration {
+        calibrated: true,
+        depth: pete_now::CameraIntrinsics {
+            width: 1,
+            height: 1,
+            fx: 1.0,
+            fy: 1.0,
+            ..pete_now::CameraIntrinsics::default()
+        },
+        validation: Some(pete_now::DepthCalibrationValidation {
+            distance_sample_count: 4,
+            min_test_distance_m: 0.5,
+            max_test_distance_m: 3.0,
+            max_plane_distance_error_m: 0.01,
+            rgb_depth_boundary_error_px: 2.0,
+        }),
+        ..pete_now::DepthGeometryCalibration::default()
+    };
+    let mut snapshot = WorldSnapshot::default();
+    snapshot.kinect.schema_version = 2;
+    snapshot.kinect.depth_m = vec![1.0];
+    snapshot.kinect.geometry_calibration = Some(calibration);
+    snapshot.kinect.live_geometry_calibration = Some(
+        pete_now::CalibrationStateMachine::new(
+            calibration.depth_to_base,
+            100,
+            pete_now::CalibrationStateConfig::default(),
+        )
+        .estimate()
+        .clone(),
+    );
+    let projection = map_world_projection(
+        &cloud,
+        &LocalMap::default().summary(),
+        &snapshot,
+        None,
+        100,
+    );
+
+    assert!(!projection.geometry_trusted);
+    assert!(projection
+        .reasons
+        .iter()
+        .any(|reason| reason.contains("live Kinect calibration epoch 0 is Configured")));
+}

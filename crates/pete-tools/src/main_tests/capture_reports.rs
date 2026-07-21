@@ -485,6 +485,50 @@ async fn representation_report_writes_json_from_capture_fixture() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn calibration_replay_summary_records_epoch_and_trust_transitions() {
+    let calibration = pete_now::DepthGeometryCalibration::default();
+    let mut first_estimate = pete_now::CalibrationStateMachine::new(
+        calibration.depth_to_base,
+        100,
+        pete_now::CalibrationStateConfig::default(),
+    )
+    .estimate()
+    .clone();
+    first_estimate.trust_state = pete_now::CalibrationTrustState::Trusted;
+    first_estimate.residuals.floor_m = Some(0.01);
+    let mut second_estimate = first_estimate.clone();
+    second_estimate.trust_state = pete_now::CalibrationTrustState::Invalidated;
+    second_estimate.epoch.id = 1;
+    second_estimate.epoch.invalidation_reason = Some("synthetic remount".to_string());
+    second_estimate.residuals.wall_m = Some(0.08);
+    let frames = [first_estimate, second_estimate]
+        .into_iter()
+        .enumerate()
+        .map(|(index, estimate)| {
+            let mut snapshot = WorldSnapshot::default();
+            snapshot.kinect.live_geometry_calibration = Some(estimate);
+            pete_worldlab::CaptureFrameRecord {
+                index: index as u64,
+                t_ms: 100 + index as u64 * 100,
+                snapshot,
+                events: Vec::new(),
+                assets: pete_worldlab::CaptureFrameAssets::default(),
+                stream_metadata: None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let summary = calibration_replay_summary(&frames);
+    assert_eq!(summary.frames_with_estimate, 2);
+    assert_eq!(summary.epoch_ids, [0, 1]);
+    assert_eq!(summary.epoch_changes, 1);
+    assert_eq!(summary.trusted_frames, 1);
+    assert_eq!(summary.invalidated_frames, 1);
+    assert_eq!(summary.maximum_floor_residual_m, Some(0.01));
+    assert_eq!(summary.maximum_wall_residual_m, Some(0.08));
+}
+
 fn pose_graph_test_frame(t_ms: u64, x_m: f32, latent_vector: Vec<f32>) -> ExperienceFrame {
     let mut now = Now::blank(t_ms, BodySense::default());
     now.body.odometry.x_m = x_m;

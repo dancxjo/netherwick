@@ -6,6 +6,13 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Add the shared adaptive Kinect mount-calibration foundation: configured,
+  estimating, trusted, degraded, and invalidated states; six-degree transform
+  covariance and observability; evidence-source interfaces; residual-based
+  shift detection and epochs; floor-plane estimation; capture/replay
+  diagnostics; live geometry trust gating; and deterministic remount tests,
+  with lidar remaining optional and brainstem safety unchanged.
+
 - Add a useful forebrain `dataset_construction` lifecycle for checksummed
   `RealRobot` WorldLab captures, including complete physical-capture export,
   resumable-transfer and worker-restart recovery controls, deterministic

@@ -153,6 +153,7 @@ fn map_world_projection(
                 .kinect
                 .geometry_calibration
                 .is_some_and(|calibration| calibration.physical_validation_ready())
+                && pete_now::DepthGeometry::live_transform_trusted(&latest.kinect)
         } else {
             metadata
                 .and_then(|metadata| metadata.sensor_calibration)
@@ -175,7 +176,16 @@ fn map_world_projection(
         reasons.push("the projection has no repeatedly observed stable cells yet".to_string());
     }
     if !calibrated_depth {
-        reasons.push("the depth stream has no explicit camera calibration".to_string());
+        if let Some(estimate) = latest.kinect.live_geometry_calibration.as_ref() {
+            reasons.push(format!(
+                "live Kinect calibration epoch {} is {:?}: {}",
+                estimate.epoch.id,
+                estimate.trust_state,
+                estimate.rejection_reasons.join("; ")
+            ));
+        } else {
+            reasons.push("the depth stream has no explicit camera calibration".to_string());
+        }
     }
     if !depth_orientation_trusted {
         reasons.push("the depth stream has no trusted IMU roll/pitch correction".to_string());

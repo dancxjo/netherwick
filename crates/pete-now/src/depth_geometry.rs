@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::KinectSense;
+use crate::{CalibrationTrustState, KinectSense};
 use pete_core::Pose2;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -25,7 +25,7 @@ pub struct RigidTransform3 {
 }
 
 impl RigidTransform3 {
-    pub fn transform_point(self, point: [f32; 3]) -> [f32; 3] {
+    pub fn rotate_vector(self, point: [f32; 3]) -> [f32; 3] {
         let [roll, pitch, yaw] = self.rotation_rpy_rad;
         let (roll_sin, roll_cos) = roll.sin_cos();
         let (pitch_sin, pitch_cos) = pitch.sin_cos();
@@ -37,11 +37,15 @@ impl RigidTransform3 {
             rolled[1],
             -rolled[0] * pitch_sin + rolled[2] * pitch_cos,
         ];
-        let rotated = [
+        [
             pitched[0] * yaw_cos - pitched[1] * yaw_sin,
             pitched[0] * yaw_sin + pitched[1] * yaw_cos,
             pitched[2],
-        ];
+        ]
+    }
+
+    pub fn transform_point(self, point: [f32; 3]) -> [f32; 3] {
+        let rotated = self.rotate_vector(point);
         [
             rotated[0] + self.translation_m[0],
             rotated[1] + self.translation_m[1],
@@ -98,7 +102,7 @@ pub struct DepthGeometry {
 
 impl DepthGeometry {
     pub fn from_kinect(kinect: &KinectSense) -> Option<Self> {
-        let calibration = kinect
+        let mut calibration = kinect
             .geometry_calibration
             .unwrap_or(DepthGeometryCalibration {
                 calibrated: false,
@@ -114,6 +118,13 @@ impl DepthGeometry {
                 depth_scale: 1.0,
                 ..DepthGeometryCalibration::default()
             });
+        if let Some(estimate) = kinect.live_geometry_calibration.as_ref() {
+            if estimate.trust_state != CalibrationTrustState::Invalidated {
+                // Estimating/degraded transforms remain usable for conservative
+                // perception. Navigation trust is gated separately.
+                calibration.depth_to_base = estimate.transform;
+            }
+        }
         let depth = calibration.depth;
         (depth.width > 0
             && depth.height > 0
@@ -122,6 +133,15 @@ impl DepthGeometry {
             && depth.fy.is_finite()
             && depth.fy > 0.0)
             .then_some(Self { calibration })
+    }
+
+    pub fn live_transform_trusted(kinect: &KinectSense) -> bool {
+        kinect
+            .live_geometry_calibration
+            .as_ref()
+            .map_or(true, |estimate| {
+                estimate.trust_state == CalibrationTrustState::Trusted
+            })
     }
 
     pub fn depth_pixel_to_camera(self, u: f32, v: f32, raw_depth_m: f32) -> Option<[f32; 3]> {

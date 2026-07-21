@@ -851,3 +851,51 @@ fn asr_tool_without_command_does_not_fabricate_words() {
 
     assert!(adapter.observe_frame(&frame).is_none());
 }
+
+#[test]
+fn frame_processor_publishes_floor_evidence_without_requiring_lidar() {
+    let calibration = pete_now::DepthGeometryCalibration {
+        calibrated: true,
+        depth: pete_now::CameraIntrinsics {
+            width: 1,
+            height: 1,
+            fx: 1.0,
+            fy: 1.0,
+            ..pete_now::CameraIntrinsics::default()
+        },
+        depth_to_base: pete_now::RigidTransform3 {
+            translation_m: [0.0, 0.0, 0.5],
+            ..pete_now::RigidTransform3::default()
+        },
+        ..pete_now::DepthGeometryCalibration::default()
+    };
+    let mut snapshot = WorldSnapshot::default();
+    snapshot.kinect = KinectSense {
+        schema_version: 2,
+        captured_at_ms: 100,
+        geometry_calibration: Some(calibration),
+        floor_clip_plane: vec![0.0, 0.0, 1.0, -0.6],
+        ..KinectSense::default()
+    };
+    FrameProcessor::new().process_snapshot(100, &mut snapshot);
+
+    let estimate = snapshot
+        .kinect
+        .live_geometry_calibration
+        .expect("live floor estimate");
+    assert_eq!(
+        estimate.trust_state,
+        pete_now::CalibrationTrustState::Estimating
+    );
+    assert_eq!(estimate.epoch.id, 0);
+    assert_eq!(
+        estimate
+            .evidence_counts
+            .get(&pete_now::CalibrationEvidenceSource::FloorPlane),
+        Some(&1)
+    );
+    assert!(!estimate
+        .evidence_counts
+        .contains_key(&pete_now::CalibrationEvidenceSource::Lidar));
+    assert!(estimate.rejection_reasons[0].contains("unobservable"));
+}

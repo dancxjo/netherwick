@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 pub mod beliefs;
+pub mod calibration;
 pub mod depth_geometry;
 pub mod epistemic;
 pub mod semantic;
@@ -25,6 +26,11 @@ pub use beliefs::{
     LocalGeometrySnapshot, MotivationSummary, OrganismId, ProcessId, ReachabilityEstimate,
     SelfBodyBelief, SelfModelSnapshot, SessionId, StuckTrapKind, WorldEntity, WorldEntityKind,
     WorldModelSnapshot, WorldModelUpdateContext, WorldModelUpdater, WorldPose,
+};
+pub use calibration::{
+    CalibrationEpoch, CalibrationEvidenceSource, CalibrationResiduals, CalibrationStateConfig,
+    CalibrationStateMachine, CalibrationTrustState, LiveCalibrationEstimate,
+    TransformEstimateEvidence, TransformEstimator, TRANSFORM_DOF_COUNT,
 };
 pub use depth_geometry::{
     CameraIntrinsics, DepthCalibrationValidation, DepthGeometry, DepthGeometryCalibration,
@@ -958,6 +964,10 @@ pub struct KinectSense {
     /// measured calibration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub geometry_calibration: Option<DepthGeometryCalibration>,
+    /// Runtime estimate layered over the configured transform. Captures retain
+    /// epoch, covariance, evidence, residual, and trust history per frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_geometry_calibration: Option<LiveCalibrationEstimate>,
     #[serde(default)]
     pub min_depth_m: f32,
     #[serde(default)]
