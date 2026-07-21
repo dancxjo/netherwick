@@ -1050,15 +1050,23 @@ struct BackgroundSenseProducer {
     state: std::sync::Arc<std::sync::Mutex<BackgroundSenseState>>,
 }
 
+#[derive(Clone)]
+struct BackgroundSenseReadiness {
+    state: std::sync::Arc<std::sync::Mutex<BackgroundSenseState>>,
+}
+
 #[derive(Clone, Debug, Default)]
 struct BackgroundSenseState {
     latest: Option<SensePacket>,
     pending: VecDeque<SensePacket>,
     last_error: Option<String>,
+    received_packets: u64,
+    dropped_or_replaced_packets: u64,
 }
 
 impl BackgroundSenseState {
     fn record_packet(&mut self, name: &str, packet: SensePacket) {
+        self.received_packets = self.received_packets.saturating_add(1);
         if name == "kinect-depth" && matches!(packet, SensePacket::EyeFrame(_)) {
             return;
         }
@@ -1066,8 +1074,14 @@ impl BackgroundSenseState {
             self.pending.push_back(packet);
             while self.pending.len() > 32 {
                 self.pending.pop_front();
+                self.dropped_or_replaced_packets =
+                    self.dropped_or_replaced_packets.saturating_add(1);
             }
         } else {
+            if self.latest.is_some() {
+                self.dropped_or_replaced_packets =
+                    self.dropped_or_replaced_packets.saturating_add(1);
+            }
             self.latest = Some(packet);
         }
     }
@@ -1078,6 +1092,13 @@ impl BackgroundSenseState {
 }
 
 impl BackgroundSenseProducer {
+    fn spawn<T>(name: &'static str, producer: T, poll_interval: Duration) -> Self
+    where
+        T: SenseProducer + Send + 'static,
+    {
+        Self::spawn_with_callback(name, producer, poll_interval, |_| {})
+    }
+
     fn spawn_with_callback<T, F>(
         name: &'static str,
         mut producer: T,
@@ -1134,12 +1155,42 @@ impl BackgroundSenseProducer {
         });
         Self { name, state }
     }
+
+    fn readiness(&self) -> BackgroundSenseReadiness {
+        BackgroundSenseReadiness {
+            state: std::sync::Arc::clone(&self.state),
+        }
+    }
+}
+
+impl BackgroundSenseReadiness {
+    fn snapshot(&self) -> BackgroundSenseState {
+        self.state
+            .lock()
+            .expect("background sensor mutex poisoned")
+            .clone()
+    }
 }
 
 #[async_trait::async_trait]
 impl SenseProducer for BackgroundSenseProducer {
     fn source_name(&self) -> &'static str {
         self.name
+    }
+
+    fn health_diagnostics(&self) -> Option<serde_json::Value> {
+        let state = self
+            .state
+            .lock()
+            .expect("background sensor mutex poisoned");
+        Some(serde_json::json!({
+            "queue_capacity": 32,
+            "queued_packets": state.pending.len(),
+            "latest_packet_available": state.latest.is_some(),
+            "received_packets": state.received_packets,
+            "dropped_or_replaced_packets": state.dropped_or_replaced_packets,
+            "last_background_error": state.last_error,
+        }))
     }
 
     async fn poll(&mut self) -> Result<SensePacket> {
@@ -1164,8 +1215,9 @@ fn background_sensor_retry_delay(base: Duration, consecutive_failures: u32) -> D
 
 #[cfg(test)]
 mod background_sensor_retry_tests {
-    use super::{background_sensor_retry_delay, slow_motion_note};
-    use pete_sensors::WorldSnapshot;
+    use super::{background_sensor_retry_delay, slow_motion_note, BackgroundSenseState};
+    use pete_now::{EarSense, EyeSense};
+    use pete_sensors::{SensePacket, WorldSnapshot};
     use std::time::Duration;
 
     #[test]
@@ -1192,6 +1244,22 @@ mod background_sensor_retry_tests {
             background_sensor_retry_delay(base, 20),
             Duration::from_secs(5)
         );
+    }
+
+    #[test]
+    fn background_sensor_accounts_for_lossy_replacement_and_reliable_overflow() {
+        let mut lossy = BackgroundSenseState::default();
+        lossy.record_packet("camera", SensePacket::Eye(EyeSense::default()));
+        lossy.record_packet("camera", SensePacket::Eye(EyeSense::default()));
+        assert_eq!(lossy.received_packets, 2);
+        assert_eq!(lossy.dropped_or_replaced_packets, 1);
+
+        let mut reliable = BackgroundSenseState::default();
+        for _ in 0..33 {
+            reliable.record_packet("microphone", SensePacket::Ear(EarSense::default()));
+        }
+        assert_eq!(reliable.pending.len(), 32);
+        assert_eq!(reliable.dropped_or_replaced_packets, 1);
     }
 
     #[test]
