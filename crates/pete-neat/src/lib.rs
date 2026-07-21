@@ -15,6 +15,7 @@ use pete_core::Pose2;
 use pete_now::RangeSense;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 include!("neat/locomotion.rs");
 include!("neat/genome.rs");

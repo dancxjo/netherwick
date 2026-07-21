@@ -133,15 +133,20 @@ proposal-only and still traverses conductor selection, autonomic filtering, and
 the final motor gate; physical evidence must additionally observe the possession
 lease and brainstem gate.
 
-A schema-v1 promotion evidence file contains `simulation` and `physical`
-`LocomotionShadowReport` objects. Each report includes capture IDs and metrics
-for collision rate, progress, oscillation, energy per metre, recovery success,
-and command instability. The default gate requires 20 held-out simulation
-episodes, 10 physical episodes, exact input alignment on every frame, no safety
-invariant violations, improvement without bounded metric regression, consistent
-simulation/physical progress gains, hardcoded fallback evidence, and atomic
-activation/rollback evidence. Missing or rejected evidence never changes the
-active model.
+A schema-v2 promotion evidence package contains `simulation` and `physical`
+`LocomotionShadowReport` objects plus relative, SHA-256-bound artifact references.
+The artifact set includes capture manifests, shadow-frame JSONL, the exact
+candidate checkpoint and identity record, an activation ledger, and a rollback
+record. The gate recomputes frame counts, exact-input alignment, baseline-only
+execution, safety-chain coverage, physical lease/brainstem evidence, candidate
+identity, activation, and rollback from those artifacts. Report booleans alone
+cannot promote a model, and artifact paths may not escape the evidence package.
+
+The default gate requires 20 held-out simulation episodes, 10 physical episodes,
+exact input alignment on every frame, no safety invariant violations, improvement
+without bounded metric regression, consistent simulation/physical progress gains,
+hardcoded fallback evidence, and verified activation/rollback transitions. Missing,
+changed, or rejected evidence never changes the active model.
 
 The stable v1 input order has 17 values:
 

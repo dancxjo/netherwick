@@ -756,10 +756,14 @@ fn shadow_report(
         environment,
         baseline_id: "locomotion.hardcoded_wander.v0".into(),
         candidate_id: "candidate-good".into(),
-        capture_ids: vec!["capture-a".into()],
+        capture_ids: vec![if physical {
+            "capture-physical".into()
+        } else {
+            "capture-simulation".into()
+        }],
         episodes: 20,
-        total_frames: 2_000,
-        aligned_input_frames: 2_000,
+        total_frames: 1,
+        aligned_input_frames: 1,
         baseline_executed_only: true,
         proposal_only: true,
         conductor_gate_observed: true,
@@ -780,6 +784,144 @@ fn shadow_report(
             command_instability: 0.30,
         },
         candidate,
+    }
+}
+
+fn write_promotion_artifact(root: &Path, name: &str, bytes: Vec<u8>) -> PromotionArtifactRef {
+    fs::write(root.join(name), &bytes).unwrap();
+    PromotionArtifactRef {
+        path: name.to_string(),
+        sha256: sha256_hex(&bytes),
+    }
+}
+
+fn promotion_evidence(
+    root: &Path,
+    candidate: LocomotionPolicyMetrics,
+) -> LocomotionPromotionEvidence {
+    let simulation = shadow_report(ShadowEnvironment::HeldOutSimulation, candidate);
+    let physical = shadow_report(ShadowEnvironment::Physical, candidate);
+    let checkpoint = b"candidate checkpoint bytes".to_vec();
+    let checkpoint_sha256 = sha256_hex(&checkpoint);
+    let candidate_checkpoint = write_promotion_artifact(root, "candidate.bin", checkpoint);
+    let candidate_identity = write_promotion_artifact(
+        root,
+        "candidate.json",
+        serde_json::to_vec(&LocomotionCandidateIdentityArtifact {
+            candidate_id: physical.candidate_id.clone(),
+            checkpoint_sha256: checkpoint_sha256.clone(),
+        })
+        .unwrap(),
+    );
+    let baseline = LocomotionOutput {
+        forward_velocity_m_s: 0.2,
+        ..LocomotionOutput::default()
+    };
+    let candidate_output = LocomotionOutput {
+        forward_velocity_m_s: 0.25,
+        ..LocomotionOutput::default()
+    };
+    let capture_artifacts = |environment: ShadowEnvironment, name: &str| {
+        let report = if environment == ShadowEnvironment::Physical {
+            &physical
+        } else {
+            &simulation
+        };
+        let capture_id = report.capture_ids[0].clone();
+        let manifest = write_promotion_artifact(
+            root,
+            &format!("{name}-manifest.json"),
+            serde_json::to_vec(&LocomotionCaptureManifestEvidence {
+                capture_id: capture_id.clone(),
+                environment,
+                episodes: 20,
+                possession_lease_id: (environment == ShadowEnvironment::Physical)
+                    .then(|| "lease-1".to_string()),
+                brainstem_firmware_identity: (environment == ShadowEnvironment::Physical)
+                    .then(|| "brainstem:a50d7838".to_string()),
+            })
+            .unwrap(),
+        );
+        let frame = RecordedLocomotionShadowFrame {
+            shadow: LocomotionShadowFrame::new(
+                format!("{name}-frame-1"),
+                100,
+                LocomotionInput::default(),
+                baseline,
+                Some(candidate_output),
+                baseline,
+                &report.baseline_id,
+                &report.candidate_id,
+                Some(8),
+                Some(10),
+                Some(0.9),
+                None,
+            ),
+            safety: LocomotionShadowSafetyTrace {
+                proposal_only: true,
+                conductor_gate_executed: true,
+                autonomic_gate_executed: true,
+                final_motor_gate_executed: true,
+                safety_invariant_violation: false,
+            },
+        };
+        let mut frame_bytes = serde_json::to_vec(&frame).unwrap();
+        frame_bytes.push(b'\n');
+        let shadow_frames =
+            write_promotion_artifact(root, &format!("{name}-frames.jsonl"), frame_bytes);
+        ShadowCaptureArtifacts {
+            capture_id,
+            manifest,
+            shadow_frames,
+        }
+    };
+    let simulation_capture = capture_artifacts(ShadowEnvironment::HeldOutSimulation, "simulation");
+    let physical_capture = capture_artifacts(ShadowEnvironment::Physical, "physical");
+    let transitions = vec![
+        LocomotionActivationTransition {
+            sequence: 10,
+            from_policy_id: physical.baseline_id.clone(),
+            to_policy_id: physical.candidate_id.clone(),
+            candidate_id: physical.candidate_id.clone(),
+            checkpoint_sha256: checkpoint_sha256.clone(),
+        },
+        LocomotionActivationTransition {
+            sequence: 11,
+            from_policy_id: physical.candidate_id.clone(),
+            to_policy_id: physical.baseline_id.clone(),
+            candidate_id: physical.candidate_id.clone(),
+            checkpoint_sha256: checkpoint_sha256.clone(),
+        },
+    ];
+    let activation_ledger = write_promotion_artifact(
+        root,
+        "activation-ledger.json",
+        serde_json::to_vec(&transitions).unwrap(),
+    );
+    let rollback_record = write_promotion_artifact(
+        root,
+        "rollback.json",
+        serde_json::to_vec(&LocomotionRollbackRecord {
+            activation_sequence: 10,
+            rollback_sequence: 11,
+            candidate_id: physical.candidate_id.clone(),
+            checkpoint_sha256,
+            restored_policy_id: physical.baseline_id.clone(),
+        })
+        .unwrap(),
+    );
+    LocomotionPromotionEvidence {
+        schema_version: LOCOMOTION_SHADOW_SCHEMA_VERSION,
+        simulation,
+        physical,
+        artifacts: LocomotionPromotionArtifacts {
+            simulation_captures: vec![simulation_capture],
+            physical_captures: vec![physical_capture],
+            candidate_identity,
+            candidate_checkpoint,
+            activation_ledger,
+            rollback_record,
+        },
     }
 }
 
@@ -852,12 +994,54 @@ fn promotion_requires_consistent_simulation_and_physical_shadow_evidence() {
         recovery_success_rate: 0.75,
         command_instability: 0.25,
     };
-    let evidence = LocomotionPromotionEvidence {
-        schema_version: LOCOMOTION_SHADOW_SCHEMA_VERSION,
-        simulation: shadow_report(ShadowEnvironment::HeldOutSimulation, candidate),
-        physical: shadow_report(ShadowEnvironment::Physical, candidate),
+    let root = tempfile::tempdir().unwrap();
+    let evidence = promotion_evidence(root.path(), candidate);
+    let verification = verify_locomotion_promotion_artifacts(&evidence, root.path()).unwrap();
+    let decision =
+        evaluate_locomotion_promotion(&evidence, Default::default(), Some(&verification));
+    assert!(decision.promote, "{:?}", decision.reasons);
+}
+
+#[test]
+fn self_attested_report_booleans_cannot_promote_without_artifact_verification() {
+    let candidate = LocomotionPolicyMetrics {
+        collision_rate: 0.08,
+        progress_m: 11.0,
+        oscillations_per_m: 0.3,
+        energy_per_m: 1.02,
+        recovery_success_rate: 0.75,
+        command_instability: 0.25,
     };
-    assert!(evaluate_locomotion_promotion(&evidence, Default::default()).promote);
+    let root = tempfile::tempdir().unwrap();
+    let evidence = promotion_evidence(root.path(), candidate);
+    let decision = evaluate_locomotion_promotion(&evidence, Default::default(), None);
+    assert!(!decision.promote);
+    assert!(decision
+        .reasons
+        .iter()
+        .any(|reason| reason.contains("independently verified")));
+}
+
+#[test]
+fn promotion_artifact_checksum_tampering_fails_closed() {
+    let candidate = LocomotionPolicyMetrics {
+        collision_rate: 0.08,
+        progress_m: 11.0,
+        oscillations_per_m: 0.3,
+        energy_per_m: 1.02,
+        recovery_success_rate: 0.75,
+        command_instability: 0.25,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let evidence = promotion_evidence(root.path(), candidate);
+    fs::write(
+        root.path()
+            .join(&evidence.artifacts.physical_captures[0].shadow_frames.path),
+        b"tampered\n",
+    )
+    .unwrap();
+    let error = verify_locomotion_promotion_artifacts(&evidence, root.path()).unwrap_err();
+    assert!(error.to_string().contains("checksum mismatch"));
 }
 
 #[test]
@@ -870,15 +1054,13 @@ fn deliberately_poor_candidate_is_rejected_and_hardcoded_remains_fallback() {
         recovery_success_rate: 0.25,
         command_instability: 0.9,
     };
-    let mut physical = shadow_report(ShadowEnvironment::Physical, poor);
-    physical.hardcoded_fallback_verified = false;
-    physical.rollback_verified = false;
-    let evidence = LocomotionPromotionEvidence {
-        schema_version: LOCOMOTION_SHADOW_SCHEMA_VERSION,
-        simulation: shadow_report(ShadowEnvironment::HeldOutSimulation, poor),
-        physical,
-    };
-    let decision = evaluate_locomotion_promotion(&evidence, Default::default());
+    let root = tempfile::tempdir().unwrap();
+    let evidence = promotion_evidence(root.path(), poor);
+    let mut verification = verify_locomotion_promotion_artifacts(&evidence, root.path()).unwrap();
+    verification.physical.hardcoded_fallback_verified = false;
+    verification.rollback_verified = false;
+    let decision =
+        evaluate_locomotion_promotion(&evidence, Default::default(), Some(&verification));
     assert!(!decision.promote);
     assert!(decision
         .reasons
@@ -904,16 +1086,15 @@ fn malformed_or_non_finite_shadow_evidence_fails_closed() {
         recovery_success_rate: 0.75,
         command_instability: 0.25,
     };
-    let mut simulation = shadow_report(ShadowEnvironment::HeldOutSimulation, candidate);
-    simulation.schema_version += 1;
-    simulation.aligned_input_frames = simulation.total_frames + 1;
-    simulation.candidate.progress_m = f32::NAN;
-    let evidence = LocomotionPromotionEvidence {
-        schema_version: LOCOMOTION_SHADOW_SCHEMA_VERSION + 1,
-        simulation,
-        physical: shadow_report(ShadowEnvironment::Physical, candidate),
-    };
-    let decision = evaluate_locomotion_promotion(&evidence, Default::default());
+    let root = tempfile::tempdir().unwrap();
+    let mut evidence = promotion_evidence(root.path(), candidate);
+    evidence.schema_version += 1;
+    evidence.simulation.schema_version += 1;
+    evidence.simulation.aligned_input_frames = evidence.simulation.total_frames + 1;
+    evidence.simulation.candidate.progress_m = f32::NAN;
+    let verification = verify_locomotion_promotion_artifacts(&evidence, root.path()).unwrap();
+    let decision =
+        evaluate_locomotion_promotion(&evidence, Default::default(), Some(&verification));
     assert!(!decision.promote);
     assert!(decision
         .reasons
@@ -922,7 +1103,7 @@ fn malformed_or_non_finite_shadow_evidence_fails_closed() {
     assert!(decision
         .reasons
         .iter()
-        .any(|reason| reason.contains("frame counts")));
+        .any(|reason| reason.contains("claims do not match")));
     assert!(decision
         .reasons
         .iter()

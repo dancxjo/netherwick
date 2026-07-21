@@ -40,11 +40,11 @@ use pete_memory::{
 use pete_models::MODEL_REGISTRY;
 use pete_mouth::QueuedPiperCpalMouth;
 use pete_neat::{
-    evaluate_locomotion_promotion, CandidateEvaluation, CurriculumStage,
-    EpisodeMetrics as NeatEpisodeMetrics, FitnessTraits, Genome, GenomeState, LocomotionCheckpoint,
-    LocomotionOutput, LocomotionPromotionEvidence, LocomotionPromotionPolicy, LocomotionTracker,
-    NeatConfig, NicheQualificationEvidence, NoveltyArchive, Population, QualityDiversityDescriptor,
-    QualityDiversityEntry, SelectionSummary,
+    evaluate_locomotion_promotion, verify_locomotion_promotion_artifacts, CandidateEvaluation,
+    CurriculumStage, EpisodeMetrics as NeatEpisodeMetrics, FitnessTraits, Genome, GenomeState,
+    LocomotionCheckpoint, LocomotionOutput, LocomotionPromotionEvidence, LocomotionPromotionPolicy,
+    LocomotionTracker, NeatConfig, NicheQualificationEvidence, NoveltyArchive, Population,
+    QualityDiversityDescriptor, QualityDiversityEntry, SelectionSummary,
 };
 use pete_now::{
     EarSense, ExtensionSense, KinectSense, Now, RangeExtrinsics, RangeSense, SurpriseSense,

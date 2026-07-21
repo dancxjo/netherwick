@@ -33,9 +33,15 @@ async fn run_neat_train(args: NeatTrainArgs) -> Result<()> {
                 args.checkpoint
             );
         }
+        let artifact_root = Path::new(path).parent().unwrap_or_else(|| Path::new("."));
+        let verification = verify_locomotion_promotion_artifacts(&evidence, artifact_root)
+            .with_context(|| {
+                format!("verifying checksummed locomotion promotion artifacts for {path}")
+            })?;
         Some(evaluate_locomotion_promotion(
             &evidence,
             LocomotionPromotionPolicy::default(),
+            Some(&verification),
         ))
     } else {
         None
