@@ -71,6 +71,10 @@ All notable changes are grouped by date.
 - Derive `Clone`, `Debug`, `PartialEq`, `Serialize`, and `Deserialize` for
   `EmbodiedDemo` so demo embeddings can be copied, compared, and serialized
   consistently through experience tooling.
+- Ready: Normalize Brainstem test module formatting in
+  `crates/pete-brainstem/src/{arch/pico_w_tests.rs,display_tests.rs,runtime_tests.rs,status_tests.rs}`
+  by removing stray leading indentation and restoring canonical top-level item
+  alignment.
 
 ### Auto-sync (2026-07-15)
 
