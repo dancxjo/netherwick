@@ -488,9 +488,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             live_state.update_embodied_context(tick.frame.embodied_context());
         }
         if let Some(writer) = capture.as_mut() {
-            writer
-                .append_snapshot(snapshot.body.last_update_ms, snapshot.clone(), Vec::new())
-                .await?;
+            append_real_robot_snapshot(writer, &snapshot, &tick).await?;
         }
         let motion_note = slow_motion_note(&snapshot);
         println!(
@@ -554,6 +552,16 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         capture_summary
     );
     Ok(())
+}
+
+async fn append_real_robot_snapshot(
+    writer: &mut CaptureWriter,
+    snapshot: &WorldSnapshot,
+    tick: &RuntimeTick,
+) -> Result<()> {
+    writer
+        .append_snapshot(tick.frame.now.t_ms, snapshot.clone(), Vec::new())
+        .await
 }
 
 async fn shutdown_signal() -> &'static str {

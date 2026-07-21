@@ -26,6 +26,10 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Timestamp physical capture frames with the canonical fused runtime-frame time
+  while retaining body and sensor producer timestamps as provenance, preventing
+  stale Create packets from collapsing asynchronous sensor evidence onto duplicate
+  capture times.
 - Integrate legacy cumulative physical odometry as stateful SE(2) deltas,
   require measured scan/submap registration for live loop constraints, publish
   the runtime map as the dashboard's canonical map, rebuild retained 3D depth

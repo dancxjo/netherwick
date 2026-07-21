@@ -147,6 +147,36 @@ async fn possession_mode_never_falls_back_when_brainstem_is_missing() {
     assert!(error.to_string().contains("stable brainstem USB CDC"));
 }
 
+#[tokio::test]
+async fn physical_capture_uses_runtime_frame_time_when_body_time_is_stale() {
+    let temp_dir = temp_path("pete_physical_capture_runtime_time");
+    let mut writer = CaptureWriter::create(&temp_dir, CaptureSource::RealRobot, Some(100))
+        .await
+        .unwrap();
+    let mut snapshot = WorldSnapshot::default();
+    snapshot.body.last_update_ms = 100;
+    let mut tick = tick_with_action(ActionPrimitive::Stop);
+    tick.frame.t_ms = 250;
+    tick.frame.now.t_ms = 250;
+    tick.frame.now.body.last_update_ms = 100;
+
+    append_real_robot_snapshot(&mut writer, &snapshot, &tick)
+        .await
+        .unwrap();
+    writer.finish().await.unwrap();
+
+    let frames = CaptureReader::open(&temp_dir)
+        .await
+        .unwrap()
+        .read_frames()
+        .await
+        .unwrap();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].t_ms, 250);
+    assert_eq!(frames[0].snapshot.body.last_update_ms, 100);
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
 #[test]
 fn possession_reconnect_backoff_is_exponential_and_bounded() {
     assert_eq!(next_reconnect_backoff_ms(250, 5_000), 500);
