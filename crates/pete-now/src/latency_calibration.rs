@@ -278,7 +278,7 @@ impl StreamEstimator {
             };
         self.state.trust_state = if !fresh && self.state.last_observed_at_ms.is_some() {
             LatencyTrustState::Degraded
-        } else if enough_samples && uncertainty <= config.maximum_uncertainty_ms {
+        } else if enough_samples && enough_events && uncertainty <= config.maximum_uncertainty_ms {
             LatencyTrustState::Trusted
         } else if self.transport_samples_ms.is_empty() {
             LatencyTrustState::Unobservable
@@ -457,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_latency_reports_distribution_jitter_and_confidence() {
+    fn stable_transport_latency_without_correlated_events_remains_estimating() {
         let mut registry = SensorLatencyRegistry::default();
         for index in 0..20 {
             let latency = [18, 20, 21, 19][index % 4];
@@ -465,12 +465,16 @@ mod tests {
             registry.observe("camera", observation(receive - latency, receive, 0));
         }
         let state = registry.snapshot(3_000)["camera"].clone();
-        assert_eq!(state.trust_state, LatencyTrustState::Trusted);
+        assert_eq!(state.trust_state, LatencyTrustState::Estimating);
         let distribution = state.transport_latency.unwrap();
         assert_eq!(distribution.median_ms, 20.0);
         assert_eq!(distribution.p95_ms, 21.0);
         assert!(distribution.jitter_ms <= 1.0);
         assert!(state.confidence > 0.6);
+        assert!(state
+            .rejection_reasons
+            .iter()
+            .any(|reason| reason.contains("correlated event")));
     }
 
     #[test]
@@ -488,6 +492,7 @@ mod tests {
             registry.observe("imu", sample);
         }
         let state = registry.snapshot(2_600)["imu"].clone();
+        assert_eq!(state.trust_state, LatencyTrustState::Trusted);
         assert_eq!(state.correlated_offset.as_ref().unwrap().median_ms, 30.0);
         assert!(registry
             .validate_held_out_event("imu", 5_032, 5_000, 3.0)
@@ -532,6 +537,7 @@ mod tests {
     fn stale_timing_degrades_without_blocking_observation() {
         let mut registry = SensorLatencyRegistry::default();
         registry.config.minimum_samples = 2;
+        registry.config.minimum_correlated_events = 0;
         registry.observe("audio", observation(990, 1_000, 0));
         registry.observe("audio", observation(1_090, 1_100, 0));
         assert_eq!(

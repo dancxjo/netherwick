@@ -301,10 +301,9 @@ impl ImuCalibrationEstimator {
     }
 
     fn detect_remount(&self, acceleration_g: [f32; 3], angular_velocity_rad_s: [f32; 3]) -> bool {
-        if !matches!(
-            self.state.trust_state,
-            ImuCalibrationTrustState::Trusted | ImuCalibrationTrustState::Degraded
-        ) {
+        if !self.state.roll_pitch_observable
+            || self.state.stationary_samples < self.config.minimum_stationary_samples
+        {
             return false;
         }
         let gravity = normalize(acceleration_g);
@@ -396,7 +395,7 @@ impl ImuCalibrationEstimator {
         .clamp(0.0, 1.0);
         self.state.trust_state = if !warmed {
             ImuCalibrationTrustState::WarmingUp
-        } else if bias_ready && self.state.roll_pitch_observable {
+        } else if bias_ready && self.state.roll_pitch_observable && self.state.yaw_axis_observable {
             ImuCalibrationTrustState::Trusted
         } else if rejected_ratio > 0.5 {
             ImuCalibrationTrustState::Degraded
@@ -463,7 +462,7 @@ mod tests {
         }
         assert_eq!(
             estimator.state().trust_state,
-            ImuCalibrationTrustState::Trusted
+            ImuCalibrationTrustState::Estimating
         );
         assert!(estimator.state().roll_pitch_observable);
         assert!(!estimator.state().yaw_axis_observable);
@@ -529,6 +528,10 @@ mod tests {
             );
         }
         assert!(estimator.state().yaw_axis_observable);
+        assert_eq!(
+            estimator.state().trust_state,
+            ImuCalibrationTrustState::Trusted
+        );
         assert!(estimator
             .state()
             .yaw_rate_scale
@@ -575,7 +578,7 @@ mod tests {
         }
         assert_eq!(
             estimator.state().trust_state,
-            ImuCalibrationTrustState::Trusted
+            ImuCalibrationTrustState::Estimating
         );
         assert_eq!(estimator.state().epoch.id, 1);
     }

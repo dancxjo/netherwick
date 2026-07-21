@@ -1,6 +1,6 @@
 use crate::RigidTransform3;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const TRANSFORM_DOF_COUNT: usize = 6;
 
@@ -75,6 +75,8 @@ pub struct LiveCalibrationEstimate {
     pub evidence_counts: BTreeMap<CalibrationEvidenceSource, u32>,
     pub dof_evidence_counts: [u32; TRANSFORM_DOF_COUNT],
     pub residuals: CalibrationResiduals,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_started_at_ms: Option<u64>,
     pub updated_at_ms: u64,
     pub epoch: CalibrationEpoch,
     pub rejection_reasons: Vec<String>,
@@ -116,6 +118,18 @@ pub struct CalibrationStateConfig {
     pub reprojection_shift_px: f32,
     pub map_shift_m: f32,
     pub maximum_evidence_age_ms: u64,
+    #[serde(default = "default_minimum_independent_sources")]
+    pub minimum_independent_sources: usize,
+    #[serde(default = "default_minimum_trust_span_ms")]
+    pub minimum_trust_span_ms: u64,
+}
+
+const fn default_minimum_independent_sources() -> usize {
+    2
+}
+
+const fn default_minimum_trust_span_ms() -> u64 {
+    1_000
 }
 
 impl Default for CalibrationStateConfig {
@@ -131,6 +145,8 @@ impl Default for CalibrationStateConfig {
             reprojection_shift_px: 6.0,
             map_shift_m: 0.15,
             maximum_evidence_age_ms: 2_000,
+            minimum_independent_sources: default_minimum_independent_sources(),
+            minimum_trust_span_ms: default_minimum_trust_span_ms(),
         }
     }
 }
@@ -140,6 +156,7 @@ pub struct CalibrationStateMachine {
     configured_guess: RigidTransform3,
     pub config: CalibrationStateConfig,
     estimate: LiveCalibrationEstimate,
+    dof_covariance_sources: [BTreeSet<CalibrationEvidenceSource>; TRANSFORM_DOF_COUNT],
 }
 
 impl CalibrationStateMachine {
@@ -159,6 +176,7 @@ impl CalibrationStateMachine {
                 evidence_counts: BTreeMap::new(),
                 dof_evidence_counts: [0; TRANSFORM_DOF_COUNT],
                 residuals: CalibrationResiduals::default(),
+                evidence_started_at_ms: None,
                 updated_at_ms: started_at_ms,
                 epoch: CalibrationEpoch {
                     id: 0,
@@ -168,6 +186,7 @@ impl CalibrationStateMachine {
                 },
                 rejection_reasons: vec!["configured transform is only an initial guess".to_string()],
             },
+            dof_covariance_sources: std::array::from_fn(|_| BTreeSet::new()),
             config,
         }
     }
@@ -183,14 +202,11 @@ impl CalibrationStateMachine {
     ) -> &LiveCalibrationEstimate {
         self.estimate.rejection_reasons.clear();
         if let Err(reason) = self.validate_evidence(&evidence, now_ms) {
-            self.refresh_trust_state();
+            self.refresh_trust_state(now_ms);
             self.estimate.rejection_reasons.insert(0, reason);
             return &self.estimate;
         }
-        if matches!(
-            self.estimate.trust_state,
-            CalibrationTrustState::Trusted | CalibrationTrustState::Degraded
-        ) {
+        if self.shift_detection_ready(&evidence) {
             if let Some(reason) = self.shift_reason(&evidence) {
                 self.invalidate_epoch(&evidence, now_ms, reason);
                 return &self.estimate;
@@ -203,6 +219,9 @@ impl CalibrationStateMachine {
             self.estimate.epoch.invalidation_reason = None;
         }
         self.fuse(&evidence);
+        self.estimate
+            .evidence_started_at_ms
+            .get_or_insert(evidence.captured_at_ms);
         self.estimate.updated_at_ms = evidence.captured_at_ms;
         *self
             .estimate
@@ -210,7 +229,12 @@ impl CalibrationStateMachine {
             .entry(evidence.source)
             .or_default() += 1;
         self.estimate.residuals.merge(&evidence.residuals);
-        self.refresh_trust_state();
+        self.refresh_trust_state(now_ms);
+        &self.estimate
+    }
+
+    pub fn refresh(&mut self, now_ms: u64) -> &LiveCalibrationEstimate {
+        self.refresh_trust_state(now_ms);
         &self.estimate
     }
 
@@ -274,7 +298,15 @@ impl CalibrationStateMachine {
             if index >= 3 {
                 current[index] = normalize_angle(current[index]);
             }
-            self.estimate.covariance[index] = 1.0 / (prior_weight + observation_weight);
+            // Repeated frames from one estimator are correlated. Only a newly
+            // independent source gets an inverse-variance covariance update;
+            // repetition may report a better bound but cannot compound itself.
+            self.estimate.covariance[index] =
+                if self.dof_covariance_sources[index].insert(evidence.source) {
+                    1.0 / (prior_weight + observation_weight)
+                } else {
+                    prior_variance.min(observation_variance)
+                };
             self.estimate.dof_evidence_counts[index] =
                 self.estimate.dof_evidence_counts[index].saturating_add(1);
             self.estimate.observable_dofs[index] = true;
@@ -333,6 +365,17 @@ impl CalibrationStateMachine {
         None
     }
 
+    fn shift_detection_ready(&self, evidence: &TransformEstimateEvidence) -> bool {
+        matches!(
+            self.estimate.trust_state,
+            CalibrationTrustState::Trusted | CalibrationTrustState::Degraded
+        ) || evidence
+            .observable_dofs
+            .iter()
+            .zip(self.estimate.dof_evidence_counts)
+            .any(|(observable, count)| *observable && count >= self.config.minimum_evidence_per_dof)
+    }
+
     fn invalidate_epoch(
         &mut self,
         evidence: &TransformEstimateEvidence,
@@ -353,7 +396,9 @@ impl CalibrationStateMachine {
         self.estimate.observable_dofs = [false; TRANSFORM_DOF_COUNT];
         self.estimate.evidence_counts.clear();
         self.estimate.dof_evidence_counts = [0; TRANSFORM_DOF_COUNT];
+        self.dof_covariance_sources = std::array::from_fn(|_| BTreeSet::new());
         self.estimate.residuals = evidence.residuals.clone();
+        self.estimate.evidence_started_at_ms = None;
         self.estimate.updated_at_ms = now_ms;
         self.estimate.epoch = CalibrationEpoch {
             id: self.estimate.epoch.id.saturating_add(1),
@@ -364,7 +409,7 @@ impl CalibrationStateMachine {
         self.estimate.rejection_reasons = vec![reason];
     }
 
-    fn refresh_trust_state(&mut self) {
+    fn refresh_trust_state(&mut self, now_ms: u64) {
         if self.estimate.trust_state == CalibrationTrustState::Invalidated {
             return;
         }
@@ -379,6 +424,15 @@ impl CalibrationStateMachine {
             .iter()
             .zip(self.config.trusted_covariance)
             .all(|(actual, limit)| *actual <= limit);
+        let source_diversity_ready =
+            self.estimate.evidence_counts.len() >= self.config.minimum_independent_sources;
+        let temporal_separation_ready = self.estimate.evidence_started_at_ms.is_some_and(|first| {
+            self.estimate.updated_at_ms.saturating_sub(first) >= self.config.minimum_trust_span_ms
+        });
+        let evidence_fresh = !self.estimate.evidence_counts.is_empty()
+            && now_ms.saturating_sub(self.estimate.updated_at_ms)
+                <= self.config.maximum_evidence_age_ms;
+        let evidence_stale = !self.estimate.evidence_counts.is_empty() && !evidence_fresh;
         let residual_degraded = self
             .estimate
             .residuals
@@ -415,9 +469,13 @@ impl CalibrationStateMachine {
             .sum::<f32>()
             / TRANSFORM_DOF_COUNT as f32;
         self.estimate.confidence = (observable_fraction * covariance_fraction).clamp(0.0, 1.0);
-        self.estimate.trust_state = if residual_degraded {
+        self.estimate.trust_state = if residual_degraded || evidence_stale {
             CalibrationTrustState::Degraded
-        } else if all_observable && covariance_ready {
+        } else if all_observable
+            && covariance_ready
+            && source_diversity_ready
+            && temporal_separation_ready
+        {
             CalibrationTrustState::Trusted
         } else if self.estimate.evidence_counts.is_empty() {
             CalibrationTrustState::Configured
@@ -443,6 +501,23 @@ impl CalibrationStateMachine {
             self.estimate
                 .rejection_reasons
                 .push("transform covariance remains above trust limits".to_string());
+        }
+        if !source_diversity_ready {
+            self.estimate.rejection_reasons.push(format!(
+                "only {} independent calibration source(s); {} required",
+                self.estimate.evidence_counts.len(),
+                self.config.minimum_independent_sources
+            ));
+        }
+        if !temporal_separation_ready {
+            self.estimate
+                .rejection_reasons
+                .push("calibration evidence lacks temporal separation".to_string());
+        }
+        if !evidence_fresh && !self.estimate.evidence_counts.is_empty() {
+            self.estimate
+                .rejection_reasons
+                .push("calibration evidence has aged past the freshness limit".to_string());
         }
         if residual_degraded {
             self.estimate
@@ -497,6 +572,23 @@ mod tests {
         }
     }
 
+    fn converge_full_transform(
+        machine: &mut CalibrationStateMachine,
+        transform: RigidTransform3,
+        start_ms: u64,
+    ) {
+        for index in 0..4 {
+            let timestamp = start_ms + index * 500;
+            let mut item = evidence(timestamp, transform, [true; 6]);
+            item.source = if index % 2 == 0 {
+                CalibrationEvidenceSource::PersistentSurface
+            } else {
+                CalibrationEvidenceSource::MapConsistency
+            };
+            machine.observe(item, timestamp);
+        }
+    }
+
     #[test]
     fn trust_is_withheld_until_every_transform_dof_is_observable() {
         let mut machine = CalibrationStateMachine::new(
@@ -525,12 +617,7 @@ mod tests {
             0,
             CalibrationStateConfig::default(),
         );
-        for timestamp in 1..=4 {
-            machine.observe(
-                evidence(timestamp, RigidTransform3::default(), [true; 6]),
-                timestamp,
-            );
-        }
+        converge_full_transform(&mut machine, RigidTransform3::default(), 0);
         assert_eq!(
             machine.estimate().trust_state,
             CalibrationTrustState::Trusted
@@ -539,7 +626,7 @@ mod tests {
             translation_m: [0.12, 0.0, 0.0],
             ..RigidTransform3::default()
         };
-        machine.observe(evidence(10, shifted, [true; 6]), 10);
+        machine.observe(evidence(2_000, shifted, [true; 6]), 2_000);
         assert_eq!(
             machine.estimate().trust_state,
             CalibrationTrustState::Invalidated
@@ -547,9 +634,7 @@ mod tests {
         assert_eq!(machine.estimate().epoch.id, 1);
         assert!(machine.estimate().epoch.invalidation_reason.is_some());
 
-        for timestamp in 11..=15 {
-            machine.observe(evidence(timestamp, shifted, [true; 6]), timestamp);
-        }
+        converge_full_transform(&mut machine, shifted, 2_500);
         assert_eq!(
             machine.estimate().trust_state,
             CalibrationTrustState::Trusted
@@ -564,11 +649,7 @@ mod tests {
             0,
             CalibrationStateConfig::default(),
         );
-        for timestamp in 1..=4 {
-            let mut item = evidence(timestamp, RigidTransform3::default(), [true; 6]);
-            item.source = CalibrationEvidenceSource::PersistentSurface;
-            machine.observe(item, timestamp);
-        }
+        converge_full_transform(&mut machine, RigidTransform3::default(), 0);
         assert_eq!(
             machine.estimate().trust_state,
             CalibrationTrustState::Trusted
@@ -601,26 +682,75 @@ mod tests {
             0,
             CalibrationStateConfig::default(),
         );
-        for timestamp in 1..=4 {
-            machine.observe(
-                evidence(timestamp, RigidTransform3::default(), [true; 6]),
-                timestamp,
-            );
-        }
-        let mut degraded = evidence(5, RigidTransform3::default(), [true; 6]);
+        converge_full_transform(&mut machine, RigidTransform3::default(), 0);
+        let mut degraded = evidence(2_000, RigidTransform3::default(), [true; 6]);
         degraded.residuals.wall_m = Some(0.06);
-        machine.observe(degraded, 5);
+        machine.observe(degraded, 2_000);
         assert_eq!(
             machine.estimate().trust_state,
             CalibrationTrustState::Degraded
         );
-        let mut shifted = evidence(6, RigidTransform3::default(), [true; 6]);
+        let mut shifted = evidence(2_500, RigidTransform3::default(), [true; 6]);
         shifted.residuals.map_consistency_m = Some(0.20);
-        machine.observe(shifted, 6);
+        machine.observe(shifted, 2_500);
         assert_eq!(
             machine.estimate().trust_state,
             CalibrationTrustState::Invalidated
         );
         assert_eq!(machine.estimate().epoch.id, 1);
+    }
+
+    #[test]
+    fn partially_observable_floor_evidence_can_detect_a_mount_shift() {
+        let mut machine = CalibrationStateMachine::new(
+            RigidTransform3::default(),
+            0,
+            CalibrationStateConfig::default(),
+        );
+        let partial = [false, false, true, true, true, false];
+        for timestamp in [0, 500, 1_000] {
+            machine.observe(
+                evidence(timestamp, RigidTransform3::default(), partial),
+                timestamp,
+            );
+        }
+        assert_eq!(
+            machine.estimate().trust_state,
+            CalibrationTrustState::Estimating
+        );
+        let shifted = RigidTransform3 {
+            translation_m: [0.0, 0.0, 0.12],
+            ..RigidTransform3::default()
+        };
+        machine.observe(evidence(1_500, shifted, partial), 1_500);
+        assert_eq!(
+            machine.estimate().trust_state,
+            CalibrationTrustState::Invalidated
+        );
+        assert_eq!(machine.estimate().epoch.id, 1);
+    }
+
+    #[test]
+    fn trusted_transform_degrades_when_calibration_evidence_ages_out() {
+        let mut machine = CalibrationStateMachine::new(
+            RigidTransform3::default(),
+            0,
+            CalibrationStateConfig::default(),
+        );
+        converge_full_transform(&mut machine, RigidTransform3::default(), 0);
+        assert_eq!(
+            machine.estimate().trust_state,
+            CalibrationTrustState::Trusted
+        );
+        machine.refresh(4_000);
+        assert_eq!(
+            machine.estimate().trust_state,
+            CalibrationTrustState::Degraded
+        );
+        assert!(machine
+            .estimate()
+            .rejection_reasons
+            .iter()
+            .any(|reason| reason.contains("aged past")));
     }
 }

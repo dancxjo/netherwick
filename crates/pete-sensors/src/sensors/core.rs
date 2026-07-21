@@ -1270,11 +1270,12 @@ impl FrameProcessor {
                 CalibrationStateConfig::default(),
             ));
         }
-        if let (Some(state), Some(evidence)) = (
-            self.kinect_calibration.as_mut(),
-            floor_plane_calibration_evidence(kinect),
-        ) {
-            state.observe(evidence, t_ms);
+        if let Some(state) = self.kinect_calibration.as_mut() {
+            if let Some(evidence) = floor_plane_calibration_evidence(kinect) {
+                state.observe(evidence, t_ms);
+            } else {
+                state.refresh(t_ms);
+            }
         }
         kinect.live_geometry_calibration = self
             .kinect_calibration

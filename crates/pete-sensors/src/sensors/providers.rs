@@ -507,7 +507,10 @@ impl Mpu6050OrientationFilter {
         let calibration = self.calibration.state().clone();
         let acceleration = self.calibration.acceleration_in_base(raw_acceleration);
         let mut angular_velocity = self.calibration.corrected_gyro(raw_angular_velocity);
-        if let Some(scale) = calibration.yaw_rate_scale {
+        if calibration.yaw_axis_observable {
+            let scale = calibration
+                .yaw_rate_scale
+                .expect("observable yaw calibration requires a scale");
             angular_velocity[2] *= scale;
         }
         let accel_norm = vector_norm(acceleration);
@@ -550,11 +553,15 @@ impl Mpu6050OrientationFilter {
         sense.orientation = vec![roll, pitch];
         sense.acceleration = acceleration.to_vec();
         sense.angular_velocity = angular_velocity.to_vec();
-        sense.gyro_bias_calibrated = matches!(
-            calibration.trust_state,
-            pete_now::ImuCalibrationTrustState::Trusted
-                | pete_now::ImuCalibrationTrustState::Degraded
-        );
+        sense.gyro_bias_calibrated = calibration.stationary_samples
+            >= self.calibration.config.minimum_stationary_samples
+            && calibration
+                .gyro_variance
+                .iter()
+                .all(|variance| {
+                    variance.is_finite()
+                        && *variance <= self.calibration.config.maximum_bias_variance
+                });
         sense.mounting_calibrated = calibration.roll_pitch_observable
             && calibration.trust_state != pete_now::ImuCalibrationTrustState::Invalidated;
         sense.orientation_confidence = if accel_trusted {

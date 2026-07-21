@@ -111,6 +111,19 @@ fn schema3_imu_requires_trusted_adaptive_calibration() {
             index * 10,
         );
     }
+    for index in 0..15 {
+        estimator.observe(
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.5],
+            None,
+            pete_now::ImuMotionContext {
+                commanded_angular_rps: 0.5,
+                odometry_angular_rps: 0.5,
+                ..pete_now::ImuMotionContext::default()
+            },
+            700 + index * 10,
+        );
+    }
     for timestamp in [1_005, 1_010] {
         let mut trusted = trustworthy_imu("local_i2c_mpu6050", timestamp, 0);
         trusted.schema_version = 3;
@@ -153,8 +166,12 @@ fn now_builder_publishes_replayable_latency_epochs_and_correlated_rotation() {
             .unwrap();
     assert_eq!(
         states["body"].trust_state,
-        pete_now::LatencyTrustState::Trusted
+        pete_now::LatencyTrustState::Estimating
     );
+    assert!(states["body"]
+        .rejection_reasons
+        .iter()
+        .any(|reason| reason.contains("correlated event")));
     assert_eq!(
         states["imu"].trust_state,
         pete_now::LatencyTrustState::Trusted

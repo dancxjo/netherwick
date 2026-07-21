@@ -374,8 +374,18 @@ impl LocomotionCalibrationEstimator {
             && (self.state.conditions.surface.is_some()
                 || self.state.conditions.tire_condition.is_some())
         {
-            self.state.epoch = self.state.epoch.saturating_add(1);
-            self.state.epoch_started_at_ms = timestamp_ms;
+            let next_epoch = self.state.epoch.saturating_add(1);
+            self.state = LocomotionCalibrationState {
+                trust_state: LocomotionCalibrationTrustState::Estimating,
+                epoch: next_epoch,
+                epoch_started_at_ms: timestamp_ms,
+                conditions: conditions.clone(),
+                rejection_reasons: vec![
+                    "locomotion conditions changed; fresh evidence is required".to_string(),
+                ],
+                ..LocomotionCalibrationState::default()
+            };
+            return;
         }
         self.state.conditions = conditions.clone();
     }
@@ -579,5 +589,19 @@ mod tests {
         changed.conditions.surface = Some("low_pile_carpet".to_string());
         estimator.observe_straight(changed);
         assert_eq!(estimator.state().epoch, 1);
+        assert_eq!(estimator.state().straight_evidence_count, 1);
+        assert_eq!(estimator.state().rotation_evidence_count, 0);
+        assert_eq!(
+            estimator.state().trust_state,
+            LocomotionCalibrationTrustState::Estimating
+        );
+        assert_eq!(estimator.state().global_distance_scale.evidence_count, 1);
+        assert_eq!(
+            estimator
+                .state()
+                .counter_clockwise_rotation_scale
+                .evidence_count,
+            0
+        );
     }
 }
