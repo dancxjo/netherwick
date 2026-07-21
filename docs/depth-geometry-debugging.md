@@ -55,9 +55,14 @@ The report also includes `sensor_truth.ready_for_real_slam`. Do not start real S
 - `kinect_imu_synchronized`: the Kinect and IMU capture timestamps are within the selected skew limit.
 - `kinect_body_pose_synchronized`: a buffered body pose was interpolated sufficiently close to the depth exposure.
 - `imu_roll_pitch_contract`: IMU shape is recognized as `[roll, pitch]` or `[roll, pitch, yaw]` radians and roll/pitch correction is active.
-- `stationary_rotation_cloud_stability`: a rotate-in-place capture has enough stable voxels with limited vertical spread.
+- `stationary_rotation_cloud_stability`: a rotate-in-place capture has enough stable voxels with limited vertical spread, bounded axle-center translation, trusted IMU/odometry agreement, observable covariance, and post-remount reconvergence when applicable.
 
-For the stationary rotation gate, use a capture where the robot turns at least 45 degrees while translating less than 0.20 m. A normal driving capture will be marked `not_applicable` for that gate and is not enough to clear SLAM readiness.
+The stationary evaluator unwraps consecutive headings, so a complete 360-degree turn is measured as
+a full turn rather than a zero net heading change. Its report includes direction, cumulative and
+final heading, maximum axle-center translation, stationary windows before/after, integrated trusted
+IMU rotation, calibration epochs, remount/reconvergence state, transform observability/covariance,
+and optional-lidar presence. A normal driving capture is marked `not_applicable` and cannot clear
+SLAM readiness.
 
 Old captures made before sensor `captured_at_ms` fields were added deserialize
 those timestamps as `0` and fail the freshness and synchronization gates. A
@@ -80,12 +85,30 @@ and run:
 ```bash
 cargo run -p pete-tools -- representation-report \
   --capture data/captures/real/return-to-start \
+  --physical-reference data/captures/real/return-to-start/reference.json \
   --out data/reports/representation/return-to-start.json
 ```
 
-Require `return_to_start.passed = true`. That gate requires a measured loop
+The physical-reference sidecar is explicit and reviewable:
+
+```json
+{
+  "direction": "clockwise",
+  "actual_endpoint_distance_m": 0.08,
+  "actual_orientation_error_deg": 2.5,
+  "distance_tolerance_m": 0.15,
+  "orientation_tolerance_deg": 5.0,
+  "notes": ["tape-measure endpoint and overhead-video heading"]
+}
+```
+
+Require `return_to_start.passed = true` for the software loop-correction gate and
+`return_to_start.navigation_trusted = true` for physical acceptance. The report requires a measured loop
 constraint, lower final RMS graph error, improved registered wall overlap, and
-a corrected final pose within 0.25 m of the start. Depth observations are
+a corrected final pose that improves on raw odometry and lies within 0.25 m of the start. Navigation
+trust additionally requires the physical sidecar, passing endpoint/orientation tolerances, Kinect
+geometry with covariance, and post-remount epoch reconvergence. It reports clockwise/counter-clockwise
+direction and treats absent lidar as Kinect-only rather than a failure. Depth observations are
 retained and the voxel world is rebuilt through corrected graph-node poses. The
 dashboard keeps the projection untrusted if any retained observation cannot be
 associated with the corrected graph.

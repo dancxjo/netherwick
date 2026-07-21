@@ -485,6 +485,7 @@ impl Mpu6050OrientationFilter {
         }
     }
 
+    #[cfg(test)]
     fn update(&mut self, sense: ImuSense) -> ImuSense {
         self.update_with_context(sense, pete_now::ImuMotionContext::default())
     }

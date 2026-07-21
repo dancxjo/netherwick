@@ -45,7 +45,7 @@ motion, possession, reflex, or safety limits.
 WorldLab capture frames retain the complete live estimate. Each calibration
 asset includes the current transform, covariance, evidence counts, floor/wall
 and other residuals, trust state, timestamp, epoch, and invalidation reason.
-`geometry-debug` schema 3 summarizes all recorded epochs, state counts,
+`geometry-debug` schema 4 summarizes all recorded epochs, state counts,
 residual maxima, covariance maxima, and evidence counts across replay:
 
 ```bash
@@ -69,4 +69,3 @@ the following:
 5. compare held-out floor/wall/map residuals before and after the remount
    against declared tolerances;
 6. confirm deterministic motion and safety limits are unchanged.
-

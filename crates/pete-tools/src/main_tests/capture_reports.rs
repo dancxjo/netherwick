@@ -68,8 +68,24 @@ fn geometry_truth_rejects_stale_and_unsynchronized_kinect_imu_samples() {
         evaluated: true,
         reason: "test".to_string(),
         frame_count: 3,
+        direction: "counter_clockwise".to_string(),
         heading_delta_deg: 90.0,
+        cumulative_rotation_deg: 90.0,
+        final_heading_error_deg: 0.0,
         translation_delta_m: 0.0,
+        max_axle_translation_m: 0.0,
+        stationary_frames_before: 1,
+        stationary_frames_after: 1,
+        imu_integrated_rotation_deg: Some(90.0),
+        imu_odometry_error_deg: Some(0.0),
+        rotation_agreement: true,
+        calibration_epoch_ids: vec![0],
+        remount_detected: false,
+        reconverged_after_remount: false,
+        observability_gate_passed: true,
+        insufficient_observability_exposed: false,
+        covariance_gate_passed: true,
+        optional_lidar_present: false,
         raw_points_seen: 100,
         voxel_count: 20,
         stable_voxel_count: 10,
@@ -198,15 +214,109 @@ fn return_to_start_gate_requires_measured_error_overlap_and_endpoint_improvement
         });
     }
 
-    let validation = return_to_start_validation(&map);
+    let validation = return_to_start_validation(
+        &map,
+        &ReturnToStartCalibrationEvidence {
+            epoch_ids: vec![2],
+            saw_invalidated: false,
+            last_epoch_trusted: true,
+            uncertainty_reported: true,
+            kinect_present: true,
+            lidar_present: false,
+        },
+        Some(ReturnToStartPhysicalReference {
+            direction: "counter_clockwise".to_string(),
+            actual_endpoint_distance_m: 0.08,
+            actual_orientation_error_deg: 2.0,
+            distance_tolerance_m: 0.15,
+            orientation_tolerance_deg: 5.0,
+            notes: vec!["synthetic measured fixture".to_string()],
+        }),
+    );
 
     assert!(validation.evaluated);
     assert!(validation.passed);
     assert!(validation.graph_error_reduced);
     assert!(validation.wall_overlap_improved);
     assert!(validation.corrected_pose_near_start);
+    assert!(validation.corrected_endpoint_improves_over_raw);
+    assert!(validation.navigation_trusted);
+    assert_eq!(validation.navigation_trust_decision, "trusted");
+    assert_eq!(validation.geometry_mode, "kinect_only");
     assert_eq!(validation.raw_final_distance_to_start_m, Some(0.4));
     assert_eq!(validation.corrected_final_distance_to_start_m, Some(0.1));
+}
+
+#[test]
+fn stationary_rotation_evaluator_accumulates_wrapped_full_turn_and_exposes_unobservability() {
+    let headings = [
+        0.0,
+        std::f32::consts::FRAC_PI_2,
+        std::f32::consts::PI,
+        -std::f32::consts::FRAC_PI_2,
+        0.0,
+    ];
+    let frames = headings
+        .into_iter()
+        .enumerate()
+        .map(|(index, heading)| {
+            let mut snapshot = WorldSnapshot::default();
+            snapshot.body.odometry.heading_rad = heading;
+            snapshot.body.velocity.turn_rad_s = if index == 0 || index == 4 { 0.0 } else { 0.5 };
+            snapshot.kinect.depth_m = vec![1.0];
+            snapshot.kinect.depth_width = 1;
+            snapshot.kinect.depth_height = 1;
+            snapshot.imu.schema_version = 2;
+            snapshot.imu.captured_at_ms = 1_000 + index as u64 * 1_000;
+            snapshot.imu.angular_velocity = vec![
+                0.0,
+                0.0,
+                if index == 0 || index == 4 {
+                    0.0
+                } else {
+                    std::f32::consts::TAU / 3.0
+                },
+            ];
+            pete_worldlab::CaptureFrameRecord {
+                index: index as u64,
+                t_ms: 1_000 + index as u64 * 1_000,
+                snapshot,
+                events: Vec::new(),
+                assets: pete_worldlab::CaptureFrameAssets::default(),
+                stream_metadata: None,
+            }
+        })
+        .collect::<Vec<_>>();
+    let args = GeometryDebugArgs {
+        capture: None,
+        live_now_url: None,
+        out: String::new(),
+        samples: 16,
+        max_below_floor_ratio: 0.02,
+        max_body_timestamp_age_ms: 200,
+        max_kinect_timestamp_age_ms: 200,
+        max_imu_timestamp_age_ms: 200,
+        max_kinect_imu_skew_ms: 100,
+        max_kinect_body_skew_ms: 100,
+        max_rgbd_skew_ms: 50,
+        min_depth_frames: 2,
+        min_stationary_rotation_deg: 300.0,
+        max_stationary_translation_m: 0.2,
+        min_stationary_stable_voxel_ratio: 0.05,
+        max_stationary_stable_z_span_m: 1.5,
+    };
+
+    let diagnostics = stationary_rotation_diagnostics(&frames, &args);
+
+    assert!(diagnostics.evaluated);
+    assert!((diagnostics.cumulative_rotation_deg - 360.0).abs() < 0.1);
+    assert!(diagnostics.final_heading_error_deg < 0.1);
+    assert!(diagnostics.rotation_agreement);
+    assert_eq!(diagnostics.stationary_frames_before, 1);
+    assert_eq!(diagnostics.stationary_frames_after, 1);
+    assert!(diagnostics.insufficient_observability_exposed);
+    assert!(!diagnostics.observability_gate_passed);
+    assert!(!diagnostics.optional_lidar_present);
 }
 
 #[test]
@@ -470,6 +580,7 @@ async fn representation_report_writes_json_from_capture_fixture() {
     run_representation_report(RepresentationReportArgs {
         ledger: "unused-when-capture-is-set".to_string(),
         capture: Some(temp_dir.to_string_lossy().to_string()),
+        physical_reference: None,
         out: out.to_string_lossy().to_string(),
     })
     .await

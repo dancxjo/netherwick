@@ -1083,6 +1083,9 @@ struct RepresentationReportArgs {
     ledger: String,
     #[arg(long)]
     capture: Option<String>,
+    /// JSON sidecar containing independently measured endpoint/orientation error.
+    #[arg(long)]
+    physical_reference: Option<String>,
     #[arg(long, default_value = "data/reports/representation/latest.json")]
     out: String,
 }
@@ -1167,9 +1170,46 @@ struct ReturnToStartValidation {
     wall_overlap_improved: bool,
     raw_final_distance_to_start_m: Option<f32>,
     corrected_final_distance_to_start_m: Option<f32>,
+    raw_final_heading_error_deg: Option<f32>,
+    corrected_final_heading_error_deg: Option<f32>,
+    corrected_endpoint_improves_over_raw: bool,
     max_corrected_distance_to_start_m: f32,
     corrected_pose_near_start: bool,
+    loop_direction: String,
+    physical_reference: Option<ReturnToStartPhysicalReference>,
+    physical_measurement_passed: bool,
+    physical_direction_matches: bool,
+    calibration_epoch_ids: Vec<u64>,
+    remount_detected: bool,
+    reconverged_after_remount: bool,
+    kinect_present: bool,
+    lidar_present: bool,
+    geometry_mode: String,
+    calibration_uncertainty_reported: bool,
+    navigation_trusted: bool,
+    navigation_trust_decision: String,
     reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct ReturnToStartPhysicalReference {
+    direction: String,
+    actual_endpoint_distance_m: f32,
+    actual_orientation_error_deg: f32,
+    distance_tolerance_m: f32,
+    orientation_tolerance_deg: f32,
+    #[serde(default)]
+    notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ReturnToStartCalibrationEvidence {
+    epoch_ids: Vec<u64>,
+    saw_invalidated: bool,
+    last_epoch_trusted: bool,
+    uncertainty_reported: bool,
+    kinect_present: bool,
+    lidar_present: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

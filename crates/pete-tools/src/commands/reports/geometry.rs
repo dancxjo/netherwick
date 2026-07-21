@@ -229,8 +229,24 @@ struct StationaryRotationDiagnostics {
     evaluated: bool,
     reason: String,
     frame_count: usize,
+    direction: String,
     heading_delta_deg: f32,
+    cumulative_rotation_deg: f32,
+    final_heading_error_deg: f32,
     translation_delta_m: f32,
+    max_axle_translation_m: f32,
+    stationary_frames_before: usize,
+    stationary_frames_after: usize,
+    imu_integrated_rotation_deg: Option<f32>,
+    imu_odometry_error_deg: Option<f32>,
+    rotation_agreement: bool,
+    calibration_epoch_ids: Vec<u64>,
+    remount_detected: bool,
+    reconverged_after_remount: bool,
+    observability_gate_passed: bool,
+    insufficient_observability_exposed: bool,
+    covariance_gate_passed: bool,
+    optional_lidar_present: bool,
     raw_points_seen: u64,
     voxel_count: usize,
     stable_voxel_count: usize,
@@ -435,7 +451,7 @@ async fn generate_geometry_debug_report(args: &GeometryDebugArgs) -> Result<Geom
             ],
         ));
     Ok(GeometryDebugReport {
-        schema_version: 3,
+        schema_version: 4,
         input_source: input.source,
         frame_index: record.index,
         t_ms: record.t_ms,
@@ -916,6 +932,11 @@ fn sensor_truth_report(
         && stationary
             .stable_z_span_m
             .is_some_and(|span| span <= args.max_stationary_stable_z_span_m)
+        && stationary.max_axle_translation_m <= args.max_stationary_translation_m
+        && stationary.rotation_agreement
+        && stationary.observability_gate_passed
+        && stationary.covariance_gate_passed
+        && (!stationary.remount_detected || stationary.reconverged_after_remount)
     {
         SensorTruthStatus::Pass
     } else {
@@ -925,12 +946,17 @@ fn sensor_truth_report(
         name: "stationary_rotation_cloud_stability".to_string(),
         status: stationary_status,
         detail: format!(
-            "{}; heading_delta_deg={:.1}, translation_delta_m={:.3}, stable_ratio={:.3}, stable_z_span_m={:?}",
+            "{}; cumulative_rotation_deg={:.1}, final_heading_error_deg={:.1}, max_axle_translation_m={:.3}, imu_error_deg={:?}, stable_ratio={:.3}, stable_z_span_m={:?}, epochs={:?}, remount={}, reconverged={}",
             stationary.reason,
-            stationary.heading_delta_deg,
-            stationary.translation_delta_m,
+            stationary.cumulative_rotation_deg,
+            stationary.final_heading_error_deg,
+            stationary.max_axle_translation_m,
+            stationary.imu_odometry_error_deg,
             stationary.stable_voxel_ratio,
-            stationary.stable_z_span_m
+            stationary.stable_z_span_m,
+            stationary.calibration_epoch_ids,
+            stationary.remount_detected,
+            stationary.reconverged_after_remount,
         ),
     });
     let ready_for_real_slam = gates
@@ -1019,8 +1045,24 @@ fn stationary_rotation_diagnostics(
             evaluated: false,
             reason: "capture has fewer than two depth frames".to_string(),
             frame_count: depth_frames.len(),
+            direction: "unobservable".to_string(),
             heading_delta_deg: 0.0,
+            cumulative_rotation_deg: 0.0,
+            final_heading_error_deg: 0.0,
             translation_delta_m: 0.0,
+            max_axle_translation_m: 0.0,
+            stationary_frames_before: 0,
+            stationary_frames_after: 0,
+            imu_integrated_rotation_deg: None,
+            imu_odometry_error_deg: None,
+            rotation_agreement: false,
+            calibration_epoch_ids: Vec::new(),
+            remount_detected: false,
+            reconverged_after_remount: false,
+            observability_gate_passed: false,
+            insufficient_observability_exposed: false,
+            covariance_gate_passed: false,
+            optional_lidar_present: false,
             raw_points_seen: 0,
             voxel_count: 0,
             stable_voxel_count: 0,
@@ -1035,11 +1077,86 @@ fn stationary_rotation_diagnostics(
     let last_pose = last.snapshot.body.odometry;
     let heading_delta_deg =
         angle_delta_abs(last_pose.heading_rad, first_pose.heading_rad).to_degrees();
+    let cumulative_rotation_rad = depth_frames
+        .windows(2)
+        .map(|window| {
+            angle_delta_signed(
+                window[1].snapshot.body.odometry.heading_rad,
+                window[0].snapshot.body.odometry.heading_rad,
+            )
+        })
+        .sum::<f32>();
+    let cumulative_rotation_deg = cumulative_rotation_rad.to_degrees();
     let translation_delta_m = ((last_pose.x_m - first_pose.x_m).powi(2)
         + (last_pose.y_m - first_pose.y_m).powi(2))
     .sqrt();
-    let stationary_candidate = heading_delta_deg >= args.min_stationary_rotation_deg
-        && translation_delta_m <= args.max_stationary_translation_m;
+    let max_axle_translation_m = depth_frames
+        .iter()
+        .map(|frame| {
+            (frame.snapshot.body.odometry.x_m - first_pose.x_m)
+                .hypot(frame.snapshot.body.odometry.y_m - first_pose.y_m)
+        })
+        .fold(0.0, f32::max);
+    let stationary_candidate = cumulative_rotation_deg.abs() >= args.min_stationary_rotation_deg
+        && max_axle_translation_m <= args.max_stationary_translation_m;
+    let stationary_frames_before = depth_frames
+        .iter()
+        .take_while(|frame| frame_is_stationary(&frame.snapshot))
+        .count();
+    let stationary_frames_after = depth_frames
+        .iter()
+        .rev()
+        .take_while(|frame| frame_is_stationary(&frame.snapshot))
+        .count();
+    let imu_integrated_rotation_rad = integrate_imu_rotation(&depth_frames);
+    let imu_odometry_error_deg = imu_integrated_rotation_rad
+        .map(|imu| (imu - cumulative_rotation_rad).abs().to_degrees());
+    let rotation_agreement = imu_integrated_rotation_rad.is_some_and(|imu| {
+        imu.signum() == cumulative_rotation_rad.signum()
+            && (imu - cumulative_rotation_rad).abs()
+                <= (15.0_f32.to_radians()).max(cumulative_rotation_rad.abs() * 0.10)
+    });
+    let estimates = depth_frames
+        .iter()
+        .filter_map(|frame| frame.snapshot.kinect.live_geometry_calibration.as_ref())
+        .collect::<Vec<_>>();
+    let mut calibration_epoch_ids = Vec::new();
+    for estimate in &estimates {
+        if !calibration_epoch_ids.contains(&estimate.epoch.id) {
+            calibration_epoch_ids.push(estimate.epoch.id);
+        }
+    }
+    let remount_detected = calibration_epoch_ids.len() > 1
+        || estimates.iter().any(|estimate| {
+            estimate.trust_state == pete_now::CalibrationTrustState::Invalidated
+        });
+    let reconverged_after_remount = remount_detected
+        && estimates.last().is_some_and(|estimate| {
+            estimate.trust_state == pete_now::CalibrationTrustState::Trusted
+        });
+    let observability_gate_passed = estimates.last().is_some_and(|estimate| {
+        estimate.trust_state == pete_now::CalibrationTrustState::Trusted
+            && estimate.observable_dofs.iter().all(|observable| *observable)
+    });
+    let insufficient_observability_exposed = estimates.is_empty()
+        || estimates.iter().any(|estimate| {
+            estimate.trust_state != pete_now::CalibrationTrustState::Trusted
+                && (!estimate.observable_dofs.iter().all(|observable| *observable)
+                    || !estimate.rejection_reasons.is_empty())
+        });
+    let covariance_limits = pete_now::CalibrationStateConfig::default().trusted_covariance;
+    let covariance_gate_passed = estimates.last().is_some_and(|estimate| {
+        estimate
+            .covariance
+            .iter()
+            .zip(covariance_limits)
+            .all(|(value, limit)| value.is_finite() && *value <= limit)
+    });
+    let optional_lidar_present = depth_frames.iter().any(|frame| {
+        frame.snapshot.range.source.as_deref().is_some_and(|source| {
+            source.contains("lidar") || source.contains("lfcd")
+        })
+    });
     let mut cloud = VoxelPointCloud::default();
     for frame in &depth_frames {
         cloud.observe_snapshot(&frame.snapshot, frame.t_ms);
@@ -1070,8 +1187,30 @@ fn stationary_rotation_diagnostics(
             )
         },
         frame_count: depth_frames.len(),
+        direction: if cumulative_rotation_rad > 0.0 {
+            "counter_clockwise".to_string()
+        } else if cumulative_rotation_rad < 0.0 {
+            "clockwise".to_string()
+        } else {
+            "unobservable".to_string()
+        },
         heading_delta_deg,
+        cumulative_rotation_deg,
+        final_heading_error_deg: heading_delta_deg,
         translation_delta_m,
+        max_axle_translation_m,
+        stationary_frames_before,
+        stationary_frames_after,
+        imu_integrated_rotation_deg: imu_integrated_rotation_rad.map(f32::to_degrees),
+        imu_odometry_error_deg,
+        rotation_agreement,
+        calibration_epoch_ids,
+        remount_detected,
+        reconverged_after_remount,
+        observability_gate_passed,
+        insufficient_observability_exposed,
+        covariance_gate_passed,
+        optional_lidar_present,
         raw_points_seen: summary.raw_points_seen,
         voxel_count: summary.voxels,
         stable_voxel_count: summary.stable_voxels,
@@ -1212,6 +1351,10 @@ fn min_max_values(values: &[f32]) -> Option<(f32, f32)> {
 }
 
 fn angle_delta_abs(left: f32, right: f32) -> f32 {
+    angle_delta_signed(left, right).abs()
+}
+
+fn angle_delta_signed(left: f32, right: f32) -> f32 {
     let mut delta = left - right;
     while delta > std::f32::consts::PI {
         delta -= std::f32::consts::TAU;
@@ -1219,5 +1362,56 @@ fn angle_delta_abs(left: f32, right: f32) -> f32 {
     while delta < -std::f32::consts::PI {
         delta += std::f32::consts::TAU;
     }
-    delta.abs()
+    delta
+}
+
+fn frame_is_stationary(snapshot: &WorldSnapshot) -> bool {
+    snapshot.body.velocity.forward_m_s.abs() <= 0.01
+        && snapshot.body.velocity.turn_rad_s.abs() <= 0.01
+        && snapshot
+            .imu
+            .angular_velocity
+            .get(2)
+            .is_none_or(|rate| rate.abs() <= 0.02)
+}
+
+fn integrate_imu_rotation(
+    frames: &[&pete_worldlab::CaptureFrameRecord],
+) -> Option<f32> {
+    let mut rotation = 0.0;
+    let mut intervals = 0usize;
+    for window in frames.windows(2) {
+        let first = &window[0].snapshot.imu;
+        let second = &window[1].snapshot.imu;
+        let trusted = |imu: &pete_now::ImuSense| {
+            imu.schema_version < 3
+                || imu.calibration.as_ref().is_some_and(|calibration| {
+                    calibration.trust_state == pete_now::ImuCalibrationTrustState::Trusted
+                })
+        };
+        let Some((first_rate, second_rate)) = first
+            .angular_velocity
+            .get(2)
+            .copied()
+            .zip(second.angular_velocity.get(2).copied())
+        else {
+            continue;
+        };
+        if !trusted(first) || !trusted(second) {
+            continue;
+        }
+        let first_time = nonzero_or(first.captured_at_ms, window[0].t_ms);
+        let second_time = nonzero_or(second.captured_at_ms, window[1].t_ms);
+        let dt_s = second_time.saturating_sub(first_time) as f32 / 1_000.0;
+        if !(0.0..=1.0).contains(&dt_s) || dt_s == 0.0 {
+            continue;
+        }
+        rotation += (first_rate + second_rate) * 0.5 * dt_s;
+        intervals += 1;
+    }
+    (intervals > 0).then_some(rotation)
+}
+
+fn nonzero_or(value: u64, fallback: u64) -> u64 {
+    if value == 0 { fallback } else { value }
 }

@@ -6,6 +6,13 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Extend replay validation with a full-turn stationary-rotation evaluator
+  (unwrapped heading, IMU agreement, axle translation, calibration remount and
+  covariance gates, optional lidar) and return-to-start reports with physical
+  reference sidecars, raw/corrected endpoint and heading metrics, direction,
+  calibration epochs, Kinect-only status, and an explicit navigation-trust
+  decision backed by deterministic synthetic fixtures.
+
 - Add advisory bounded locomotion calibration with conservative nominal
   fallback, global/left/right/forward/reverse distance estimates, independent
   CW/CCW rotation scale and effective wheelbase, condition epochs, uncertainty,

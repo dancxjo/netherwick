@@ -35,6 +35,17 @@ async fn generate_representation_report(
     let mut saw_objects = false;
     let mut saw_depth = false;
     let mut saw_audio = false;
+    let mut calibration_evidence = ReturnToStartCalibrationEvidence::default();
+    let physical_reference = args
+        .physical_reference
+        .as_deref()
+        .map(|path| -> Result<ReturnToStartPhysicalReference> {
+            let bytes = fs::read(path)
+                .with_context(|| format!("reading physical reference sidecar {path}"))?;
+            serde_json::from_slice(&bytes)
+                .with_context(|| format!("decoding physical reference sidecar {path}"))
+        })
+        .transpose()?;
 
     let input = if let Some(capture) = args.capture.as_deref() {
         let reader = CaptureReader::open(capture).await?;
@@ -47,6 +58,7 @@ async fn generate_representation_report(
                 .or_default() += 1;
             let frame_id = format!("capture-frame-{}", record.index);
             let mut now = record.snapshot.to_now(record.t_ms);
+            observe_return_to_start_calibration(&mut calibration_evidence, &now);
             set_now_frame_id(&mut now, &frame_id);
             saw_range |= !now.range.beams.is_empty() || now.range.nearest_m.is_some();
             saw_scene_vectors |= !now.eye.scene_vectors.is_empty();
@@ -94,6 +106,7 @@ async fn generate_representation_report(
                 .or_default() += 1;
 
             let now = &frame.now;
+            observe_return_to_start_calibration(&mut calibration_evidence, now);
             saw_range |= !now.range.beams.is_empty() || now.range.nearest_m.is_some();
             saw_scene_vectors |= !now.eye.scene_vectors.is_empty();
             saw_objects |= !now.objects.observations.is_empty();
@@ -219,9 +232,13 @@ async fn generate_representation_report(
         place_recognition_warnings.insert("no place-recognition candidates emitted".to_string());
     }
 
-    let return_to_start = return_to_start_validation(&local_map);
+    let return_to_start = return_to_start_validation(
+        &local_map,
+        &calibration_evidence,
+        physical_reference,
+    );
     Ok(RepresentationHealthReport {
-        schema_version: 2,
+        schema_version: 3,
         frame_count,
         input,
         warnings: warnings.into_iter().collect(),
@@ -269,7 +286,11 @@ async fn generate_representation_report(
     })
 }
 
-fn return_to_start_validation(map: &LocalMap) -> ReturnToStartValidation {
+fn return_to_start_validation(
+    map: &LocalMap,
+    calibration: &ReturnToStartCalibrationEvidence,
+    physical_reference: Option<ReturnToStartPhysicalReference>,
+) -> ReturnToStartValidation {
     const MAX_FINAL_DISTANCE_M: f32 = 0.25;
     let registration = map.pose_graph.edges.iter().rev().find_map(|edge| {
         if !edge.active {
@@ -297,12 +318,17 @@ fn return_to_start_validation(map: &LocalMap) -> ReturnToStartValidation {
             Some((
                 pose.get("x_m")?.as_f64()? as f32,
                 pose.get("y_m")?.as_f64()? as f32,
+                pose.get("heading_rad")?.as_f64()? as f32,
             ))
         })
         .collect::<Vec<_>>();
     let raw_final_distance_to_start_m = raw_poses.first().zip(raw_poses.last()).map(|(start, end)| {
         (end.0 - start.0).hypot(end.1 - start.1)
     });
+    let raw_final_heading_error_deg = raw_poses
+        .first()
+        .zip(raw_poses.last())
+        .map(|(start, end)| angle_difference(end.2, start.2).abs().to_degrees());
     let corrected_final_distance_to_start_m = map
         .pose_graph
         .nodes
@@ -312,6 +338,22 @@ fn return_to_start_validation(map: &LocalMap) -> ReturnToStartValidation {
             (end.pose_estimate.pose.x_m - start.pose_estimate.pose.x_m)
                 .hypot(end.pose_estimate.pose.y_m - start.pose_estimate.pose.y_m)
         });
+    let corrected_final_heading_error_deg = map
+        .pose_graph
+        .nodes
+        .first()
+        .zip(map.pose_graph.nodes.last())
+        .map(|(start, end)| {
+            angle_difference(
+                end.pose_estimate.pose.heading_rad,
+                start.pose_estimate.pose.heading_rad,
+            )
+            .abs()
+            .to_degrees()
+        });
+    let corrected_endpoint_improves_over_raw = raw_final_distance_to_start_m
+        .zip(corrected_final_distance_to_start_m)
+        .is_some_and(|(raw, corrected)| corrected < raw);
     let corrected_pose_near_start = corrected_final_distance_to_start_m
         .is_some_and(|distance| distance <= MAX_FINAL_DISTANCE_M);
     let evaluated = map.pose_graph.nodes.len() >= 3 && registration.is_some();
@@ -330,10 +372,55 @@ fn return_to_start_validation(map: &LocalMap) -> ReturnToStartValidation {
             "corrected final pose is not within {MAX_FINAL_DISTANCE_M:.2}m of the start"
         ));
     }
+    if !corrected_endpoint_improves_over_raw {
+        reasons.push("corrected endpoint did not improve over raw odometry".to_string());
+    }
+    let loop_direction = loop_direction(&raw_poses);
+    let physical_measurement_passed = physical_reference.as_ref().is_some_and(|reference| {
+        reference.actual_endpoint_distance_m.is_finite()
+            && reference.actual_orientation_error_deg.is_finite()
+            && reference.distance_tolerance_m.is_finite()
+            && reference.orientation_tolerance_deg.is_finite()
+            && reference.actual_endpoint_distance_m >= 0.0
+            && reference.distance_tolerance_m >= 0.0
+            && reference.orientation_tolerance_deg >= 0.0
+            && reference.actual_endpoint_distance_m <= reference.distance_tolerance_m
+            && reference.actual_orientation_error_deg.abs()
+                <= reference.orientation_tolerance_deg
+    });
+    let physical_direction_matches = physical_reference.as_ref().is_some_and(|reference| {
+        loop_direction == "unobservable"
+            || reference.direction.trim().eq_ignore_ascii_case(&loop_direction)
+    });
+    if physical_reference.is_none() {
+        reasons.push("independent physical endpoint/orientation sidecar is missing".to_string());
+    } else if !physical_measurement_passed {
+        reasons.push("physical endpoint or orientation exceeds declared tolerance".to_string());
+    }
+    if physical_reference.is_some() && !physical_direction_matches {
+        reasons.push("physical direction label contradicts the replayed loop direction".to_string());
+    }
+    let remount_detected = calibration.epoch_ids.len() > 1 || calibration.saw_invalidated;
+    if remount_detected && !calibration.last_epoch_trusted {
+        reasons.push("mount calibration did not reconverge after epoch change".to_string());
+    }
+    if !calibration.kinect_present {
+        reasons.push("Kinect geometry is absent".to_string());
+    }
+    if !calibration.uncertainty_reported {
+        reasons.push("calibration covariance/uncertainty is absent".to_string());
+    }
     let passed = evaluated
         && graph_error_reduced
         && wall_overlap_improved
-        && corrected_pose_near_start;
+        && corrected_pose_near_start
+        && corrected_endpoint_improves_over_raw;
+    let navigation_trusted = passed
+        && physical_measurement_passed
+        && physical_direction_matches
+        && calibration.kinect_present
+        && calibration.uncertainty_reported
+        && (!remount_detected || calibration.last_epoch_trusted);
     ReturnToStartValidation {
         evaluated,
         passed,
@@ -346,10 +433,76 @@ fn return_to_start_validation(map: &LocalMap) -> ReturnToStartValidation {
         wall_overlap_improved,
         raw_final_distance_to_start_m,
         corrected_final_distance_to_start_m,
+        raw_final_heading_error_deg,
+        corrected_final_heading_error_deg,
+        corrected_endpoint_improves_over_raw,
         max_corrected_distance_to_start_m: MAX_FINAL_DISTANCE_M,
         corrected_pose_near_start,
+        loop_direction,
+        physical_reference,
+        physical_measurement_passed,
+        physical_direction_matches,
+        calibration_epoch_ids: calibration.epoch_ids.clone(),
+        remount_detected,
+        reconverged_after_remount: remount_detected && calibration.last_epoch_trusted,
+        kinect_present: calibration.kinect_present,
+        lidar_present: calibration.lidar_present,
+        geometry_mode: if calibration.lidar_present {
+            "kinect_with_optional_lidar".to_string()
+        } else {
+            "kinect_only".to_string()
+        },
+        calibration_uncertainty_reported: calibration.uncertainty_reported,
+        navigation_trusted,
+        navigation_trust_decision: if navigation_trusted {
+            "trusted".to_string()
+        } else {
+            "withheld".to_string()
+        },
         reasons,
     }
+}
+
+fn observe_return_to_start_calibration(
+    evidence: &mut ReturnToStartCalibrationEvidence,
+    now: &Now,
+) {
+    evidence.kinect_present |= !now.kinect.depth_m.is_empty();
+    evidence.lidar_present |= now.range.source.as_deref().is_some_and(|source| {
+        source.contains("lidar") || source.contains("lfcd")
+    });
+    if let Some(estimate) = now.kinect.live_geometry_calibration.as_ref() {
+        if !evidence.epoch_ids.contains(&estimate.epoch.id) {
+            evidence.epoch_ids.push(estimate.epoch.id);
+        }
+        evidence.saw_invalidated |=
+            estimate.trust_state == pete_now::CalibrationTrustState::Invalidated;
+        evidence.last_epoch_trusted =
+            estimate.trust_state == pete_now::CalibrationTrustState::Trusted;
+        evidence.uncertainty_reported |= estimate
+            .covariance
+            .iter()
+            .all(|value| value.is_finite());
+    }
+}
+
+fn loop_direction(poses: &[(f32, f32, f32)]) -> String {
+    let signed_area = poses
+        .windows(2)
+        .map(|window| window[0].0 * window[1].1 - window[1].0 * window[0].1)
+        .sum::<f32>();
+    if signed_area > 0.001 {
+        "counter_clockwise".to_string()
+    } else if signed_area < -0.001 {
+        "clockwise".to_string()
+    } else {
+        "unobservable".to_string()
+    }
+}
+
+fn angle_difference(left: f32, right: f32) -> f32 {
+    (left - right + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
+        - std::f32::consts::PI
 }
 
 fn summarize_confidence_distribution(values: &[f32]) -> RepresentationConfidenceDistribution {
