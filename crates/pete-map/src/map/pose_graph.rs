@@ -232,17 +232,22 @@ impl PoseGraph {
                 let to_pose = self.nodes[to_index].pose_estimate.pose;
                 let predicted_to = apply_pose_delta(from_pose, edge.transform);
                 let residual = pose_delta(predicted_to, to_pose);
+                let (predicted_sin, predicted_cos) = predicted_to.heading_rad.sin_cos();
+                let residual_world_x =
+                    predicted_cos * residual.x_m - predicted_sin * residual.y_m;
+                let residual_world_y =
+                    predicted_sin * residual.x_m + predicted_cos * residual.y_m;
                 let weight = edge_constraint_weight(edge) * config.step_size;
 
                 if to_index != 0 {
-                    corrections[to_index].x_m -= residual.x_m * weight;
-                    corrections[to_index].y_m -= residual.y_m * weight;
+                    corrections[to_index].x_m -= residual_world_x * weight;
+                    corrections[to_index].y_m -= residual_world_y * weight;
                     corrections[to_index].heading_rad -= residual.heading_rad * weight;
                     weights[to_index] += weight;
                 }
                 if from_index != 0 {
-                    corrections[from_index].x_m += residual.x_m * weight;
-                    corrections[from_index].y_m += residual.y_m * weight;
+                    corrections[from_index].x_m += residual_world_x * weight;
+                    corrections[from_index].y_m += residual_world_y * weight;
                     corrections[from_index].heading_rad += residual.heading_rad * weight;
                     weights[from_index] += weight;
                 }

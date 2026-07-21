@@ -99,17 +99,21 @@ fn cap_vec<T>(items: &mut Vec<T>, max_len: usize) {
 }
 
 fn pose_delta(from: Pose2, to: Pose2) -> Pose2 {
+    let world_x = to.x_m - from.x_m;
+    let world_y = to.y_m - from.y_m;
+    let (from_sin, from_cos) = from.heading_rad.sin_cos();
     Pose2 {
-        x_m: to.x_m - from.x_m,
-        y_m: to.y_m - from.y_m,
+        x_m: from_cos * world_x + from_sin * world_y,
+        y_m: -from_sin * world_x + from_cos * world_y,
         heading_rad: normalize_angle(to.heading_rad - from.heading_rad),
     }
 }
 
 fn apply_pose_delta(from: Pose2, delta: Pose2) -> Pose2 {
+    let (from_sin, from_cos) = from.heading_rad.sin_cos();
     Pose2 {
-        x_m: from.x_m + delta.x_m,
-        y_m: from.y_m + delta.y_m,
+        x_m: from.x_m + from_cos * delta.x_m - from_sin * delta.y_m,
+        y_m: from.y_m + from_sin * delta.x_m + from_cos * delta.y_m,
         heading_rad: normalize_angle(from.heading_rad + delta.heading_rad),
     }
 }
