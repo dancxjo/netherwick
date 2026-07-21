@@ -11,8 +11,11 @@ pub const HEIGHT: usize = 32;
 pub const FRAMEBUFFER_BYTES: usize = WIDTH * HEIGHT / 8;
 pub const REFRESH_PERIOD_MS: u32 = 200;
 pub const PAGE_ROTATION_MS: u32 = 3_000;
-pub const LINK_FRESHNESS_MS: u32 = 1_000;
+pub const LINK_FRESHNESS_MS: u32 = 2_000;
+pub const BATTERY_FRESHNESS_MS: u32 = 2_000;
 pub const LOW_BATTERY_PERCENT: u32 = 20;
+
+const LIVENESS_TOGGLE_MS: u32 = 500;
 
 const LINE_CAPACITY: usize = 22;
 const CREATE_POWER_OFF: u8 = 1;
@@ -26,7 +29,7 @@ const ERROR_INVALID_PACKET: u8 = 4;
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct DisplayNetwork {
     pub ssid_suffix: Option<u32>,
-    pub active_clients: u8,
+    pub active_leases: u8,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -53,12 +56,14 @@ pub struct DisplayStatus {
     oi_mode: u8,
     oi_seen: bool,
     oi_fresh: bool,
+    authority_active: bool,
     imu_enabled: bool,
     imu_health: u8,
     last_error: u8,
     wifi_state: u8,
     network: DisplayNetwork,
     battery: Option<BatteryStatus>,
+    battery_stale: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,15 +77,14 @@ pub struct DisplayPage {
     pub line1: String<LINE_CAPACITY>,
     pub line2: String<LINE_CAPACITY>,
     layout: DisplayLayout,
+    liveness: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DisplayLayout {
     Dashboard {
         state: StateIcon,
-        oi: HealthIcon,
-        imu: HealthIcon,
-        battery: Option<BatteryStatus>,
+        authority: AuthorityIcon,
     },
     Alert(AlertIcon),
     Battery(BatteryStatus),
@@ -97,9 +101,9 @@ enum StateIcon {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HealthIcon {
-    Unknown,
-    Ok,
+enum AuthorityIcon {
+    Open,
+    Active,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,6 +118,7 @@ enum AlertIcon {
     Charging,
     OiLinkLost,
     LowBattery,
+    BatteryStale,
     ImuOffline,
     WaitCreate,
     PowerOff,
@@ -134,7 +139,7 @@ struct NetworkStatus {
 enum NetworkState {
     Starting,
     Ready,
-    Client(u8),
+    Lease(u8),
     Error,
 }
 
@@ -150,8 +155,9 @@ impl DisplayStatus {
             && snapshot
                 .uptime_ms
                 .wrapping_sub(snapshot.create_sensor_last_complete_packet_timestamp_ms)
-                <= LINK_FRESHNESS_MS;
+                <= BATTERY_FRESHNESS_MS;
         let battery = battery_fresh.then(|| battery_status(snapshot)).flatten();
+        let authority_active = status::session_diagnostics(snapshot.uptime_ms).authority_active;
 
         Self {
             runtime_state: snapshot.current_runtime_state,
@@ -160,87 +166,78 @@ impl DisplayStatus {
             oi_mode: snapshot.oi_mode,
             oi_seen,
             oi_fresh,
+            authority_active,
             imu_enabled: crate::body::IMU_ENABLED,
             imu_health: snapshot.imu_health,
             last_error: snapshot.last_error,
             wifi_state: snapshot.wifi_state,
             network,
             battery,
+            battery_stale: snapshot.create_sensor_complete_packet_count > 0 && !battery_fresh,
         }
     }
 
     pub fn page(self, safety: DisplaySafety, now_ms: u32) -> DisplayPage {
-        if safety.estop_latched {
-            return alert_page(AlertIcon::EStop);
-        }
-        if let Some(kind) = safety.safety_latch_kind {
-            return safety_alert_page(kind);
-        }
-        if self.runtime_state == RuntimeState::Error as u8
+        let mut selected = if safety.estop_latched {
+            alert_page(AlertIcon::EStop)
+        } else if let Some(kind) = safety.safety_latch_kind {
+            safety_alert_page(kind)
+        } else if self.runtime_state == RuntimeState::Error as u8
             || self.body_state == BodyState::Error as u8
             || self.last_error != 0
         {
-            return runtime_error_page(self.last_error);
-        }
-        if self.create_power_state == CREATE_POWER_OFF {
-            return alert_page(AlertIcon::PowerOff);
-        }
-        if self.oi_seen && !self.oi_fresh {
-            return alert_page(AlertIcon::OiLinkLost);
-        }
-        if self
+            runtime_error_page(self.last_error)
+        } else if self.create_power_state == CREATE_POWER_OFF {
+            alert_page(AlertIcon::PowerOff)
+        } else if self.oi_seen && !self.oi_fresh {
+            alert_page(AlertIcon::OiLinkLost)
+        } else if self
             .battery
             .is_some_and(|battery| u32::from(battery.percent) <= LOW_BATTERY_PERCENT)
         {
-            return alert_page(AlertIcon::LowBattery);
-        }
-        if self.imu_enabled
+            alert_page(AlertIcon::LowBattery)
+        } else if self.battery_stale {
+            alert_page(AlertIcon::BatteryStale)
+        } else if self.imu_enabled
             && matches!(
                 self.imu_health,
                 x if x == ImuHealthCode::Fault as u8 || x == ImuHealthCode::Absent as u8
             )
         {
-            return alert_page(AlertIcon::ImuOffline);
-        }
-
-        let rotation = (now_ms / PAGE_ROTATION_MS) % 3;
-        if !self.oi_seen {
-            return if rotation == 0 {
+            alert_page(AlertIcon::ImuOffline)
+        } else {
+            let rotation = (now_ms / PAGE_ROTATION_MS) % 3;
+            if !self.oi_seen && rotation == 0 {
                 network_page(self)
-            } else {
+            } else if !self.oi_seen {
                 alert_page(AlertIcon::WaitCreate)
-            };
-        }
-        if self.wifi_state != WIFI_SERVICES_STARTED {
-            return network_page(self);
-        }
-
-        match rotation {
-            1 => network_page(self),
-            2 => {
-                if let Some(battery) = self.battery {
-                    battery_page(battery)
-                } else {
-                    health_page(self)
-                }
+            } else if let Some(battery) = self.battery.filter(|battery| battery.charging) {
+                battery_page(battery)
+            } else if self.wifi_state != WIFI_SERVICES_STARTED && rotation == 1 {
+                network_page(self)
+            } else if let Some(battery) = self.battery.filter(|_| rotation == 2) {
+                battery_page(battery)
+            } else {
+                health_page(self)
             }
-            _ => health_page(self),
-        }
+        };
+        selected.liveness = (now_ms / LIVENESS_TOGGLE_MS) % 2 != 0;
+        selected
     }
 }
 
 pub fn render(page: &DisplayPage) -> [u8; FRAMEBUFFER_BYTES] {
     let mut framebuffer = [0u8; FRAMEBUFFER_BYTES];
     match page.layout {
-        DisplayLayout::Dashboard {
-            state,
-            oi,
-            imu,
-            battery,
-        } => render_dashboard(&mut framebuffer, state, oi, imu, battery),
+        DisplayLayout::Dashboard { state, authority } => {
+            render_dashboard(&mut framebuffer, state, authority)
+        }
         DisplayLayout::Alert(alert) => render_alert(&mut framebuffer, alert),
         DisplayLayout::Battery(battery) => render_battery_page(&mut framebuffer, battery),
         DisplayLayout::Network(network) => render_network_page(&mut framebuffer, network),
+    }
+    if page.liveness {
+        set_pixel(&mut framebuffer, (WIDTH - 1) as i16, (HEIGHT - 1) as i16);
     }
     framebuffer
 }
@@ -278,15 +275,16 @@ fn battery_page(battery: BatteryStatus) -> DisplayPage {
     let mut line1 = String::new();
     let mut line2 = String::new();
     let _ = write!(line1, "BATT {}%", battery.percent);
-    let _ = write!(
-        line2,
-        "CHARGING: {}",
-        if battery.charging { "YES" } else { "NO" }
-    );
+    let _ = line2.push_str(if battery.charging {
+        "CHARGING"
+    } else {
+        "ON BATTERY"
+    });
     DisplayPage {
         line1,
         line2,
         layout: DisplayLayout::Battery(battery),
+        liveness: false,
     }
 }
 
@@ -312,32 +310,27 @@ fn health_page(status: DisplayStatus) -> DisplayPage {
     let mut line1 = String::new();
     let mut line2 = String::new();
     let _ = write!(line1, "PETE  {state}");
-    let oi = if status.oi_fresh { "OK" } else { "--" };
-    let imu = if !status.imu_enabled {
-        "--"
-    } else if status.imu_health == ImuHealthCode::Ok as u8 {
-        "OK"
-    } else {
-        "--"
-    };
-    let _ = write!(line2, "OI {oi}  IMU {imu}");
+    let _ = write!(
+        line2,
+        "CTRL {}",
+        if status.authority_active {
+            "ACTIVE"
+        } else {
+            "OPEN"
+        }
+    );
     DisplayPage {
         line1,
         line2,
         layout: DisplayLayout::Dashboard {
             state: state_icon,
-            oi: if status.oi_fresh {
-                HealthIcon::Ok
+            authority: if status.authority_active {
+                AuthorityIcon::Active
             } else {
-                HealthIcon::Unknown
+                AuthorityIcon::Open
             },
-            imu: if status.imu_enabled && status.imu_health == ImuHealthCode::Ok as u8 {
-                HealthIcon::Ok
-            } else {
-                HealthIcon::Unknown
-            },
-            battery: status.battery,
         },
+        liveness: false,
     }
 }
 
@@ -346,8 +339,8 @@ fn network_page(status: DisplayStatus) -> DisplayPage {
         NetworkState::Error
     } else if status.wifi_state != WIFI_SERVICES_STARTED {
         NetworkState::Starting
-    } else if status.network.active_clients > 0 {
-        NetworkState::Client(status.network.active_clients)
+    } else if status.network.active_leases > 0 {
+        NetworkState::Lease(status.network.active_leases)
     } else {
         NetworkState::Ready
     };
@@ -358,10 +351,14 @@ fn network_page(status: DisplayStatus) -> DisplayPage {
     let ssid = ssid_text(network.ssid_suffix);
     let mut line2 = String::new();
     let _ = write!(line2, "192.168.4.1 {}", network_state_text(state));
+    if let NetworkState::Lease(count) = state {
+        let _ = write!(line2, " {count}");
+    }
     DisplayPage {
         line1: ssid,
         line2,
         layout: DisplayLayout::Network(network),
+        liveness: false,
     }
 }
 
@@ -392,7 +389,7 @@ fn network_state_text(state: NetworkState) -> &'static str {
     match state {
         NetworkState::Starting => "START",
         NetworkState::Ready => "READY",
-        NetworkState::Client(_) => "CLIENT",
+        NetworkState::Lease(_) => "LEASE",
         NetworkState::Error => "ERROR",
     }
 }
@@ -403,12 +400,13 @@ fn alert_text(alert: AlertIcon) -> (&'static str, &'static str) {
         AlertIcon::Cliff => ("CLIFF", ""),
         AlertIcon::WheelDrop => ("WHEEL", "DROP"),
         AlertIcon::EStop => ("ESTOP", ""),
-        AlertIcon::Heartbeat => ("HEART", "BEAT"),
+        AlertIcon::Heartbeat => ("CTRL", "LOST"),
         AlertIcon::Tilt => ("TILT", ""),
         AlertIcon::Impact => ("IMPACT", ""),
-        AlertIcon::Charging => ("CHARGE", "LATCH"),
+        AlertIcon::Charging => ("NO", "DRIVE"),
         AlertIcon::OiLinkLost => ("OI LINK", "LOST"),
         AlertIcon::LowBattery => ("LOW", "BATT"),
+        AlertIcon::BatteryStale => ("BATT", "STALE"),
         AlertIcon::ImuOffline => ("IMU", "OFFLINE"),
         AlertIcon::WaitCreate => ("WAIT", "CREATE"),
         AlertIcon::PowerOff => ("POWER", "OFF"),
@@ -437,6 +435,7 @@ fn page(line1: &str, line2: &str, layout: DisplayLayout) -> DisplayPage {
         line1: String::new(),
         line2: String::new(),
         layout,
+        liveness: false,
     };
     let _ = result.line1.push_str(line1);
     let _ = result.line2.push_str(line2);
@@ -446,101 +445,29 @@ fn page(line1: &str, line2: &str, layout: DisplayLayout) -> DisplayPage {
 fn render_dashboard(
     framebuffer: &mut [u8; FRAMEBUFFER_BYTES],
     state: StateIcon,
-    oi: HealthIcon,
-    imu: HealthIcon,
-    battery: Option<BatteryStatus>,
+    authority: AuthorityIcon,
 ) {
-    for x in [32, 64, 96] {
-        draw_vline(framebuffer, x, 3, 25);
-    }
-    render_state_icon(framebuffer, state);
-    render_oi_icon(framebuffer, oi);
-    render_imu_icon(framebuffer, imu);
-    render_battery_icon(framebuffer, battery);
+    render_centered_text(framebuffer, 0, WIDTH, 1, 2, state_text(state));
+    render_centered_text(
+        framebuffer,
+        0,
+        WIDTH,
+        17,
+        2,
+        match authority {
+            AuthorityIcon::Open => "OPEN",
+            AuthorityIcon::Active => "CTRL",
+        },
+    );
 }
 
-fn render_state_icon(framebuffer: &mut [u8; FRAMEBUFFER_BYTES], state: StateIcon) {
+fn state_text(state: StateIcon) -> &'static str {
     match state {
-        StateIcon::Boot => {
-            draw_circle(framebuffer, 15, 11, 5);
-            for (x0, y0, x1, y1) in [
-                (15, 1, 15, 4),
-                (15, 18, 15, 21),
-                (5, 11, 8, 11),
-                (22, 11, 25, 11),
-                (8, 4, 10, 6),
-                (20, 16, 22, 18),
-                (8, 18, 10, 16),
-                (20, 6, 22, 4),
-            ] {
-                draw_line(framebuffer, x0, y0, x1, y1);
-            }
-            render_text(framebuffer, 4, 24, 1, "BOOT");
-        }
-        StateIcon::Ready => {
-            draw_circle(framebuffer, 15, 11, 10);
-            draw_check(framebuffer, 8, 7, 1);
-            render_text(framebuffer, 1, 24, 1, "READY");
-        }
-        StateIcon::Run => {
-            fill_rect(framebuffer, 5, 8, 14, 7);
-            fill_triangle_right(framebuffer, 19, 4, 10);
-            render_text(framebuffer, 7, 24, 1, "RUN");
-        }
-        StateIcon::Stop => {
-            fill_rect(framebuffer, 7, 3, 17, 17);
-            render_text(framebuffer, 4, 24, 1, "STOP");
-        }
-        StateIcon::Warn => {
-            draw_triangle(framebuffer, 15, 1, 3, 21, 27, 21);
-            draw_vline(framebuffer, 15, 7, 7);
-            fill_rect(framebuffer, 14, 17, 3, 3);
-            render_text(framebuffer, 4, 24, 1, "WARN");
-        }
-    }
-}
-
-fn render_oi_icon(framebuffer: &mut [u8; FRAMEBUFFER_BYTES], health: HealthIcon) {
-    draw_rect(framebuffer, 42, 5, 13, 11);
-    draw_vline(framebuffer, 45, 1, 4);
-    draw_vline(framebuffer, 51, 1, 4);
-    draw_vline(framebuffer, 48, 16, 5);
-    draw_line(framebuffer, 48, 20, 43, 22);
-    draw_health_badge(framebuffer, 54, 4, health);
-    render_text(framebuffer, 41, 24, 1, "OI");
-}
-
-fn render_imu_icon(framebuffer: &mut [u8; FRAMEBUFFER_BYTES], health: HealthIcon) {
-    draw_rect(framebuffer, 72, 3, 17, 17);
-    draw_line(framebuffer, 75, 14, 80, 9);
-    draw_line(framebuffer, 80, 9, 86, 14);
-    draw_circle(framebuffer, 80, 12, 2);
-    draw_health_badge(framebuffer, 86, 4, health);
-    render_text(framebuffer, 71, 24, 1, "IMU");
-}
-
-fn render_battery_icon(framebuffer: &mut [u8; FRAMEBUFFER_BYTES], battery: Option<BatteryStatus>) {
-    draw_rect(framebuffer, 101, 5, 22, 14);
-    fill_rect(framebuffer, 123, 9, 3, 6);
-    if let Some(battery) = battery {
-        let fill = (u32::from(battery.percent) * 18 / 100) as usize;
-        fill_rect(framebuffer, 103, 7, fill, 10);
-        if battery.charging {
-            draw_bolt(framebuffer, 111, 6);
-        }
-        let mut label = String::<5>::new();
-        let _ = write!(label, "{}%", battery.percent);
-        let width = label.len() * 6 - 1;
-        render_text(
-            framebuffer,
-            112usize.saturating_sub(width / 2),
-            24,
-            1,
-            &label,
-        );
-    } else {
-        render_text(framebuffer, 109, 8, 1, "?");
-        render_text(framebuffer, 105, 24, 1, "BATT");
+        StateIcon::Boot => "BOOT",
+        StateIcon::Ready => "READY",
+        StateIcon::Run => "RUN",
+        StateIcon::Stop => "STOP",
+        StateIcon::Warn => "WARN",
     }
 }
 
@@ -622,6 +549,12 @@ fn render_alert(framebuffer: &mut [u8; FRAMEBUFFER_BYTES], alert: AlertIcon) {
             fill_rect(framebuffer, 32, 13, 3, 6);
             fill_rect(framebuffer, 8, 11, 4, 10);
         }
+        AlertIcon::BatteryStale => {
+            draw_rect(framebuffer, 5, 8, 27, 16);
+            fill_rect(framebuffer, 32, 13, 3, 6);
+            draw_line(framebuffer, 9, 11, 28, 21);
+            draw_line(framebuffer, 28, 11, 9, 21);
+        }
         AlertIcon::ImuOffline => {
             draw_rect(framebuffer, 8, 6, 20, 20);
             draw_line(framebuffer, 11, 20, 18, 12);
@@ -693,9 +626,9 @@ fn render_network_page(framebuffer: &mut [u8; FRAMEBUFFER_BYTES], network: Netwo
     match network.state {
         NetworkState::Starting => render_text(framebuffer, 37, 23, 1, "AP START"),
         NetworkState::Ready => render_text(framebuffer, 37, 23, 1, "AP READY"),
-        NetworkState::Client(count) => {
+        NetworkState::Lease(count) => {
             let mut label = String::<12>::new();
-            let _ = write!(label, "CLIENT {count}");
+            let _ = write!(label, "LEASE {count}");
             render_text(framebuffer, 37, 23, 1, &label);
         }
         NetworkState::Error => render_text(framebuffer, 37, 23, 1, "AP ERROR"),
@@ -714,45 +647,17 @@ fn render_battery_page(framebuffer: &mut [u8; FRAMEBUFFER_BYTES], battery: Batte
     let mut percent = String::<5>::new();
     let _ = write!(percent, "{}%", battery.percent);
     render_text(framebuffer, 53, 1, 2, &percent);
-    render_text(
+    render_centered_text(
         framebuffer,
-        59,
+        49,
+        WIDTH,
         23,
         1,
         if battery.charging {
-            "CHG YES"
+            "CHARGING"
         } else {
-            "CHG NO"
+            "ON BATTERY"
         },
-    );
-}
-
-fn draw_health_badge(
-    framebuffer: &mut [u8; FRAMEBUFFER_BYTES],
-    x: usize,
-    y: usize,
-    health: HealthIcon,
-) {
-    match health {
-        HealthIcon::Ok => draw_check(framebuffer, x, y, 1),
-        HealthIcon::Unknown => draw_hline(framebuffer, x, y + 6, 7),
-    }
-}
-
-fn draw_check(framebuffer: &mut [u8; FRAMEBUFFER_BYTES], x: usize, y: usize, scale: usize) {
-    draw_line(
-        framebuffer,
-        x as i16,
-        (y + 4 * scale) as i16,
-        (x + 3 * scale) as i16,
-        (y + 7 * scale) as i16,
-    );
-    draw_line(
-        framebuffer,
-        (x + 3 * scale) as i16,
-        (y + 7 * scale) as i16,
-        (x + 9 * scale) as i16,
-        y as i16,
     );
 }
 
@@ -986,18 +891,6 @@ fn draw_triangle(
     draw_line(framebuffer, x2, y2, x0, y0);
 }
 
-fn fill_triangle_right(framebuffer: &mut [u8; FRAMEBUFFER_BYTES], x: usize, y: usize, size: usize) {
-    for column in 0..size {
-        let half_height = size.saturating_sub(column) / 2;
-        draw_vline(
-            framebuffer,
-            x + column,
-            y + size / 2 - half_height,
-            half_height * 2 + 1,
-        );
-    }
-}
-
 fn draw_octagon(
     framebuffer: &mut [u8; FRAMEBUFFER_BYTES],
     center_x: i16,
@@ -1082,18 +975,20 @@ mod tests {
             oi_mode: 3,
             oi_seen: true,
             oi_fresh: true,
+            authority_active: false,
             imu_enabled: true,
             imu_health: ImuHealthCode::Ok as u8,
             last_error: 0,
             wifi_state: WIFI_SERVICES_STARTED,
             network: DisplayNetwork {
                 ssid_suffix: Some(1_337_420),
-                active_clients: 0,
+                active_leases: 0,
             },
             battery: Some(BatteryStatus {
                 percent: 73,
                 charging: false,
             }),
+            battery_stale: false,
         }
     }
 
@@ -1110,19 +1005,55 @@ mod tests {
     }
 
     #[test]
-    fn normal_pages_rotate_dashboard_network_and_real_battery() {
+    fn normal_pages_prioritize_large_status_and_real_battery() {
         let status = normal_status();
-        assert_lines(status.page(no_safety(), 0), "PETE  READY", "OI OK  IMU OK");
+        assert_lines(status.page(no_safety(), 0), "PETE  READY", "CTRL OPEN");
         assert_lines(
             status.page(no_safety(), PAGE_ROTATION_MS),
-            "pete-snyk",
-            "192.168.4.1 READY",
+            "PETE  READY",
+            "CTRL OPEN",
         );
         assert_lines(
             status.page(no_safety(), PAGE_ROTATION_MS * 2),
             "BATT 73%",
-            "CHARGING: NO",
+            "ON BATTERY",
         );
+    }
+
+    #[test]
+    fn active_control_authority_replaces_the_normal_imu_cell() {
+        let mut status = normal_status();
+        status.authority_active = true;
+        assert_lines(status.page(no_safety(), 0), "PETE  READY", "CTRL ACTIVE");
+    }
+
+    #[test]
+    fn network_failure_rotates_as_secondary_instead_of_monopolizing() {
+        let mut status = normal_status();
+        status.wifi_state = WIFI_ERROR;
+        assert_lines(status.page(no_safety(), 0), "PETE  READY", "CTRL OPEN");
+        assert_lines(
+            status.page(no_safety(), PAGE_ROTATION_MS),
+            "pete-snyk",
+            "192.168.4.1 ERROR",
+        );
+        assert_lines(
+            status.page(no_safety(), PAGE_ROTATION_MS * 2),
+            "BATT 73%",
+            "ON BATTERY",
+        );
+    }
+
+    #[test]
+    fn charging_is_a_persistent_positive_page() {
+        let mut status = normal_status();
+        status.battery = Some(BatteryStatus {
+            percent: 73,
+            charging: true,
+        });
+        for now_ms in [0, PAGE_ROTATION_MS, PAGE_ROTATION_MS * 2] {
+            assert_lines(status.page(no_safety(), now_ms), "BATT 73%", "CHARGING");
+        }
     }
 
     #[test]
@@ -1167,8 +1098,34 @@ mod tests {
         assert_lines(
             status.page(no_safety(), PAGE_ROTATION_MS * 2),
             "PETE  READY",
-            "OI OK  IMU OK",
+            "CTRL OPEN",
         );
+    }
+
+    #[test]
+    fn stale_battery_uses_a_full_alert_after_a_jitter_tolerant_window() {
+        let mut snapshot = status::snapshot(10_000);
+        snapshot.uptime_ms = 10_000;
+        snapshot.create_sensor_complete_packet_count = 1;
+        snapshot.create_sensor_capacity_mah = 100;
+        snapshot.create_sensor_charge_mah = 10;
+        snapshot.create_sensor_last_complete_packet_timestamp_ms =
+            snapshot.uptime_ms - BATTERY_FRESHNESS_MS + 1;
+        let network = DisplayNetwork {
+            ssid_suffix: None,
+            active_leases: 0,
+        };
+
+        let fresh = DisplayStatus::from_snapshot(&snapshot, network);
+        assert_eq!(fresh.battery.map(|battery| battery.percent), Some(10));
+        assert!(!fresh.battery_stale);
+
+        snapshot.create_sensor_last_complete_packet_timestamp_ms =
+            snapshot.uptime_ms - BATTERY_FRESHNESS_MS - 1;
+        let stale = DisplayStatus::from_snapshot(&snapshot, network);
+        assert_eq!(stale.battery, None);
+        assert!(stale.battery_stale);
+        assert_lines(stale.page(no_safety(), 0), "BATT", "STALE");
     }
 
     #[test]
@@ -1192,11 +1149,11 @@ mod tests {
     fn moving_and_passive_states_render_run_and_stop() {
         let mut status = normal_status();
         status.body_state = BodyState::Moving as u8;
-        assert_lines(status.page(no_safety(), 0), "PETE  RUN", "OI OK  IMU OK");
+        assert_lines(status.page(no_safety(), 0), "PETE  RUN", "CTRL OPEN");
 
         status.body_state = BodyState::Idle as u8;
         status.oi_mode = 1;
-        assert_lines(status.page(no_safety(), 0), "PETE  STOP", "OI OK  IMU OK");
+        assert_lines(status.page(no_safety(), 0), "PETE  STOP", "CTRL OPEN");
     }
 
     #[test]
@@ -1238,10 +1195,10 @@ mod tests {
             (SafetyEventKind::Cliff, ("CLIFF", "")),
             (SafetyEventKind::WheelDrop, ("WHEEL", "DROP")),
             (SafetyEventKind::EStop, ("ESTOP", "")),
-            (SafetyEventKind::Heartbeat, ("HEART", "BEAT")),
+            (SafetyEventKind::Heartbeat, ("CTRL", "LOST")),
             (SafetyEventKind::Tilt, ("TILT", "")),
             (SafetyEventKind::Impact, ("IMPACT", "")),
-            (SafetyEventKind::Charging, ("CHARGE", "LATCH")),
+            (SafetyEventKind::Charging, ("NO", "DRIVE")),
         ] {
             assert_lines(
                 status.page(
@@ -1258,27 +1215,41 @@ mod tests {
     }
 
     #[test]
-    fn network_page_reports_startup_readiness_and_live_clients() {
+    fn network_page_reports_startup_readiness_and_active_dhcp_leases() {
         let mut status = normal_status();
         status.wifi_state = 1;
         assert_lines(network_page(status), "pete-snyk", "192.168.4.1 START");
         status.wifi_state = WIFI_SERVICES_STARTED;
-        status.network.active_clients = 2;
-        assert_lines(network_page(status), "pete-snyk", "192.168.4.1 CLIENT");
+        status.network.active_leases = 2;
+        assert_lines(network_page(status), "pete-snyk", "192.168.4.1 LEASE 2");
         status.wifi_state = WIFI_ERROR;
         assert_lines(network_page(status), "pete-snyk", "192.168.4.1 ERROR");
     }
 
     #[test]
-    fn renderer_uses_all_four_icon_cells() {
+    fn normal_status_uses_both_double_height_text_bands() {
         let dashboard = render(&normal_status().page(no_safety(), 0));
-        for cell in 0..4 {
-            assert!(
-                (0..HEIGHT).any(|y| dashboard[(y / 8) * WIDTH + cell * 32] != 0
-                    || dashboard[(y / 8) * WIDTH + cell * 32 + 16] != 0),
-                "dashboard cell {cell} should contain a visible icon"
-            );
-        }
+        assert!(dashboard[..WIDTH * 2].iter().any(|byte| *byte != 0));
+        assert!(dashboard[WIDTH * 2..].iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn liveness_pixel_toggles_without_changing_the_selected_page() {
+        let status = normal_status();
+        let off_page = status.page(no_safety(), 0);
+        let on_page = status.page(no_safety(), LIVENESS_TOGGLE_MS);
+        assert_eq!(off_page.line1, on_page.line1);
+        assert_eq!(off_page.line2, on_page.line2);
+
+        let off = render(&off_page);
+        let on = render(&on_page);
+        let differences = off
+            .iter()
+            .zip(on.iter())
+            .filter(|(left, right)| left != right)
+            .count();
+        assert_eq!(differences, 1);
+        assert_eq!(off[FRAMEBUFFER_BYTES - 1] ^ on[FRAMEBUFFER_BYTES - 1], 0x80);
     }
 
     fn framebuffer_hash(framebuffer: &[u8; FRAMEBUFFER_BYTES]) -> u64 {
@@ -1300,10 +1271,8 @@ mod tests {
         stop.oi_mode = 1;
         let mut warn = status;
         warn.runtime_state = RuntimeState::Error as u8;
-        let mut unknown_health = status;
-        unknown_health.oi_fresh = false;
-        unknown_health.imu_health = ImuHealthCode::Unknown as u8;
-        unknown_health.battery = None;
+        let mut controlled = status;
+        controlled.authority_active = true;
 
         let network = |state| {
             page(
@@ -1323,10 +1292,10 @@ mod tests {
             ("dashboard_run", health_page(run)),
             ("dashboard_stop", health_page(stop)),
             ("dashboard_warn", health_page(warn)),
-            ("dashboard_unknown", health_page(unknown_health)),
+            ("dashboard_controlled", health_page(controlled)),
             ("network_start", network(NetworkState::Starting)),
             ("network_ready", network(NetworkState::Ready)),
-            ("network_client", network(NetworkState::Client(2))),
+            ("network_lease", network(NetworkState::Lease(2))),
             ("network_error", network(NetworkState::Error)),
             (
                 "battery",
@@ -1352,6 +1321,7 @@ mod tests {
             ("alert_charging", alert(AlertIcon::Charging)),
             ("alert_oi_link_lost", alert(AlertIcon::OiLinkLost)),
             ("alert_low_battery", alert(AlertIcon::LowBattery)),
+            ("alert_battery_stale", alert(AlertIcon::BatteryStale)),
             ("alert_imu_offline", alert(AlertIcon::ImuOffline)),
             ("alert_wait_create", alert(AlertIcon::WaitCreate)),
             ("alert_power_off", alert(AlertIcon::PowerOff)),
@@ -1362,28 +1332,29 @@ mod tests {
             ("alert_runtime_error", alert(AlertIcon::RuntimeError)),
         ];
         let expected = [
-            0x07c0_021e_3f10_f2b8,
-            0xf7c8_4f66_47b6_7355,
-            0xa641_860b_f800_c559,
-            0x6f7f_fd85_fc80_9c94,
-            0x26e7_610a_cb4c_dc94,
-            0x0de0_431b_c83b_69a3,
+            0x7622_ed05_97b5_baf9,
+            0x6742_ded5_5bfd_3ec3,
+            0x7b1e_718d_b98d_10b9,
+            0x24cc_85d2_5530_7bcf,
+            0x5c33_5285_f482_079f,
+            0x7fb9_312a_8a87_e61b,
             0xf7fe_64e2_9714_b28a,
             0xa1dd_390d_7fb4_0abc,
-            0xcb4d_8876_01f4_b299,
+            0xfdab_7d1d_144f_86ad,
             0xc4b7_40fa_05d5_cd0e,
-            0xc51d_4958_ad4c_69f3,
-            0x8c17_c62f_e65b_f410,
+            0x945d_9d1a_02ec_af46,
+            0xba9c_d6a8_f0d7_c0c1,
             0x12da_7ac2_b02f_ace2,
             0xb2e4_dee8_a08e_e256,
             0x6dfc_49f2_e1a4_c0ae,
             0xf182_9cdf_47ea_8586,
-            0x1de2_8e2f_b84d_69a8,
+            0x3445_eed7_4e17_2226,
             0x05e4_a5b4_c9ab_35e6,
             0xc89b_9d26_35db_ea71,
-            0x3774_b251_3374_197f,
+            0x103e_5f07_8e33_c377,
             0x7900_5182_a418_2ed1,
             0x7742_6561_91ae_f3ec,
+            0x8041_dfd5_0ce6_efec,
             0xfb71_5d25_25ab_1437,
             0x7daf_f066_7c51_80c6,
             0xc5ab_0cb8_2e95_be74,

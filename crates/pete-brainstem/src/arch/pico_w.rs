@@ -767,7 +767,7 @@ impl OledService {
                 &snapshot,
                 DisplayNetwork {
                     ssid_suffix: (ap_instance_id != AP_INSTANCE_UNKNOWN).then_some(ap_instance_id),
-                    active_clients: network_registry::diagnostics(now_ms).active_leases,
+                    active_leases: network_registry::diagnostics(now_ms).active_leases,
                 },
             )
             .page(DisplaySafety::current(), now_ms);
