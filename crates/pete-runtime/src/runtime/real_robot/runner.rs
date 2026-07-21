@@ -111,7 +111,74 @@ where
             possessor_skills: PossessorSkillRuntime::default(),
             sensor_poll_health,
             physical_pose: PhysicalPoseAdapter::default(),
+            brainstem_clock: BrainstemClockMapper::default(),
+            imu_arbiter: ImuArbiter::default(),
+            last_imu_selection: ImuSelection::default(),
         }
+    }
+
+    pub fn with_imu_override(mut self, source_override: ImuSourceOverride) -> Self {
+        self.imu_arbiter.set_override(source_override);
+        self
+    }
+
+    pub fn note_brainstem_reconnect(&mut self) {
+        self.brainstem_clock.mark_reconnect();
+        self.imu_arbiter.observe_unavailable(
+            "brainstem_board_imu",
+            "brainstem transport reconnected; awaiting new clock epoch",
+            wall_time_ms(),
+        );
+        self.now_builder.clear_imu_history();
+    }
+
+    fn refresh_brainstem_observation(&mut self) -> Result<BrainstemObservation> {
+        let host_request_started_ms = wall_time_ms();
+        let status = self.cockpit.refresh_status()?;
+        let host_response_received_ms = wall_time_ms();
+        Ok(brainstem_observation_from_cockpit_status(
+            status,
+            StatusRequestTiming {
+                host_request_started_ms,
+                host_response_received_ms,
+            },
+            &mut self.brainstem_clock,
+            &mut self.physical_pose,
+        ))
+    }
+
+    fn arbitrate_imu(
+        &mut self,
+        observation: &BrainstemObservation,
+        packets: &mut Vec<pete_sensors::SensePacket>,
+        now_ms: TimeMs,
+    ) {
+        if let (Some(imu), Some(metadata)) =
+            (observation.imu.clone(), observation.imu_metadata.clone())
+        {
+            self.imu_arbiter
+                .observe_with_metadata(imu, metadata, now_ms);
+        } else {
+            self.imu_arbiter.observe_unavailable(
+                "brainstem_board_imu",
+                observation
+                    .imu_rejection
+                    .clone()
+                    .unwrap_or_else(|| "brainstem IMU unavailable".to_string()),
+                now_ms,
+            );
+        }
+        self.last_imu_selection = self.imu_arbiter.arbitrate_packets(packets, now_ms);
+        if observation.clock_epoch_changed || self.last_imu_selection.source_changed {
+            self.now_builder.clear_imu_history();
+        }
+    }
+
+    fn insert_imu_selection(&self, now: &mut Now) {
+        now.extensions.insert(
+            "sensor.imu_selection".to_string(),
+            self.last_imu_selection.diagnostics.clone(),
+        );
     }
 
     pub fn with_frame_processor(mut self, frame_processor: FrameProcessor) -> Self {
@@ -168,18 +235,16 @@ where
             anyhow::bail!("only read-only robot mode is implemented");
         }
 
-        let status = self.cockpit.refresh_status()?;
-        let body = body_sense_from_cockpit_status_with_pose_adapter(
-            status,
-            wall_time_ms(),
-            &mut self.physical_pose,
-        );
+        let observation = self.refresh_brainstem_observation()?;
+        let body = observation.body.clone();
         let brainstem_events = self.cockpit.poll_events()?;
         let mut packets = poll_sensors_lossy(&mut self.sensors, &mut self.sensor_poll_health).await;
         let t_ms = body.last_update_ms.max(wall_time_ms());
         self.frame_processor.process_packets(t_ms, &mut packets);
+        self.arbitrate_imu(&observation, &mut packets, t_ms);
         let mut now = self.now_builder.build(t_ms, body, packets)?;
         insert_sensor_health(&mut now, &self.sensor_poll_health);
+        self.insert_imu_selection(&mut now);
         now.self_sense.mode = Some("read-only".to_string());
         now.extensions.insert(
             "source".to_string(),
@@ -267,19 +332,18 @@ where
             }
         }
 
-        let status_before = self.cockpit.refresh_status()?;
-        let body_before = body_sense_from_cockpit_status_with_pose_adapter(
-            status_before.clone(),
-            wall_time_ms(),
-            &mut self.physical_pose,
-        );
+        let observation = self.refresh_brainstem_observation()?;
+        let status_before = &observation.status;
+        let body_before = observation.body.clone();
         let recovery_decision =
-            self.apply_possession_recovery(&body_before, &brainstem_events, &status_before)?;
+            self.apply_possession_recovery(&body_before, &brainstem_events, status_before)?;
         let mut packets = poll_sensors_lossy(&mut self.sensors, &mut self.sensor_poll_health).await;
         let t_ms = body_before.last_update_ms.max(wall_time_ms());
         self.frame_processor.process_packets(t_ms, &mut packets);
+        self.arbitrate_imu(&observation, &mut packets, t_ms);
         let mut now = self.now_builder.build(t_ms, body_before.clone(), packets)?;
         insert_sensor_health(&mut now, &self.sensor_poll_health);
+        self.insert_imu_selection(&mut now);
         now.self_sense.mode = Some("slow".to_string());
         self.insert_possession_snapshot(&mut now);
         now.extensions.insert(
@@ -424,7 +488,7 @@ where
                     self.cockpit.client_mut(),
                     &request,
                     &tick.frame.now,
-                    &status_before,
+                    status_before,
                     status_before.battery.home_base(),
                     &brainstem_events,
                     t_ms,

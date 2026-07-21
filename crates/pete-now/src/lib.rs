@@ -633,6 +633,26 @@ pub struct ImuSense {
     pub orientation_source: Option<String>,
 }
 
+impl ImuSense {
+    pub fn source_id(&self) -> Option<&str> {
+        self.orientation_source
+            .as_deref()?
+            .split_once(':')
+            .map(|(identity, _)| identity)
+            .and_then(|identity| identity.split('@').next())
+            .filter(|source| !source.is_empty())
+    }
+
+    pub fn source_epoch(&self) -> u64 {
+        self.orientation_source
+            .as_deref()
+            .and_then(|source| source.split_once(':').map(|(identity, _)| identity))
+            .and_then(|identity| identity.split_once('@').map(|(_, epoch)| epoch))
+            .and_then(|epoch| epoch.parse().ok())
+            .unwrap_or(0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TrustedImuOrientation {
     pub roll_rad: Option<f32>,

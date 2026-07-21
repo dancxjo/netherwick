@@ -68,14 +68,15 @@ use pete_neat::{
 use pete_now::{
     ActionValuePrediction, ActiveControlSummary, BeliefMeta, BeliefSourceKind, ChargePrediction,
     CognitiveServiceBelief, ControlProvenance, DangerPrediction, DriveSense, EarPrediction,
-    EntityId, EvidenceRef, ExtensionSense, EyePrediction, Freshness, MemorySense, Now, ObjectClass,
-    ObjectObservation, ObjectObservationSource, ReignSense, SafetySense, SemanticBehaviorId,
-    SemanticEvidenceObservation, SemanticGroundingKind, SemanticNodeRef, SemanticOutcomeId,
-    SemanticPredicate, SurpriseSense, WorldModelSnapshot, WorldModelUpdater,
+    EntityId, EvidenceRef, ExtensionSense, EyePrediction, Freshness, ImuSense, MemorySense, Now,
+    ObjectClass, ObjectObservation, ObjectObservationSource, ReignSense, SafetySense,
+    SemanticBehaviorId, SemanticEvidenceObservation, SemanticGroundingKind, SemanticNodeRef,
+    SemanticOutcomeId, SemanticPredicate, SurpriseSense, WorldModelSnapshot, WorldModelUpdater,
 };
 use pete_sensors::{
-    anticipate_surfaces, FrameProcessor, NowBuilder, SenseProducer, SurfaceExtractor,
-    SurfaceExtractorOutput, World, WorldSnapshot,
+    anticipate_surfaces, FrameProcessor, ImuArbiter, ImuCandidateMetadata, ImuSelection,
+    ImuSourceOverride, NowBuilder, SenseProducer, SurfaceExtractor, SurfaceExtractorOutput, World,
+    WorldSnapshot,
 };
 use pete_sim::{SimCockpit, VirtualWorld};
 use pete_skills::{

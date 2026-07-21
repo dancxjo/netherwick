@@ -552,8 +552,38 @@ fn selected_imu_device(requested: Option<&str>, suppress_default: bool) -> Optio
         Some(value) if imu_disabled_value(value) => None,
         Some(value) if !value.is_empty() => Some(value),
         _ if suppress_default => None,
-        _ => Some(DEFAULT_MPU6050_IMU_DEVICE),
+        _ => discover_local_imu_device(),
     }
+}
+
+fn discover_local_imu_device() -> Option<&'static str> {
+    // A local provider is optional. Register it only when Linux has enumerated
+    // a device at a supported MPU-6050 address; path existence alone is not
+    // enough to assume that /dev/i2c-1 belongs to Motherbrain.
+    [
+        ("/sys/bus/i2c/devices/1-0068", DEFAULT_MPU6050_IMU_DEVICE),
+        ("/sys/bus/i2c/devices/1-0069", "/dev/i2c-1@0x69"),
+    ]
+    .into_iter()
+    .find_map(|(sysfs, device)| Path::new(sysfs).exists().then_some(device))
+}
+
+fn imu_source_override(args: &RobotArgs) -> ImuSourceOverride {
+    if args.imu.as_deref().is_some_and(imu_disabled_value) && args.imu_source == ImuSourceArg::Auto
+    {
+        return ImuSourceOverride::Disabled;
+    }
+    match args.imu_source {
+        ImuSourceArg::Auto => ImuSourceOverride::Auto,
+        ImuSourceArg::Brainstem => ImuSourceOverride::Force("brainstem_board_imu".to_string()),
+        ImuSourceArg::LocalI2c => ImuSourceOverride::Force("local_i2c_mpu6050".to_string()),
+        ImuSourceArg::None => ImuSourceOverride::Disabled,
+    }
+}
+
+fn local_imu_provider_allowed(args: &RobotArgs) -> bool {
+    matches!(args.imu_source, ImuSourceArg::Auto | ImuSourceArg::LocalI2c)
+        && !matches!(imu_source_override(args), ImuSourceOverride::Disabled)
 }
 
 #[cfg(feature = "kinect-freenect")]

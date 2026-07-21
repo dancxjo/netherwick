@@ -548,7 +548,8 @@ impl Mpu6050OrientationFilter {
             (true, false, true) => 0.45,
             _ => 0.20,
         };
-        sense.orientation_source = Some("mpu6050_complementary_accel_gyro".to_string());
+        sense.orientation_source =
+            Some("local_i2c_mpu6050@0:mpu6050_complementary_accel_gyro".to_string());
         sense
     }
 }

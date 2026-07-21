@@ -228,6 +228,15 @@ impl NowBuilder {
         Self::default()
     }
 
+    /// Invalidates canonical IMU interpolation without disturbing body pose history.
+    /// Call this on source or brainstem clock-epoch changes.
+    pub fn clear_imu_history(&mut self) {
+        self.imu_history.clear();
+        self.last_snapshot.imu = ImuSense::default();
+        self.last_snapshot.kinect.fusion_alignment = None;
+        self.last_updates.imu = None;
+    }
+
     pub fn build(
         &mut self,
         t_ms: TimeMs,
@@ -438,6 +447,9 @@ fn interpolate_imu(
 ) -> Option<(ImuSense, u64, u64)> {
     let samples = history.iter().cloned().collect::<Vec<_>>();
     let (before, after) = bracketing_samples(&samples, target_ms, |sample| sample.captured_at_ms)?;
+    if before.source_id() != after.source_id() || before.source_epoch() != after.source_epoch() {
+        return None;
+    }
     let span = after.captured_at_ms.abs_diff(before.captured_at_ms);
     let nearest = target_ms
         .abs_diff(before.captured_at_ms)

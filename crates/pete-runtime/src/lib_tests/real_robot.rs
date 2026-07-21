@@ -31,6 +31,257 @@ async fn real_robot_read_only_runner_never_applies_motor() {
     );
 }
 
+struct LiveDepthFixture;
+
+#[async_trait::async_trait]
+impl SenseProducer for LiveDepthFixture {
+    fn source_name(&self) -> &'static str {
+        "test_kinect"
+    }
+
+    async fn poll(&mut self) -> Result<pete_sensors::SensePacket> {
+        Ok(pete_sensors::SensePacket::Kinect(pete_now::KinectSense {
+            schema_version: 2,
+            captured_at_ms: wall_time_ms(),
+            depth_m: vec![1.0],
+            depth_width: 1,
+            depth_height: 1,
+            depth_fx: 1.0,
+            depth_fy: 1.0,
+            ..pete_now::KinectSense::default()
+        }))
+    }
+}
+
+#[tokio::test]
+async fn real_robot_tick_inserts_brainstem_imu_before_kinect_alignment() {
+    let mut runner = RealRobotRunner::new(
+        RobotMode::ReadOnly,
+        SimCockpit::new(),
+        vec![Box::new(LiveDepthFixture)],
+        StubRuntime,
+    );
+
+    let _ = runner.tick_read_only().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let (_snapshot, tick) = runner.tick_read_only().await.unwrap();
+
+    assert_eq!(tick.frame.now.imu.source_id(), Some("brainstem_board_imu"));
+    let alignment = tick
+        .frame
+        .now
+        .kinect
+        .fusion_alignment
+        .as_ref()
+        .expect("brainstem pose/IMU history aligns Kinect exposure");
+    assert_eq!(alignment.imu.source_id(), Some("brainstem_board_imu"));
+    assert!(alignment.pose_sample_skew_ms <= 200);
+    assert!(alignment.imu_sample_skew_ms <= 200);
+    assert_eq!(
+        tick.frame.now.extensions["sensor.imu_selection"]["selected_source"],
+        serde_json::json!("brainstem_board_imu")
+    );
+}
+
+fn complete_brainstem_status(
+    uptime_ms: u32,
+    body_timestamp_ms: u32,
+    imu_timestamp_ms: u32,
+) -> StatusSummary {
+    StatusSummary::from_raw(&format!(
+        "OK 1 STATUS uptime_ms={uptime_ms} clock_epoch=0 create_body_packets=4 create_last_body_packet_ms={body_timestamp_ms} odometry_x_mm=100 odometry_y_mm=200 odometry_heading_mrad=300 imu_present=2 imu_health=1 imu_samples=60 imu_sample_ms={imu_timestamp_ms} imu_age_ms={} imu_roll_mrad=125 imu_pitch_mrad=-250 imu_gyro_x_mrad_s=1000 imu_gyro_y_mrad_s=-2000 imu_gyro_z_mrad_s=500 imu_accel_x_mm_s2=9807 imu_accel_y_mm_s2=0 imu_accel_z_mm_s2=-9807 imu_orientation_confidence=900 imu_gyro_bias_calibrated=true imu_mounting_calibrated=true imu_orientation_source=mpu6050_accel_gyro_roll_pitch",
+        uptime_ms.wrapping_sub(imu_timestamp_ms)
+    ))
+}
+
+fn observe_brainstem_fixture(
+    mapper: &mut BrainstemClockMapper,
+    adapter: &mut PhysicalPoseAdapter,
+    status: StatusSummary,
+    start_ms: u64,
+    received_ms: u64,
+) -> BrainstemObservation {
+    brainstem_observation_from_cockpit_status(
+        status,
+        StatusRequestTiming {
+            host_request_started_ms: start_ms,
+            host_response_received_ms: received_ms,
+        },
+        mapper,
+        adapter,
+    )
+}
+
+#[test]
+fn brainstem_status_converts_units_without_publishing_integrated_yaw() {
+    let mut mapper = BrainstemClockMapper::default();
+    let mut adapter = PhysicalPoseAdapter::default();
+    let observation = observe_brainstem_fixture(
+        &mut mapper,
+        &mut adapter,
+        complete_brainstem_status(10_000, 9_980, 9_990),
+        1_000_000,
+        1_000_020,
+    );
+    let imu = observation.imu.expect("complete brainstem sample");
+    assert_eq!(imu.captured_at_ms, 1_000_000);
+    assert_eq!(imu.orientation, vec![0.125, -0.25]);
+    assert_eq!(imu.orientation.len(), 2, "MPU gyro yaw is not absolute");
+    assert_eq!(imu.angular_velocity, vec![1.0, -2.0, 0.5]);
+    assert!((imu.acceleration[0] - 1.0).abs() < 0.001);
+    assert!((imu.acceleration[2] + 1.0).abs() < 0.001);
+    assert_eq!(imu.source_id(), Some("brainstem_board_imu"));
+    assert_eq!(observation.body.last_update_ms, 999_990);
+}
+
+#[test]
+fn brainstem_observation_rejects_incomplete_axes_without_inventing_zeros() {
+    let mut mapper = BrainstemClockMapper::default();
+    let mut adapter = PhysicalPoseAdapter::default();
+    let status = StatusSummary::from_raw(
+        "OK 1 STATUS uptime_ms=1000 clock_epoch=0 create_body_packets=1 create_last_body_packet_ms=990 imu_present=2 imu_health=1 imu_samples=1 imu_sample_ms=995 imu_age_ms=5 imu_roll_mrad=0 imu_pitch_mrad=0 imu_gyro_x_mrad_s=0 imu_gyro_y_mrad_s=0 imu_accel_x_mm_s2=0 imu_accel_y_mm_s2=0 imu_accel_z_mm_s2=9807 imu_orientation_confidence=900 imu_gyro_bias_calibrated=true imu_mounting_calibrated=true imu_orientation_source=mpu6050_accel_gyro_roll_pitch",
+    );
+    let observation = observe_brainstem_fixture(&mut mapper, &mut adapter, status, 10_000, 10_010);
+    assert!(observation.imu.is_none());
+    assert!(observation
+        .imu_rejection
+        .as_deref()
+        .is_some_and(|reason| reason.contains("gyro axes are incomplete")));
+}
+
+#[test]
+fn brainstem_observation_rejects_missing_trust_fields_and_marks_age_fallback_uncertain() {
+    let mut mapper = BrainstemClockMapper::default();
+    let mut adapter = PhysicalPoseAdapter::default();
+    let mut incomplete = complete_brainstem_status(1_000, 990, 995);
+    incomplete.imu.orientation_confidence_permille = None;
+    let rejected = observe_brainstem_fixture(&mut mapper, &mut adapter, incomplete, 10_000, 10_010);
+    assert!(rejected.imu.is_none());
+    assert!(rejected
+        .imu_rejection
+        .as_deref()
+        .is_some_and(|reason| reason.contains("confidence is missing")));
+
+    let mut fallback = complete_brainstem_status(1_010, 1_000, 1_005);
+    fallback.uptime_ms = None;
+    fallback.imu.sample_timestamp_ms = None;
+    let fallback = observe_brainstem_fixture(&mut mapper, &mut adapter, fallback, 10_020, 10_030);
+    assert!(fallback.imu.is_some());
+    assert_eq!(
+        fallback
+            .imu_metadata
+            .as_ref()
+            .map(|metadata| metadata.clock_confidence),
+        Some(0.25)
+    );
+    assert_eq!(
+        fallback
+            .imu_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.clock_source.as_deref()),
+        Some("brainstem_sample_age_fallback")
+    );
+}
+
+#[test]
+fn brainstem_clock_handles_wrap_reboot_reconnect_and_future_samples() {
+    let mut mapper = BrainstemClockMapper::default();
+    let mut adapter = PhysicalPoseAdapter::default();
+    let near_wrap = observe_brainstem_fixture(
+        &mut mapper,
+        &mut adapter,
+        complete_brainstem_status(u32::MAX - 5, u32::MAX - 15, u32::MAX - 10),
+        20_000,
+        20_020,
+    );
+    assert!(!near_wrap.clock_epoch_changed);
+    let wrapped = observe_brainstem_fixture(
+        &mut mapper,
+        &mut adapter,
+        complete_brainstem_status(5, 1, 2),
+        20_040,
+        20_060,
+    );
+    assert!(!wrapped.clock_epoch_changed, "32-bit wrap is not a reboot");
+    assert_eq!(
+        wrapped.imu.as_ref().map(|imu| imu.captured_at_ms),
+        Some(20_047)
+    );
+
+    let rebooted = observe_brainstem_fixture(
+        &mut mapper,
+        &mut adapter,
+        complete_brainstem_status(2, 1, 1),
+        20_080,
+        20_100,
+    );
+    assert!(rebooted.clock_epoch_changed);
+    assert_eq!(rebooted.imu.as_ref().map(ImuSense::source_epoch), Some(1));
+
+    mapper.mark_reconnect();
+    let reconnected = observe_brainstem_fixture(
+        &mut mapper,
+        &mut adapter,
+        complete_brainstem_status(100, 90, 95),
+        20_120,
+        20_140,
+    );
+    assert!(reconnected.clock_epoch_changed);
+    assert_eq!(
+        reconnected.imu.as_ref().map(ImuSense::source_epoch),
+        Some(2)
+    );
+
+    let future = observe_brainstem_fixture(
+        &mut mapper,
+        &mut adapter,
+        complete_brainstem_status(110, 105, 120),
+        20_160,
+        20_180,
+    );
+    assert!(future.imu.is_none());
+    assert!(future
+        .imu_rejection
+        .as_deref()
+        .is_some_and(|reason| reason.contains("future")));
+}
+
+#[test]
+fn brainstem_clock_rejects_out_of_order_status_and_low_confidence_latency() {
+    let mut mapper = BrainstemClockMapper::default();
+    let mut adapter = PhysicalPoseAdapter::default();
+    let first = observe_brainstem_fixture(
+        &mut mapper,
+        &mut adapter,
+        complete_brainstem_status(1000, 990, 995),
+        50_000,
+        50_010,
+    );
+    assert!(first.imu.is_some());
+    let out_of_order = observe_brainstem_fixture(
+        &mut mapper,
+        &mut adapter,
+        complete_brainstem_status(1010, 1000, 1005),
+        49_000,
+        49_010,
+    );
+    assert!(out_of_order.imu.is_none());
+
+    let slow = observe_brainstem_fixture(
+        &mut mapper,
+        &mut adapter,
+        complete_brainstem_status(1020, 1010, 1015),
+        51_000,
+        51_500,
+    );
+    assert_eq!(
+        slow.imu_metadata
+            .as_ref()
+            .map(|metadata| metadata.clock_confidence),
+        Some(0.2)
+    );
+}
+
 #[tokio::test]
 async fn real_robot_read_only_runner_publishes_snapshot_when_optional_sensor_fails() {
     let body = CountingCockpit {

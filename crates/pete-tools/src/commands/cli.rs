@@ -545,6 +545,9 @@ struct RobotArgs {
     asr_command: Option<String>,
     #[arg(long)]
     imu: Option<String>,
+    /// Fusion IMU policy. Automatic discovery is the normal mode; overrides never bypass trust.
+    #[arg(long, value_enum, default_value = "auto", env = "PETE_IMU_SOURCE")]
+    imu_source: ImuSourceArg,
     #[arg(long)]
     gps: Option<String>,
     /// HLS-LFCD2 / LDS-01 serial device. Omit for best-effort auto-detection.
@@ -633,6 +636,15 @@ enum RobotModeArg {
     ReadOnly,
     PossessionSlow,
     Disabled,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum ImuSourceArg {
+    #[default]
+    Auto,
+    Brainstem,
+    LocalI2c,
+    None,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]

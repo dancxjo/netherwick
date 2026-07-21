@@ -4,6 +4,237 @@ use std::sync::Arc;
 
 struct StaticFaceDetector;
 
+fn trustworthy_imu(source: &str, captured_at_ms: u64, source_epoch: u64) -> ImuSense {
+    ImuSense {
+        schema_version: 2,
+        captured_at_ms,
+        orientation: vec![0.1, -0.1],
+        acceleration: vec![0.0, 0.0, 1.0],
+        angular_velocity: vec![0.0, 0.0, 0.0],
+        orientation_confidence: 0.9,
+        gyro_bias_calibrated: true,
+        mounting_calibrated: true,
+        orientation_source: Some(format!("{source}@{source_epoch}:accel_gyro_roll_pitch")),
+    }
+}
+
+fn candidate_metadata(source: &str, source_epoch: u64, healthy: bool) -> ImuCandidateMetadata {
+    ImuCandidateMetadata {
+        source_id: source.to_string(),
+        provenance: source.to_string(),
+        healthy,
+        clock_confidence: 0.9,
+        clock_source: Some("test_host_clock".to_string()),
+        source_epoch,
+        supported_axes: vec![
+            "roll".to_string(),
+            "pitch".to_string(),
+            "gyro_xyz".to_string(),
+            "accel_xyz".to_string(),
+        ],
+    }
+}
+
+#[test]
+fn imu_auto_selects_only_trustworthy_brainstem_and_none_without_candidates() {
+    let mut arbiter = ImuArbiter::default();
+    assert!(arbiter.select(1_000).selected_source.is_none());
+    arbiter.observe(trustworthy_imu("brainstem_board_imu", 990, 0), 1_000);
+    arbiter.observe(trustworthy_imu("brainstem_board_imu", 995, 0), 1_000);
+    let selection = arbiter.select(1_000);
+    assert_eq!(
+        selection.selected_source.as_deref(),
+        Some("brainstem_board_imu")
+    );
+    assert_eq!(
+        selection.selected.as_ref().and_then(ImuSense::source_id),
+        Some("brainstem_board_imu")
+    );
+}
+
+#[test]
+fn imu_auto_discovers_uncalibrated_brainstem_then_selects_after_calibration() {
+    let mut arbiter = ImuArbiter::default();
+    let mut uncalibrated = trustworthy_imu("brainstem_board_imu", 990, 0);
+    uncalibrated.gyro_bias_calibrated = false;
+    arbiter.observe(uncalibrated, 1_000);
+    let rejected = arbiter.select(1_000);
+    assert!(rejected.selected_source.is_none());
+    assert!(rejected.diagnostics["candidates"][0]["rejection_reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("gyro bias")));
+
+    let mut mounting_unknown = trustworthy_imu("brainstem_board_imu", 995, 0);
+    mounting_unknown.mounting_calibrated = false;
+    arbiter.observe(mounting_unknown, 1_000);
+    let rejected = arbiter.select(1_000);
+    assert!(rejected.selected_source.is_none());
+    assert!(rejected.diagnostics["candidates"][0]["rejection_reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("mounting")));
+
+    arbiter.observe(trustworthy_imu("brainstem_board_imu", 1_005, 0), 1_010);
+    arbiter.observe(trustworthy_imu("brainstem_board_imu", 1_015, 0), 1_020);
+    assert_eq!(
+        arbiter.select(1_020).selected_source.as_deref(),
+        Some("brainstem_board_imu")
+    );
+}
+
+#[test]
+fn imu_auto_rejects_stale_unhealthy_future_and_untrusted_override() {
+    let mut arbiter = ImuArbiter::default();
+    arbiter.observe(trustworthy_imu("brainstem_board_imu", 990, 0), 1_000);
+    arbiter.observe(trustworthy_imu("brainstem_board_imu", 995, 0), 1_000);
+    assert!(arbiter.select(1_000).selected.is_some());
+    let stale = arbiter.select(1_300);
+    assert!(stale.selected_source.is_none());
+    assert!(stale.selected.is_none());
+
+    let unhealthy = trustworthy_imu("brainstem_board_imu", 1_305, 0);
+    arbiter.observe_with_metadata(
+        unhealthy,
+        candidate_metadata("brainstem_board_imu", 0, false),
+        1_310,
+    );
+    assert!(arbiter.select(1_310).selected_source.is_none());
+
+    let mut future = trustworthy_imu("brainstem_board_imu", 1_500, 0);
+    future.mounting_calibrated = false;
+    let mut forced = ImuArbiter::new(ImuSourceOverride::Force("brainstem_board_imu".to_string()));
+    forced.observe(future, 1_310);
+    assert!(forced.select(1_310).selected_source.is_none());
+}
+
+#[test]
+fn imu_auto_prefers_equivalent_brainstem_and_hysteresis_prevents_flapping() {
+    let mut arbiter = ImuArbiter::default();
+    for timestamp in [990, 995] {
+        arbiter.observe(trustworthy_imu("local_i2c_mpu6050", timestamp, 0), 1_000);
+        arbiter.observe(trustworthy_imu("brainstem_board_imu", timestamp, 0), 1_000);
+    }
+    assert_eq!(
+        arbiter.select(1_000).selected_source.as_deref(),
+        Some("brainstem_board_imu")
+    );
+
+    for (index, healthy) in [true, false, true, false].into_iter().enumerate() {
+        let now = 1_010 + index as u64 * 10;
+        let mut local = trustworthy_imu("local_i2c_mpu6050", now - 1, 0);
+        local.orientation_confidence = 1.0;
+        arbiter.observe_with_metadata(
+            local,
+            candidate_metadata("local_i2c_mpu6050", 0, healthy),
+            now,
+        );
+        arbiter.observe(trustworthy_imu("brainstem_board_imu", now - 1, 0), now);
+        assert_eq!(
+            arbiter.select(now).selected_source.as_deref(),
+            Some("brainstem_board_imu")
+        );
+    }
+}
+
+#[test]
+fn imu_reconnect_changes_epoch_and_never_reuses_cross_source_history() {
+    let mut arbiter = ImuArbiter::default();
+    for timestamp in [990, 995] {
+        arbiter.observe(trustworthy_imu("brainstem_board_imu", timestamp, 0), 1_000);
+    }
+    let initial = arbiter.select(1_000);
+    assert!(initial.selected.is_some());
+    let initial_epoch = initial.source_epoch;
+
+    arbiter.observe(trustworthy_imu("brainstem_board_imu", 1_005, 1), 1_010);
+    let rebuilding = arbiter.select(1_010);
+    assert!(rebuilding.source_epoch > initial_epoch);
+    assert!(rebuilding.source_changed);
+    assert!(
+        rebuilding.selected.is_none(),
+        "new epoch needs fresh history"
+    );
+    for now in [1_020, 1_030] {
+        arbiter.observe(trustworthy_imu("brainstem_board_imu", now - 5, 1), now);
+        let selection = arbiter.select(now);
+        if now < 1_030 {
+            assert!(selection.selected.is_none());
+        } else {
+            assert!(selection.selected.is_some());
+        }
+    }
+
+    arbiter.observe_unavailable("brainstem_board_imu", "disconnected", 1_040);
+    let disappeared = arbiter.select(1_040);
+    assert!(disappeared.selected.is_none());
+    assert!(disappeared.selected_source.is_none());
+
+    let mut disabled = ImuArbiter::new(ImuSourceOverride::Disabled);
+    disabled.observe(trustworthy_imu("local_i2c_mpu6050", 1_025, 0), 1_030);
+    assert!(disabled.select(1_030).selected_source.is_none());
+}
+
+#[test]
+fn selected_imu_must_recover_stably_before_reselection() {
+    let mut arbiter = ImuArbiter::default();
+    for timestamp in [990, 995] {
+        arbiter.observe(trustworthy_imu("brainstem_board_imu", timestamp, 0), 1_000);
+    }
+    assert!(arbiter.select(1_000).selected.is_some());
+
+    let unhealthy = trustworthy_imu("brainstem_board_imu", 1_005, 0);
+    arbiter.observe_with_metadata(
+        unhealthy,
+        candidate_metadata("brainstem_board_imu", 0, false),
+        1_010,
+    );
+    assert!(arbiter.select(1_010).selected_source.is_none());
+
+    for (index, now) in [1_020, 1_030, 1_040].into_iter().enumerate() {
+        arbiter.observe(trustworthy_imu("brainstem_board_imu", now - 1, 0), now);
+        let selection = arbiter.select(now);
+        if index < 2 {
+            assert!(selection.selected_source.is_none());
+        } else {
+            assert_eq!(
+                selection.selected_source.as_deref(),
+                Some("brainstem_board_imu")
+            );
+        }
+    }
+}
+
+#[test]
+fn stale_brainstem_cannot_overwrite_fresh_authoritative_local_history() {
+    let mut arbiter = ImuArbiter::default();
+    for timestamp in [990, 995] {
+        let mut local = trustworthy_imu("local_i2c_mpu6050", timestamp, 0);
+        local.orientation_confidence = 0.95;
+        arbiter.observe(local, 1_000);
+    }
+    assert_eq!(
+        arbiter.select(1_000).selected_source.as_deref(),
+        Some("local_i2c_mpu6050")
+    );
+
+    arbiter.observe(trustworthy_imu("brainstem_board_imu", 700, 0), 1_010);
+    let selection = arbiter.select(1_010);
+    assert_eq!(
+        selection.selected_source.as_deref(),
+        Some("local_i2c_mpu6050")
+    );
+    assert_eq!(
+        selection.selected.as_ref().and_then(ImuSense::source_id),
+        Some("local_i2c_mpu6050")
+    );
+    let candidates = selection.diagnostics["candidates"]
+        .as_array()
+        .expect("candidate diagnostics");
+    assert_eq!(candidates.len(), 2);
+    assert!(candidates
+        .iter()
+        .all(|candidate| candidate["history_samples"] == 1 || candidate["history_samples"] == 2));
+}
+
 impl FaceDetector for StaticFaceDetector {
     fn detect_faces(&self, _frame: &EyeFrame) -> Result<Vec<FaceDetection>> {
         Ok(vec![FaceDetection {
@@ -460,7 +691,7 @@ fn mpu6050_filter_calibrates_bias_and_uses_gyro_when_acceleration_is_untrusted()
     assert!(moving.orientation[0] > 0.04);
     assert_eq!(
         moving.orientation_source.as_deref(),
-        Some("mpu6050_complementary_accel_gyro")
+        Some("local_i2c_mpu6050@0:mpu6050_complementary_accel_gyro")
     );
 }
 
@@ -473,10 +704,10 @@ fn now_builder_interpolates_pose_and_imu_to_depth_exposure() {
         .build(
             100,
             first_body,
-            vec![SensePacket::Imu(ImuSense {
-                captured_at_ms: 100,
-                orientation: vec![0.0, 0.0],
-                ..ImuSense::default()
+            vec![SensePacket::Imu({
+                let mut imu = trustworthy_imu("brainstem_board_imu", 100, 7);
+                imu.orientation = vec![0.0, 0.0];
+                imu
             })],
         )
         .unwrap();
@@ -490,10 +721,10 @@ fn now_builder_interpolates_pose_and_imu_to_depth_exposure() {
             200,
             second_body,
             vec![
-                SensePacket::Imu(ImuSense {
-                    captured_at_ms: 200,
-                    orientation: vec![0.2, -0.2],
-                    ..ImuSense::default()
+                SensePacket::Imu({
+                    let mut imu = trustworthy_imu("brainstem_board_imu", 200, 7);
+                    imu.orientation = vec![0.2, -0.2];
+                    imu
                 }),
                 SensePacket::Kinect(KinectSense {
                     schema_version: 2,
@@ -512,6 +743,10 @@ fn now_builder_interpolates_pose_and_imu_to_depth_exposure() {
     assert!((alignment.pose.x_m - 0.5).abs() < 0.001);
     assert!((alignment.pose.heading_rad - std::f32::consts::FRAC_PI_4).abs() < 0.001);
     assert!((alignment.imu.orientation[0] - 0.1).abs() < 0.001);
+    assert_eq!(alignment.imu.source_id(), Some("brainstem_board_imu"));
+    assert_eq!(alignment.imu.source_epoch(), 7);
+    assert!(alignment.imu.mounting_calibrated);
+    assert!(alignment.imu.gyro_bias_calibrated);
     assert_eq!(alignment.pose_sample_skew_ms, 50);
     assert_eq!(alignment.imu_sample_skew_ms, 50);
 }

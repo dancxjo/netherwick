@@ -20,7 +20,7 @@ use pete_now::{
 };
 use pete_now::{Now, PredictionSense, SurpriseSense};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -112,6 +112,7 @@ const KINECT_V1_DEPTH_CY: f32 = 242.0;
 
 // Sensor domains share one namespace to preserve the crate API.
 include!("sensors/core.rs");
+include!("sensors/imu_arbitration.rs");
 include!("sensors/vision.rs");
 include!("sensors/audio.rs");
 include!("sensors/world.rs");

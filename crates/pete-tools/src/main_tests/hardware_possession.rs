@@ -23,10 +23,10 @@ async fn hardware_env_report_has_expected_shape() {
 }
 
 #[test]
-fn imu_device_defaults_can_be_overridden_or_disabled() {
+fn imu_device_is_registered_only_after_discovery_or_explicit_configuration() {
     assert_eq!(
         selected_imu_device(None, false),
-        Some(DEFAULT_MPU6050_IMU_DEVICE)
+        discover_local_imu_device()
     );
     assert_eq!(selected_imu_device(None, true), None);
     assert_eq!(
@@ -34,6 +34,40 @@ fn imu_device_defaults_can_be_overridden_or_disabled() {
         Some("/dev/i2c-1@0x69")
     );
     assert_eq!(selected_imu_device(Some("none"), false), None);
+}
+
+#[test]
+fn imu_source_overrides_never_start_a_duplicate_local_provider() {
+    let Command::Robot(brainstem) = Cli::try_parse_from([
+        "pete",
+        "robot",
+        "--imu-source",
+        "brainstem",
+        "--imu",
+        "/dev/i2c-1",
+    ])
+    .unwrap()
+    .command
+    else {
+        panic!("expected robot command");
+    };
+    assert!(!local_imu_provider_allowed(&brainstem));
+    assert!(matches!(
+        imu_source_override(&brainstem),
+        ImuSourceOverride::Force(ref source) if source == "brainstem_board_imu"
+    ));
+
+    let Command::Robot(disabled) = Cli::try_parse_from(["pete", "robot", "--imu-source", "none"])
+        .unwrap()
+        .command
+    else {
+        panic!("expected robot command");
+    };
+    assert!(!local_imu_provider_allowed(&disabled));
+    assert!(matches!(
+        imu_source_override(&disabled),
+        ImuSourceOverride::Disabled
+    ));
 }
 
 #[test]
@@ -424,4 +458,3 @@ fn simulated_possession_reconnect_gets_fresh_session_and_lease() {
         Some(false)
     );
 }
-

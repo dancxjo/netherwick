@@ -53,7 +53,7 @@ use pete_runtime::{
 };
 use pete_sensors::{
     AsrToolConfig, CameraSenseProvider, DepthRangeProjectionConfig, EyeFrame, EyeFrameFormat,
-    FrameProcessor, GpsSenseProvider, ImuSenseProvider, Lfcd2SenseProvider,
+    FrameProcessor, GpsSenseProvider, ImuSenseProvider, ImuSourceOverride, Lfcd2SenseProvider,
     MicrophoneSenseProvider, PcmAudioFrame, SensePacket, SenseProducer, World, WorldSnapshot,
 };
 #[cfg(feature = "kinect-freenect")]

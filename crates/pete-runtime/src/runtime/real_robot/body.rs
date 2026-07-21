@@ -113,12 +113,293 @@ fn insert_sensor_health(now: &mut Now, health: &[SensorPollHealth]) {
 }
 
 fn wall_time_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
+    static HOST_CLOCK: std::sync::OnceLock<(std::time::Instant, TimeMs)> =
+        std::sync::OnceLock::new();
+    let (monotonic_anchor, unix_anchor_ms) = HOST_CLOCK.get_or_init(|| {
+        let unix_anchor_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        (std::time::Instant::now(), unix_anchor_ms)
+    });
+    unix_anchor_ms.saturating_add(
+        monotonic_anchor
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX),
+    )
+}
+
+const BRAINSTEM_CLOCK_HALF_RANGE: u32 = 1 << 31;
+const BRAINSTEM_MAX_STATUS_RTT_MS: u64 = 200;
+const STANDARD_GRAVITY_MM_S2: f32 = 9_806.65;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatusRequestTiming {
+    pub host_request_started_ms: TimeMs,
+    pub host_response_received_ms: TimeMs,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BrainstemClockEstimate {
+    uptime_ms: u32,
+    host_midpoint_ms: TimeMs,
+    confidence: f32,
+    source_epoch: u64,
+    epoch_changed: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BrainstemClockMapper {
+    last_uptime_ms: Option<u32>,
+    last_host_midpoint_ms: Option<TimeMs>,
+    firmware_epoch: Option<u32>,
+    source_epoch: u64,
+    reconnect_pending: bool,
+}
+
+impl BrainstemClockMapper {
+    pub fn mark_reconnect(&mut self) {
+        self.reconnect_pending = true;
+    }
+
+    fn observe_status(
+        &mut self,
+        status: &StatusSummary,
+        timing: StatusRequestTiming,
+    ) -> Result<BrainstemClockEstimate, String> {
+        let uptime_ms = status
+            .uptime_ms
+            .ok_or_else(|| "brainstem uptime is unavailable".to_string())?;
+        if timing.host_response_received_ms < timing.host_request_started_ms {
+            return Err("host status timing regressed".to_string());
+        }
+        let round_trip_ms = timing
+            .host_response_received_ms
+            .saturating_sub(timing.host_request_started_ms);
+        let host_midpoint_ms = timing
+            .host_request_started_ms
+            .saturating_add(round_trip_ms / 2);
+        if self
+            .last_host_midpoint_ms
+            .is_some_and(|last| host_midpoint_ms < last)
+        {
+            return Err("out-of-order status response rejected".to_string());
+        }
+
+        let firmware_epoch_changed = matches!(
+            (self.firmware_epoch, status.clock_epoch),
+            (Some(previous), Some(current)) if previous != current
+        );
+        let uptime_regressed = self.last_uptime_ms.is_some_and(|last| {
+            uptime_ms < last && last.wrapping_sub(uptime_ms) < BRAINSTEM_CLOCK_HALF_RANGE
+        });
+        // A large numeric regression is normal 32-bit wrap; a small regression is
+        // a reboot because status requests are serialized at this boundary.
+        let epoch_changed = self.reconnect_pending || firmware_epoch_changed || uptime_regressed;
+        if epoch_changed {
+            self.source_epoch = self.source_epoch.saturating_add(1);
+        }
+        self.reconnect_pending = false;
+        self.last_uptime_ms = Some(uptime_ms);
+        self.last_host_midpoint_ms = Some(host_midpoint_ms);
+        self.firmware_epoch = status.clock_epoch.or(self.firmware_epoch);
+
+        let confidence = if round_trip_ms <= 50 {
+            0.95
+        } else if round_trip_ms <= BRAINSTEM_MAX_STATUS_RTT_MS {
+            0.70
+        } else {
+            0.20
+        };
+        Ok(BrainstemClockEstimate {
+            uptime_ms,
+            host_midpoint_ms,
+            confidence,
+            source_epoch: self.source_epoch,
+            epoch_changed,
+        })
+    }
+}
+
+impl BrainstemClockEstimate {
+    fn map_exact(self, brainstem_timestamp_ms: u32) -> Result<TimeMs, String> {
+        let age_ms = self.uptime_ms.wrapping_sub(brainstem_timestamp_ms);
+        if age_ms >= BRAINSTEM_CLOCK_HALF_RANGE {
+            return Err("brainstem sensor timestamp is in the future".to_string());
+        }
+        self.host_midpoint_ms
+            .checked_sub(u64::from(age_ms))
+            .ok_or_else(|| "brainstem timestamp predates host clock origin".to_string())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BrainstemObservation {
+    pub status: StatusSummary,
+    pub body: BodySense,
+    pub imu: Option<ImuSense>,
+    pub imu_metadata: Option<ImuCandidateMetadata>,
+    pub imu_rejection: Option<String>,
+    pub clock_epoch_changed: bool,
+}
+
+pub fn brainstem_observation_from_cockpit_status(
+    status: StatusSummary,
+    timing: StatusRequestTiming,
+    mapper: &mut BrainstemClockMapper,
+    adapter: &mut PhysicalPoseAdapter,
+) -> BrainstemObservation {
+    let clock = mapper.observe_status(&status, timing);
+    let exact_body_timestamp = clock.as_ref().ok().and_then(|estimate| {
+        status
+            .body_packet_timestamp_ms
+            .and_then(|timestamp| estimate.map_exact(timestamp).ok())
+    });
+    let (imu, imu_metadata, imu_rejection, epoch_changed) = match &clock {
+        Ok(estimate) => {
+            match brainstem_imu_sense(&status, Some(*estimate), timing.host_response_received_ms) {
+                Ok((imu, metadata)) => {
+                    (Some(imu), Some(metadata), None, estimate.epoch_changed)
+                }
+                Err(reason) => (None, None, Some(reason), estimate.epoch_changed),
+            }
+        }
+        Err(_) if status.uptime_ms.is_none() => {
+            match brainstem_imu_sense(&status, None, timing.host_response_received_ms) {
+                Ok((imu, metadata)) => (Some(imu), Some(metadata), None, false),
+                Err(fallback_reason) => (None, None, Some(fallback_reason), false),
+            }
+        }
+        Err(reason) => (None, None, Some(reason.clone()), false),
+    };
+    let pose = adapter.observe(&status);
+    let mut body =
+        body_sense_from_cockpit_status_and_pose(&status, timing.host_response_received_ms, pose);
+    if status_body_timestamp_is_usable(&body, exact_body_timestamp) {
+        body.last_update_ms = exact_body_timestamp.unwrap_or(body.last_update_ms);
+    }
+    BrainstemObservation {
+        status,
+        body,
+        imu,
+        imu_metadata,
+        imu_rejection,
+        clock_epoch_changed: epoch_changed,
+    }
+}
+
+fn status_body_timestamp_is_usable(body: &BodySense, timestamp: Option<TimeMs>) -> bool {
+    body.last_update_ms > 0 && timestamp.is_some()
+}
+
+fn brainstem_imu_sense(
+    status: &StatusSummary,
+    clock: Option<BrainstemClockEstimate>,
+    host_received_ms: TimeMs,
+) -> Result<(ImuSense, ImuCandidateMetadata), String> {
+    let imu = &status.imu;
+    let present = imu
+        .present
+        .as_deref()
+        .is_some_and(|value| matches!(value, "1" | "2" | "true" | "on" | "present"));
+    if !present || imu.sample_count.unwrap_or(0) == 0 {
+        return Err("brainstem IMU is absent or has no samples".to_string());
+    }
+    let health = imu
+        .health
+        .as_deref()
+        .ok_or_else(|| "brainstem IMU health is missing".to_string())?;
+    let healthy = matches!(health, "1" | "ok");
+    let roll = imu
+        .roll_mrad
+        .ok_or_else(|| "brainstem IMU roll is missing".to_string())? as f32
+        / 1_000.0;
+    let pitch = imu
+        .pitch_mrad
+        .ok_or_else(|| "brainstem IMU pitch is missing".to_string())? as f32
+        / 1_000.0;
+    let gyro =
+        complete_axes(&imu.angular_velocity_mrad_s, "gyro")?.map(|value| value as f32 / 1_000.0);
+    let acceleration = complete_axes(&imu.linear_acceleration_mm_s2, "acceleration")?
+        .map(|value| value as f32 / STANDARD_GRAVITY_MM_S2);
+    let (captured_at_ms, clock_confidence, clock_source, source_epoch) =
+        match (imu.sample_timestamp_ms, clock) {
+        (Some(timestamp_ms), Some(clock)) => (
+            clock.map_exact(timestamp_ms)?,
+            clock.confidence,
+            "brainstem_exact_midpoint".to_string(),
+            clock.source_epoch,
+        ),
+        _ => {
+            let age_ms = imu
+                .sample_age_ms
+                .ok_or_else(|| "brainstem IMU has no exact timestamp or sample age".to_string())?;
+            (
+                host_received_ms.saturating_sub(u64::from(age_ms)),
+                clock.map_or(0.25, |clock| clock.confidence.min(0.35)),
+                "brainstem_sample_age_fallback".to_string(),
+                clock.map_or(0, |clock| clock.source_epoch),
+            )
+        }
+    };
+    let orientation_source = imu
+        .orientation_source
+        .clone()
+        .ok_or_else(|| "brainstem IMU orientation provenance is missing".to_string())?;
+    let source_id = "brainstem_board_imu";
+    let orientation_confidence = imu
+        .orientation_confidence_permille
+        .ok_or_else(|| "brainstem IMU orientation confidence is missing".to_string())?;
+    let gyro_bias_calibrated = imu
+        .gyro_bias_calibrated
+        .ok_or_else(|| "brainstem IMU gyro-bias state is missing".to_string())?;
+    let mounting_calibrated = imu
+        .mounting_calibrated
+        .ok_or_else(|| "brainstem IMU mounting state is missing".to_string())?;
+    let imu_sense = ImuSense {
+        schema_version: 2,
+        captured_at_ms,
+        // MPU-6050 yaw is gyro-integrated and is deliberately not published as
+        // absolute orientation. Wheel odometry remains planar-heading authority.
+        orientation: vec![roll, pitch],
+        acceleration: acceleration.to_vec(),
+        angular_velocity: gyro.to_vec(),
+        orientation_confidence: f32::from(orientation_confidence).clamp(0.0, 1_000.0) / 1_000.0,
+        gyro_bias_calibrated,
+        mounting_calibrated,
+        orientation_source: Some(format!(
+            "{source_id}@{}:{orientation_source}",
+            source_epoch
+        )),
+    };
+    Ok((
+        imu_sense,
+        ImuCandidateMetadata {
+            source_id: source_id.to_string(),
+            provenance: orientation_source,
+            healthy,
+            clock_confidence,
+            clock_source: Some(clock_source),
+            source_epoch,
+            supported_axes: vec![
+                "roll".to_string(),
+                "pitch".to_string(),
+                "gyro_xyz".to_string(),
+                "accel_xyz".to_string(),
+            ],
+        },
+    ))
+}
+
+fn complete_axes(summary: &pete_cockpit::Axis3Summary, name: &str) -> Result<[i32; 3], String> {
+    match (summary.x, summary.y, summary.z) {
+        (Some(x), Some(y), Some(z)) => Ok([x, y, z]),
+        _ => Err(format!("brainstem IMU {name} axes are incomplete")),
+    }
 }
 
 fn final_motor_from_tick(tick: &RuntimeTick) -> MotorCommand {
@@ -310,7 +591,7 @@ pub fn body_sense_from_cockpit_status(status: StatusSummary, last_update_ms: Tim
         y_m: status.odometry.y_mm.unwrap_or(0) as f32 / 1000.0,
         heading_rad: status.odometry.heading_mrad.unwrap_or(0) as f32 / 1000.0,
     };
-    body_sense_from_cockpit_status_and_pose(status, last_update_ms, pose)
+    body_sense_from_cockpit_status_and_pose(&status, last_update_ms, pose)
 }
 
 pub fn body_sense_from_cockpit_status_with_pose_adapter(
@@ -319,7 +600,7 @@ pub fn body_sense_from_cockpit_status_with_pose_adapter(
     adapter: &mut PhysicalPoseAdapter,
 ) -> BodySense {
     let pose = adapter.observe(&status);
-    body_sense_from_cockpit_status_and_pose(status, last_update_ms, pose)
+    body_sense_from_cockpit_status_and_pose(&status, last_update_ms, pose)
 }
 
 impl PhysicalPoseAdapter {
@@ -347,14 +628,16 @@ impl PhysicalPoseAdapter {
             if let (Some(previous_distance_mm), Some(previous_heading_mrad)) =
                 (self.last_distance_mm, self.last_heading_mrad)
             {
-                let distance_delta_m = distance_mm.wrapping_sub(previous_distance_mm) as f32 / 1000.0;
+                let distance_delta_m =
+                    distance_mm.wrapping_sub(previous_distance_mm) as f32 / 1000.0;
                 let heading_delta_rad = normalize_pose_angle(
                     heading_mrad.wrapping_sub(previous_heading_mrad) as f32 / 1000.0,
                 );
                 let midpoint_heading = self.pose.heading_rad + heading_delta_rad * 0.5;
                 self.pose.x_m += distance_delta_m * midpoint_heading.cos();
                 self.pose.y_m += distance_delta_m * midpoint_heading.sin();
-                self.pose.heading_rad = normalize_pose_angle(self.pose.heading_rad + heading_delta_rad);
+                self.pose.heading_rad =
+                    normalize_pose_angle(self.pose.heading_rad + heading_delta_rad);
             } else {
                 // A cumulative legacy stream has no recoverable pre-connection
                 // translation history. Establish a truthful local origin and
@@ -381,7 +664,7 @@ fn normalize_pose_angle(mut angle: f32) -> f32 {
 }
 
 fn body_sense_from_cockpit_status_and_pose(
-    status: StatusSummary,
+    status: &StatusSummary,
     last_update_ms: TimeMs,
     pose: Pose2,
 ) -> BodySense {

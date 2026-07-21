@@ -293,7 +293,10 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         }
     }
 
-    if let Some(device) = selected_imu_device(args.imu.as_deref(), is_mock_body) {
+    if let Some(device) = local_imu_provider_allowed(&args)
+        .then(|| selected_imu_device(args.imu.as_deref(), is_mock_body))
+        .flatten()
+    {
         match ImuSenseProvider::new(device) {
             Ok(provider) => {
                 let live_state_for_imu = live_state.clone();
@@ -372,6 +375,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         .with_live_image_enricher(live_image_enricher)
         .with_robot_initialization(initialization.clone())
         .with_brainstem_interface(serde_json::to_value(&brainstem_capabilities)?)
+        .with_imu_override(imu_source_override(&args))
         .with_autonomous_motion(args.autonomous_motion);
     runner.tick_ms = args.tick_ms;
     for warning in frame_processor_warnings {
@@ -442,6 +446,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
                 let mut replacement = replacement;
                 establish_create_sensor_stream(replacement.as_mut(), true)?;
                 runner.cockpit.replace_client(replacement);
+                runner.note_brainstem_reconnect();
                 eprintln!(
                     "possession reconnected with fresh session, lease, and complete body packet; stopped=true"
                 );

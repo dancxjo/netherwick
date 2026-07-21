@@ -94,6 +94,9 @@ pub struct RealRobotRunner<R, C> {
     possessor_skills: PossessorSkillRuntime,
     sensor_poll_health: Vec<SensorPollHealth>,
     physical_pose: PhysicalPoseAdapter,
+    brainstem_clock: BrainstemClockMapper,
+    imu_arbiter: ImuArbiter,
+    last_imu_selection: ImuSelection,
 }
 
 #[derive(Clone, Debug, Default)]
