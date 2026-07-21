@@ -276,14 +276,17 @@ When the world looks right, save screenshots and a short video. When it looks wr
 
 ### 2D map validation
 
-The live 2D panel is now a derived product of the same calibrated
-odometry-world voxel cloud used by the 3D view. Its status line distinguishes
+The live 2D panel reports the canonical runtime map used by behavior, while its
+3D-world overlay is derived from the calibrated odometry-world voxel cloud used
+by the 3D view. Its status line distinguishes
 three claims: whether 2D and 3D share a frame, whether current sensor geometry
 has enough stable evidence to trust, and whether corrected SLAM is ready for
-navigation. The automated depth-only fixture covers rotated world-frame
-projection. The remaining closure gate is a synchronized physical capture that
-compares the rendered 2D cells against the 3D scene without weakening the
-sensor-truth or navigation gates.
+navigation. Pose-graph loop corrections rebuild 2D occupancy from retained
+submaps. They do not yet rebuild accumulated 3D voxels, so that overlay becomes
+explicitly untrusted after a nontrivial graph correction. The remaining closure
+gates are a synchronized multi-frame stationary-rotation capture and a physical
+return-to-start route that passes the report's graph-error, wall-overlap, and
+corrected-endpoint checks.
 
 ### Behavior validation
 

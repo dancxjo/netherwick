@@ -72,9 +72,20 @@ Now
   -> occupancy rebuild from corrected submaps
 ```
 
-`LocalMap` only promotes candidates when a live pose node is created. Accepted candidates become active `PoseEdgeSource::LoopClosureCandidate` edges; rejected candidates remain inactive edges with `rejection_reason` values for replay/debugging. The live gates are intentionally conservative: confidence must clear the loop threshold, the target must not be the current/source frame, the target pose must be close enough to the current pose to avoid teleportation, and current range geometry must overlap existing occupied cells at the proposed prior node. `MapSummary` surfaces total, accepted, and rejected loop-closure counts.
+`LocalMap` only promotes candidates when a live pose node is created. A
+candidate is not a geometric constraint by itself: the current range scan must
+register against the target occupancy submap, and the measured registered pose
+defines the loop transform independently of the two graph estimates. Rejected
+candidates remain inactive with `rejection_reason` values for replay/debugging.
+Confidence, target identity/distance, and geometric-overlap gates still apply.
+`MapSummary` surfaces total, accepted, and rejected loop-closure counts.
 
-The runtime now asks the configured `Recall` implementation for conservative loop candidates before storing the current frame, converts those memory candidates into `LoopClosureCandidateInput`, and feeds them into `LocalMap` for the same tick. Representation reports also run `LocalMap` through this candidate-aware path, while the standalone `pose-graph-report` command remains an offline diagnostic view of the same place/entity evidence.
+The runtime asks the configured `Recall` implementation for conservative loop
+candidates before storing the current frame and feeds them into its `LocalMap`
+for the same tick. This runtime map is canonical for both behavior and dashboard
+reporting; the server no longer reintegrates snapshots into a competing map.
+Representation reports replay the same measured-constraint path, while the
+standalone `pose-graph-report` remains an offline evidence diagnostic.
 
 Build a replay-first representation health report from capture or ledger input:
 

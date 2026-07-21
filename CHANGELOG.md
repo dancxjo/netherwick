@@ -19,6 +19,15 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Integrate legacy cumulative physical odometry as stateful SE(2) deltas,
+  require measured scan/submap registration for live loop constraints, publish
+  the runtime map as the dashboard's canonical map, keep unwarped corrected-run
+  3D voxels explicitly untrusted, and gate physical SLAM on fresh synchronized
+  multi-frame Kinect/IMU evidence plus return-to-start quality metrics.
+- Integrate Brainstem Create distance/angle deltas into coherent planar pose,
+  carry that pose through JSON and compact status into runtime body sensing, and
+  enable the Pico W hardware watchdog from the runtime safety lane with a
+  body-configured two-second timeout.
 - Restore the live 2D map as an explicit projection of the calibrated 3D
   odometry-world voxel cloud, expose alignment, geometry, and navigation trust
   separately, and cover depth-only projection through a rotated world-frame

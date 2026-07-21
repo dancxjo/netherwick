@@ -44,16 +44,44 @@ The report also includes `sensor_truth.ready_for_real_slam`. Do not start real S
 - `below_floor_ratio`: current-frame transformed floor leakage is under the selected threshold.
 - `frame_timestamps_monotonic`: capture frame timestamps are ordered and sane.
 - `body_timestamp_fresh`: odometry/body time is close to the selected depth frame time.
-- `kinect_timestamp_carried`: Kinect depth has its own `captured_at_ms`, not only an enclosing capture-frame timestamp.
-- `imu_timestamp_carried`: IMU has its own `captured_at_ms`, not only an enclosing capture-frame timestamp.
+- `multi_frame_depth_capture`: the report contains at least two distinct depth frames.
+- `kinect_timestamp_fresh`: Kinect depth has its own `captured_at_ms` and it is within the selected freshness limit.
+- `imu_timestamp_fresh`: IMU has its own `captured_at_ms` and it is within the selected freshness limit.
+- `kinect_imu_synchronized`: the Kinect and IMU capture timestamps are within the selected skew limit.
 - `imu_roll_pitch_contract`: IMU shape is recognized as `[roll, pitch]` or `[roll, pitch, yaw]` radians and roll/pitch correction is active.
 - `stationary_rotation_cloud_stability`: a rotate-in-place capture has enough stable voxels with limited vertical spread.
 
 For the stationary rotation gate, use a capture where the robot turns at least 45 degrees while translating less than 0.20 m. A normal driving capture will be marked `not_applicable` for that gate and is not enough to clear SLAM readiness.
 
-Old captures made before sensor `captured_at_ms` fields were added deserialize those timestamps as `0` and will fail the timestamp-carried gates. Re-capture after this change before judging SLAM readiness.
+Old captures made before sensor `captured_at_ms` fields were added deserialize
+those timestamps as `0` and fail the freshness and synchronization gates. A
+present but stale timestamp also fails. Re-capture after this change before
+judging SLAM readiness.
 
-The live `LocalMap` can now consume place/entity loop-closure candidates through `integrate_observation_with_loop_candidates`, optimize the anchored pose graph, and rebuild occupancy from corrected submaps. That path is for replay, simulation, and geometry-ready hardware only. On real captures, require `sensor_truth.ready_for_real_slam = true` first; failed gates should be fixed in projection, extrinsics, timestamp plumbing, IMU interpretation, or the camera/world transform chain. Do not change renderer coordinates to hide below-floor leakage or unstable accumulated clouds.
+The live runtime `LocalMap` consumes place/entity loop candidates, registers the
+current scan against the target submap, optimizes the anchored pose graph, and
+rebuilds occupancy from corrected submaps. The dashboard receives that same map
+instead of constructing a second one. A loop candidate without a measured
+scan/submap registration stays rejected. On real captures, require
+`sensor_truth.ready_for_real_slam = true` first; failed gates should be fixed in
+projection, extrinsics, timestamp plumbing, IMU interpretation, or the
+camera/world transform chain. Do not change renderer coordinates to hide
+below-floor leakage or unstable accumulated clouds.
+
+After the stationary-rotation gate passes, record a small return-to-start route
+and run:
+
+```bash
+cargo run -p pete-tools -- representation-report \
+  --capture data/captures/real/return-to-start \
+  --out data/reports/representation/return-to-start.json
+```
+
+Require `return_to_start.passed = true`. That gate requires a measured loop
+constraint, lower final RMS graph error, improved registered wall overlap, and
+a corrected final pose within 0.25 m of the start. The accumulated 3D voxel
+cloud is still placed by raw odometry and is therefore explicitly untrusted
+after a nontrivial pose-graph correction until per-node clouds can be rebuilt.
 
 ## Calibration Procedure
 
