@@ -25,8 +25,8 @@ use pete_ledger::{ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerRead
 use pete_llm::{ConfiguredLlmAgent, LiveImageEnricher, LlmConfig, LlmProvider};
 use pete_map::{
     observation_from_now, transform_point_to_world, LocalMap, LoopClosureCandidateInput,
-    OrientationEstimate, Point3D, PointCloudConfig, PointCloudFrame, PoseGraphBuilder,
-    PoseGraphConfig, PoseGraphReport, VoxelPointCloud,
+    OrientationEstimate, Point3D, PointCloudConfig, PointCloudFrame, PoseEdgeSource,
+    PoseGraphBuilder, PoseGraphConfig, PoseGraphReport, VoxelPointCloud,
 };
 use pete_memory::{
     deterministic_embodied_eval_report_with_omissions, place_memory_report_from_frames,

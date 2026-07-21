@@ -7,6 +7,24 @@ async fn live_scene_returns_503_before_first_snapshot() {
     assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
 }
 
+#[test]
+fn live_state_publishes_the_runtime_map_without_reintegrating_a_second_map() {
+    let state = LiveViewState::new();
+    let mut runtime_map = LocalMap::default();
+    runtime_map.remap_summary.generation = 42;
+    runtime_map.pose_graph_optimization = PoseGraphOptimizationSummary {
+        initial_mean_error: 0.4,
+        final_mean_error: 0.1,
+        optimized_nodes: 3,
+        active_edges: 3,
+        ..PoseGraphOptimizationSummary::default()
+    };
+
+    state.update_with_runtime_map(WorldSnapshot::default(), Some(&runtime_map));
+
+    assert_eq!(state.map_snapshot(), runtime_map);
+}
+
 #[tokio::test]
 async fn inline_learning_control_updates_live_state() {
     let state = LiveViewState::new();
@@ -496,4 +514,44 @@ async fn live_map_projects_depth_only_world_voxels_in_the_same_frame_as_3d() {
     assert!((projected.center_x_m - world_point.position.x_m).abs() <= half_cell);
     assert!((projected.center_y_m - world_point.position.y_m).abs() <= half_cell);
     assert!(projected.stable);
+}
+
+#[test]
+fn corrected_2d_graph_keeps_raw_odometry_3d_projection_explicitly_untrusted() {
+    let mut cloud = VoxelPointCloud::default();
+    let mut snapshot = WorldSnapshot::default();
+    snapshot.body.last_update_ms = 400;
+    snapshot.kinect = KinectSense {
+        captured_at_ms: 400,
+        depth_m: vec![1.0],
+        depth_width: 1,
+        depth_height: 1,
+        depth_fx: 1.0,
+        depth_fy: 1.0,
+        min_depth_m: 0.1,
+        max_depth_m: 8.0,
+        depth_coordinate_system: Some("kinect_camera".to_string()),
+        ..KinectSense::default()
+    };
+    snapshot.imu.orientation = vec![0.0, 0.0];
+    for t_ms in [100, 200, 300, 400] {
+        snapshot.body.last_update_ms = t_ms;
+        snapshot.kinect.captured_at_ms = t_ms;
+        cloud.observe_snapshot(&snapshot, t_ms);
+    }
+    let mut summary = LocalMap::default().summary();
+    summary.slam_status.mode = SlamMode::LoopClosedPoseGraph;
+    summary.pose_graph_optimization.max_node_update_m = 0.1;
+    let metadata = LiveSceneMetadata {
+        sensor_calibration: Some(SceneSensorCalibration::sim_default()),
+        ..LiveSceneMetadata::default()
+    };
+
+    let projection = map_world_projection(&cloud, &summary, &snapshot, Some(&metadata), 400);
+
+    assert!(!projection.geometry_trusted);
+    assert!(!projection.navigation_trusted);
+    assert!(projection.reasons.iter().any(|reason| reason.contains(
+        "pose-graph corrections have not been applied to the accumulated 3D voxels"
+    )));
 }

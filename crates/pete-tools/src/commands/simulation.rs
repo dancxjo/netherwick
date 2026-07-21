@@ -152,7 +152,11 @@ async fn run_sim(args: SimArgs) -> Result<()> {
                 })
                 .await?;
             live_state.update_behavior_nodes(runner.runtime.behavior_node_states());
-            live_state.update(live_snapshot.unwrap_or(runner.world.snapshot().await?));
+            let runtime_map = runner.runtime.canonical_map();
+            live_state.update_with_runtime_map(
+                live_snapshot.unwrap_or(runner.world.snapshot().await?),
+                runtime_map.as_ref(),
+            );
             live_state.update_prod_state(runner.runtime.nudge_status());
             live_state.update_training_status(pete_server::LiveTrainingStatus {
                 training_mode: current_inline_learning.training_mode_label().to_string(),
@@ -440,4 +444,3 @@ async fn run_sim_curriculum(args: SimCurriculumArgs) -> Result<()> {
     );
     Ok(())
 }
-

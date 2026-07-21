@@ -171,6 +171,10 @@ impl LocalMap {
         else {
             return;
         };
+        let target = self.find_live_loop_target(candidate, &current.id).cloned();
+        let registration = target.as_ref().and_then(|target| {
+            self.measure_loop_registration(target.pose_estimate.pose, observation)
+        });
         let source = PoseEdgeSource::LoopClosureCandidate {
             kind: candidate.kind.clone(),
             target_frame_id: candidate.target_frame_id.clone(),
@@ -181,23 +185,31 @@ impl LocalMap {
             source_vector_id: candidate.source_vector_id.clone(),
             query_vector_id: candidate.query_vector_id.clone(),
             query_experience_id: candidate.query_experience_id.clone(),
+            registration: registration.clone(),
         };
-        let target = self.find_live_loop_target(candidate, &current.id).cloned();
         let to = target
             .as_ref()
             .map(|node| node.id.clone())
             .unwrap_or_else(|| "unresolved".to_string());
-        let target_pose = target
-            .as_ref()
-            .map(|node| node.pose_estimate.pose)
-            .unwrap_or(candidate.target_pose);
-        let rejection_reason =
-            self.live_loop_rejection_reason(&current, target.as_ref(), observation, candidate);
+        let target_pose = target.as_ref().map(|node| node.pose_estimate.pose);
+        let transform = match (target_pose, registration.as_ref()) {
+            (Some(target_pose), Some(registration)) => {
+                pose_delta(registration.registered_pose, target_pose)
+            }
+            (Some(target_pose), None) => pose_delta(current.pose_estimate.pose, target_pose),
+            (None, _) => pose_delta(current.pose_estimate.pose, candidate.target_pose),
+        };
+        let rejection_reason = self.live_loop_rejection_reason(
+            &current,
+            target.as_ref(),
+            registration.as_ref(),
+            candidate,
+        );
 
         self.pose_graph.edges.push(PoseEdge {
             from: current.id,
             to,
-            transform: pose_delta(current.pose_estimate.pose, target_pose),
+            transform,
             covariance: loop_covariance(candidate.confidence),
             confidence: candidate.confidence.clamp(0.0, 1.0),
             source,
@@ -210,7 +222,7 @@ impl LocalMap {
         &self,
         current: &PoseNode,
         target: Option<&PoseNode>,
-        observation: &MapObservation,
+        registration: Option<&LoopRegistrationMeasurement>,
         candidate: &LoopClosureCandidateInput,
     ) -> Option<String> {
         let current_source_frame_id = current.source_frame_id.as_deref();
@@ -232,17 +244,81 @@ impl LocalMap {
                 target_distance, self.config.pose_graph_loop_target_max_distance_m
             ));
         }
-        let Some(target) = target else {
+        if target.is_none() {
             return Some("no prior node close enough to candidate target".to_string());
+        }
+        let Some(registration) = registration else {
+            return Some("scan/submap registration produced no measured constraint".to_string());
         };
-        let overlap = self.loop_candidate_geometric_overlap(target.pose_estimate.pose, observation);
-        if overlap < self.config.pose_graph_loop_min_geometric_overlap {
+        if registration.geometric_overlap < self.config.pose_graph_loop_min_geometric_overlap {
             return Some(format!(
                 "geometric occupancy agreement {:.3} below gate {:.3}",
-                overlap, self.config.pose_graph_loop_min_geometric_overlap
+                registration.geometric_overlap, self.config.pose_graph_loop_min_geometric_overlap
             ));
         }
         None
+    }
+
+    fn measure_loop_registration(
+        &self,
+        target_pose: Pose2,
+        observation: &MapObservation,
+    ) -> Option<LoopRegistrationMeasurement> {
+        if !observation.range_beams.iter().any(|beam| {
+            beam.hit
+                && beam.confidence > 0.0
+                && beam.distance_m.is_finite()
+                && beam.distance_m > 0.0
+        }) {
+            return None;
+        }
+
+        let mut best_pose = target_pose;
+        let mut best_score = self.scan_match_score(target_pose, &observation.range_beams);
+        let xy_step = (self.config.resolution_m * 0.5).max(0.025);
+        let xy_window = self
+            .config
+            .scan_match_xy_window_m
+            .max(self.config.resolution_m * 2.0);
+        let theta_window = self
+            .config
+            .scan_match_theta_window_rad
+            .max(10.0_f32.to_radians());
+        let theta_step = (theta_window / 2.0).max(2.0_f32.to_radians());
+        let xy_steps = (xy_window / xy_step).ceil() as i32;
+        let theta_steps = (theta_window / theta_step).ceil() as i32;
+
+        for ix in -xy_steps..=xy_steps {
+            for iy in -xy_steps..=xy_steps {
+                for itheta in -theta_steps..=theta_steps {
+                    let pose = Pose2 {
+                        x_m: target_pose.x_m + ix as f32 * xy_step,
+                        y_m: target_pose.y_m + iy as f32 * xy_step,
+                        heading_rad: normalize_angle(
+                            target_pose.heading_rad + itheta as f32 * theta_step,
+                        ),
+                    };
+                    let score = self.scan_match_score(pose, &observation.range_beams);
+                    if score > best_score + f32::EPSILON {
+                        best_score = score;
+                        best_pose = pose;
+                    }
+                }
+            }
+        }
+
+        Some(LoopRegistrationMeasurement {
+            algorithm: "correlative_occupancy_submap_registration".to_string(),
+            registered_pose: best_pose,
+            score: best_score,
+            odometry_score: self.scan_match_score(
+                observation.pose.pose,
+                &observation.range_beams,
+            ),
+            geometric_overlap: self.loop_candidate_geometric_overlap(best_pose, observation),
+            odometry_geometric_overlap: self
+                .loop_candidate_geometric_overlap(observation.pose.pose, observation),
+        })
     }
 
     fn find_live_loop_target(

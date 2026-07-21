@@ -113,6 +113,7 @@ impl PoseGraphBuilder {
             source_vector_id: candidate.source_vector_id.clone(),
             query_vector_id: candidate.query_vector_id.clone(),
             query_experience_id: candidate.query_experience_id.clone(),
+            registration: None,
         };
         let target = self.find_loop_target(candidate, &from);
         let to = target
@@ -302,13 +303,15 @@ impl PoseGraph {
             let predicted_to =
                 apply_pose_delta(self.nodes[from_index].pose_estimate.pose, edge.transform);
             let residual = pose_delta(predicted_to, self.nodes[to_index].pose_estimate.pose);
-            total += residual.x_m.hypot(residual.y_m) + residual.heading_rad.abs() * 0.25;
+            total += residual.x_m.powi(2)
+                + residual.y_m.powi(2)
+                + (residual.heading_rad * 0.25).powi(2);
             count = count.saturating_add(1);
         }
         if count == 0 {
             0.0
         } else {
-            total / count as f32
+            (total / count as f32).sqrt()
         }
     }
 

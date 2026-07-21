@@ -296,7 +296,7 @@ fn live_loop_candidate_low_confidence_is_rejected_with_reason() {
     let mut map = seeded_live_loop_map(config);
     let weak = live_loop_candidate("entity_constellation", 0.60, "seed", "return");
     let observation = observation_from_parts(
-        pose(0.05, 0.0, 0.0),
+        pose(0.35, 0.0, 0.0),
         0.75,
         &range_sense(&[1.0]),
         serde_json::json!({"frame_id":"return"}),
@@ -323,7 +323,7 @@ fn live_entity_constellation_candidate_adds_active_loop_edge() {
     let mut map = seeded_live_loop_map(config);
     let candidate = live_loop_candidate("entity_constellation", 0.94, "seed", "return");
     let observation = observation_from_parts(
-        pose(0.05, 0.0, 0.0),
+        pose(0.35, 0.0, 0.0),
         0.75,
         &range_sense(&[1.0]),
         serde_json::json!({"frame_id":"return"}),
@@ -339,6 +339,13 @@ fn live_entity_constellation_candidate_adds_active_loop_edge() {
     assert_eq!(summary.slam_status.mode, SlamMode::LoopClosedPoseGraph);
     assert!(summary.slam_status.loop_closure_active);
     assert!(summary.slam_status.pose_graph_optimized);
+    assert!(summary.pose_graph_optimization.initial_mean_error > 0.0);
+    assert!(
+        summary.pose_graph_optimization.final_mean_error
+            < summary.pose_graph_optimization.initial_mean_error,
+        "optimization did not reduce error: {:?}",
+        summary.pose_graph_optimization
+    );
     let edge = map.pose_graph.edges.last().unwrap();
     assert!(edge.active);
     assert_eq!(edge.to, "live-pose-0");
@@ -346,6 +353,26 @@ fn live_entity_constellation_candidate_adds_active_loop_edge() {
         edge.source,
         PoseEdgeSource::LoopClosureCandidate { ref kind, .. } if kind == "entity_constellation"
     ));
+    let PoseEdgeSource::LoopClosureCandidate { registration, .. } = &edge.source else {
+        unreachable!();
+    };
+    let registration = registration.as_ref().expect("measured registration");
+    assert_eq!(
+        registration.algorithm,
+        "correlative_occupancy_submap_registration"
+    );
+    assert!(registration.geometric_overlap > registration.odometry_geometric_overlap);
+    assert!(
+        map.pose_graph
+            .nodes
+            .last()
+            .unwrap()
+            .pose_estimate
+            .pose
+            .x_m
+            .abs()
+            < 0.35
+    );
 }
 
 #[test]
@@ -1063,6 +1090,7 @@ fn pose_graph_optimizer_reduces_loop_closure_error() {
                     source_vector_id: None,
                     query_vector_id: None,
                     query_experience_id: None,
+                    registration: None,
                 },
                 0.95,
             ),

@@ -196,6 +196,7 @@ struct GeometryTimestampDiagnostics {
     kinect_capture_age_ms: Option<u64>,
     imu_capture_timestamp_present: bool,
     imu_capture_age_ms: Option<u64>,
+    kinect_imu_skew_ms: Option<u64>,
     note: String,
 }
 
@@ -609,27 +610,68 @@ fn sensor_truth_report(
         ),
     });
     gates.push(SensorTruthGate {
-        name: "kinect_timestamp_carried".to_string(),
-        status: if timestamps.kinect_capture_timestamp_present {
+        name: "multi_frame_depth_capture".to_string(),
+        status: if timestamps.depth_frame_count >= args.min_depth_frames {
             SensorTruthStatus::Pass
         } else {
             SensorTruthStatus::Fail
         },
         detail: format!(
-            "kinect_captured_at_ms_present={}, age_ms={:?}",
-            timestamps.kinect_capture_timestamp_present, timestamps.kinect_capture_age_ms
+            "depth_frames={}, minimum={}",
+            timestamps.depth_frame_count, args.min_depth_frames
         ),
     });
+    let kinect_fresh = timestamps.kinect_capture_timestamp_present
+        && timestamps
+            .kinect_capture_age_ms
+            .is_some_and(|age| age <= args.max_kinect_timestamp_age_ms);
     gates.push(SensorTruthGate {
-        name: "imu_timestamp_carried".to_string(),
-        status: if timestamps.imu_capture_timestamp_present {
+        name: "kinect_timestamp_fresh".to_string(),
+        status: if kinect_fresh {
             SensorTruthStatus::Pass
         } else {
             SensorTruthStatus::Fail
         },
         detail: format!(
-            "imu_captured_at_ms_present={}, age_ms={:?}",
-            timestamps.imu_capture_timestamp_present, timestamps.imu_capture_age_ms
+            "present={}, age_ms={:?}, threshold={}",
+            timestamps.kinect_capture_timestamp_present,
+            timestamps.kinect_capture_age_ms,
+            args.max_kinect_timestamp_age_ms
+        ),
+    });
+    let imu_fresh = timestamps.imu_capture_timestamp_present
+        && timestamps
+            .imu_capture_age_ms
+            .is_some_and(|age| age <= args.max_imu_timestamp_age_ms);
+    gates.push(SensorTruthGate {
+        name: "imu_timestamp_fresh".to_string(),
+        status: if imu_fresh {
+            SensorTruthStatus::Pass
+        } else {
+            SensorTruthStatus::Fail
+        },
+        detail: format!(
+            "present={}, age_ms={:?}, threshold={}",
+            timestamps.imu_capture_timestamp_present,
+            timestamps.imu_capture_age_ms,
+            args.max_imu_timestamp_age_ms
+        ),
+    });
+    let sensors_synchronized = kinect_fresh
+        && imu_fresh
+        && timestamps
+            .kinect_imu_skew_ms
+            .is_some_and(|skew| skew <= args.max_kinect_imu_skew_ms);
+    gates.push(SensorTruthGate {
+        name: "kinect_imu_synchronized".to_string(),
+        status: if sensors_synchronized {
+            SensorTruthStatus::Pass
+        } else {
+            SensorTruthStatus::Fail
+        },
+        detail: format!(
+            "capture_skew_ms={:?}, threshold={}",
+            timestamps.kinect_imu_skew_ms, args.max_kinect_imu_skew_ms
         ),
     });
     let imu_ready = imu.contract_known && imu.roll_pitch_correction_active;
@@ -716,10 +758,13 @@ fn geometry_timestamp_diagnostics(
             .map(|frame| selected.t_ms.saturating_sub(frame.captured_at_ms)),
         kinect_capture_timestamp_present: snapshot.kinect.captured_at_ms > 0,
         kinect_capture_age_ms: (snapshot.kinect.captured_at_ms > 0)
-            .then(|| selected.t_ms.saturating_sub(snapshot.kinect.captured_at_ms)),
+            .then(|| selected.t_ms.abs_diff(snapshot.kinect.captured_at_ms)),
         imu_capture_timestamp_present: snapshot.imu.captured_at_ms > 0,
         imu_capture_age_ms: (snapshot.imu.captured_at_ms > 0)
-            .then(|| selected.t_ms.saturating_sub(snapshot.imu.captured_at_ms)),
+            .then(|| selected.t_ms.abs_diff(snapshot.imu.captured_at_ms)),
+        kinect_imu_skew_ms: (snapshot.kinect.captured_at_ms > 0
+            && snapshot.imu.captured_at_ms > 0)
+            .then(|| snapshot.kinect.captured_at_ms.abs_diff(snapshot.imu.captured_at_ms)),
         note: "KinectSense and ImuSense carry individual capture timestamps when produced by current sensor providers; old captures may deserialize as 0 and fail these gates".to_string(),
     }
 }

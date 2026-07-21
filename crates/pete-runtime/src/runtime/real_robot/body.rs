@@ -305,6 +305,86 @@ fn apply_safe_cockpit_motion<C: Cockpit>(
 }
 
 pub fn body_sense_from_cockpit_status(status: StatusSummary, last_update_ms: TimeMs) -> BodySense {
+    let pose = Pose2 {
+        x_m: status.odometry.x_mm.unwrap_or(0) as f32 / 1000.0,
+        y_m: status.odometry.y_mm.unwrap_or(0) as f32 / 1000.0,
+        heading_rad: status.odometry.heading_mrad.unwrap_or(0) as f32 / 1000.0,
+    };
+    body_sense_from_cockpit_status_and_pose(status, last_update_ms, pose)
+}
+
+pub fn body_sense_from_cockpit_status_with_pose_adapter(
+    status: StatusSummary,
+    last_update_ms: TimeMs,
+    adapter: &mut PhysicalPoseAdapter,
+) -> BodySense {
+    let pose = adapter.observe(&status);
+    body_sense_from_cockpit_status_and_pose(status, last_update_ms, pose)
+}
+
+impl PhysicalPoseAdapter {
+    pub fn observe(&mut self, status: &StatusSummary) -> Pose2 {
+        let distance_mm = status.odometry.distance_mm;
+        let heading_mrad = status.odometry.heading_mrad;
+        let reset_changed = matches!(
+            (self.last_reset_count, status.odometry.reset_count),
+            (Some(previous), Some(current)) if previous != current
+        );
+
+        if reset_changed {
+            self.pose = Pose2::default();
+            self.last_distance_mm = None;
+            self.last_heading_mrad = None;
+        }
+
+        if let (Some(x_mm), Some(y_mm)) = (status.odometry.x_mm, status.odometry.y_mm) {
+            self.pose = Pose2 {
+                x_m: x_mm as f32 / 1000.0,
+                y_m: y_mm as f32 / 1000.0,
+                heading_rad: heading_mrad.unwrap_or(0) as f32 / 1000.0,
+            };
+        } else if let (Some(distance_mm), Some(heading_mrad)) = (distance_mm, heading_mrad) {
+            if let (Some(previous_distance_mm), Some(previous_heading_mrad)) =
+                (self.last_distance_mm, self.last_heading_mrad)
+            {
+                let distance_delta_m = distance_mm.wrapping_sub(previous_distance_mm) as f32 / 1000.0;
+                let heading_delta_rad = normalize_pose_angle(
+                    heading_mrad.wrapping_sub(previous_heading_mrad) as f32 / 1000.0,
+                );
+                let midpoint_heading = self.pose.heading_rad + heading_delta_rad * 0.5;
+                self.pose.x_m += distance_delta_m * midpoint_heading.cos();
+                self.pose.y_m += distance_delta_m * midpoint_heading.sin();
+                self.pose.heading_rad = normalize_pose_angle(self.pose.heading_rad + heading_delta_rad);
+            } else {
+                // A cumulative legacy stream has no recoverable pre-connection
+                // translation history. Establish a truthful local origin and
+                // integrate only observed deltas from this sample onward.
+                self.pose.heading_rad = heading_mrad as f32 / 1000.0;
+            }
+        }
+
+        self.last_distance_mm = distance_mm;
+        self.last_heading_mrad = heading_mrad;
+        self.last_reset_count = status.odometry.reset_count;
+        self.pose
+    }
+}
+
+fn normalize_pose_angle(mut angle: f32) -> f32 {
+    while angle > std::f32::consts::PI {
+        angle -= std::f32::consts::TAU;
+    }
+    while angle < -std::f32::consts::PI {
+        angle += std::f32::consts::TAU;
+    }
+    angle
+}
+
+fn body_sense_from_cockpit_status_and_pose(
+    status: StatusSummary,
+    last_update_ms: TimeMs,
+    pose: Pose2,
+) -> BodySense {
     let charging = status.battery.charging_state.unwrap_or(0) != 0
         || status.battery.charging_indicator.unwrap_or(false);
     let home_base = status.battery.home_base();
@@ -336,11 +416,7 @@ pub fn body_sense_from_cockpit_status(status: StatusSummary, last_update_ms: Tim
             wall: status.contact.wall.unwrap_or(false),
             virtual_wall: status.contact.virtual_wall.unwrap_or(false),
         },
-        odometry: Pose2 {
-            x_m: status.odometry.distance_mm.unwrap_or(0) as f32 / 1000.0,
-            y_m: 0.0,
-            heading_rad: status.odometry.heading_mrad.unwrap_or(0) as f32 / 1000.0,
-        },
+        odometry: pose,
         last_update_ms: packet_update_ms,
         ..BodySense::default()
     }

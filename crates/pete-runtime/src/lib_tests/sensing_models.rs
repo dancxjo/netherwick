@@ -121,6 +121,75 @@ fn physical_charging_indicator_populates_body_charging_without_oi_state() {
 }
 
 #[test]
+fn brainstem_pose_odometry_reaches_body_sense_without_distance_as_x() {
+    let status = CockpitStatus {
+        raw: serde_json::json!({
+            "uptime_ms": 1_000,
+            "create_sensors": {
+                "last_packet_id": 0,
+                "complete_packet_count": 1,
+                "last_complete_packet_timestamp_ms": 1_000
+            },
+            "odometry": {
+                "distance_mm": 900,
+                "x_mm": 300,
+                "y_mm": -400,
+                "heading_mrad": 1_250
+            }
+        })
+        .to_string(),
+    }
+    .summary();
+
+    let body = body_sense_from_cockpit_status(status, 1_000);
+
+    assert_eq!(body.odometry.x_m, 0.3);
+    assert_eq!(body.odometry.y_m, -0.4);
+    assert_eq!(body.odometry.heading_rad, 1.25);
+}
+
+#[test]
+fn pre_pose_brainstem_odometry_contract_remains_accepted() {
+    let status = CockpitStatus {
+        raw: "OK 1 STATUS odometry_distance_mm=425 odometry_heading_mrad=-250".to_string(),
+    }
+    .summary();
+
+    let body = body_sense_from_cockpit_status(status, 1_000);
+
+    // A stateless conversion cannot recover the path behind a cumulative
+    // distance value, so it must not invent global X displacement.
+    assert_eq!(body.odometry.x_m, 0.0);
+    assert_eq!(body.odometry.y_m, 0.0);
+    assert_eq!(body.odometry.heading_rad, -0.25);
+}
+
+#[test]
+fn legacy_physical_pose_adapter_integrates_distance_after_turn_in_world_y() {
+    let mut adapter = PhysicalPoseAdapter::default();
+    let samples = [
+        (0, 0),
+        (1_000, 0),
+        (1_000, 1_571),
+        (2_000, 1_571),
+    ];
+    let mut body = BodySense::default();
+    for (distance_mm, heading_mrad) in samples {
+        let status = CockpitStatus {
+            raw: format!(
+                "OK 1 STATUS odometry_resets=0 odometry_distance_mm={distance_mm} odometry_heading_mrad={heading_mrad}"
+            ),
+        }
+        .summary();
+        body = body_sense_from_cockpit_status_with_pose_adapter(status, 1_000, &mut adapter);
+    }
+
+    assert!((body.odometry.x_m - 1.0).abs() < 0.002);
+    assert!((body.odometry.y_m - 1.0).abs() < 0.002);
+    assert!((body.odometry.heading_rad - 1.571).abs() < 0.001);
+}
+
+#[test]
 fn create_ir_reaches_motherbrain_body_sense() {
     let status = CockpitStatus {
         raw: serde_json::json!({

@@ -1029,6 +1029,14 @@ struct GeometryDebugArgs {
     max_below_floor_ratio: f32,
     #[arg(long, default_value_t = 200)]
     max_body_timestamp_age_ms: u64,
+    #[arg(long, default_value_t = 200)]
+    max_kinect_timestamp_age_ms: u64,
+    #[arg(long, default_value_t = 200)]
+    max_imu_timestamp_age_ms: u64,
+    #[arg(long, default_value_t = 100)]
+    max_kinect_imu_skew_ms: u64,
+    #[arg(long, default_value_t = 2)]
+    min_depth_frames: usize,
     #[arg(long, default_value_t = 45.0)]
     min_stationary_rotation_deg: f32,
     #[arg(long, default_value_t = 0.20)]
@@ -1113,6 +1121,25 @@ struct RepresentationHealthReport {
     map: RepresentationMapSummary,
     pose_graph: RepresentationPoseGraphSummary,
     place_recognition: RepresentationPlaceRecognitionSummary,
+    return_to_start: ReturnToStartValidation,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct ReturnToStartValidation {
+    evaluated: bool,
+    passed: bool,
+    measured_loop_constraint: bool,
+    graph_error_before: f32,
+    graph_error_after: f32,
+    graph_error_reduced: bool,
+    wall_overlap_before: Option<f32>,
+    wall_overlap_after: Option<f32>,
+    wall_overlap_improved: bool,
+    raw_final_distance_to_start_m: Option<f32>,
+    corrected_final_distance_to_start_m: Option<f32>,
+    max_corrected_distance_to_start_m: f32,
+    corrected_pose_near_start: bool,
+    reasons: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1314,4 +1341,3 @@ struct WhisperTranscribeArgs {
     model: Option<PathBuf>,
     wav: PathBuf,
 }
-

@@ -411,7 +411,19 @@ pub enum PoseEdgeSource {
         query_vector_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         query_experience_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        registration: Option<LoopRegistrationMeasurement>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LoopRegistrationMeasurement {
+    pub algorithm: String,
+    pub registered_pose: Pose2,
+    pub score: f32,
+    pub odometry_score: f32,
+    pub geometric_overlap: f32,
+    pub odometry_geometric_overlap: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

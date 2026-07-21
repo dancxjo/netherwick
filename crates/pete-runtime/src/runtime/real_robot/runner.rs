@@ -110,6 +110,7 @@ where
             motion_rejection: MotionRejectionState::default(),
             possessor_skills: PossessorSkillRuntime::default(),
             sensor_poll_health,
+            physical_pose: PhysicalPoseAdapter::default(),
         }
     }
 
@@ -167,7 +168,12 @@ where
             anyhow::bail!("only read-only robot mode is implemented");
         }
 
-        let body = body_sense_from_cockpit_status(self.cockpit.refresh_status()?, wall_time_ms());
+        let status = self.cockpit.refresh_status()?;
+        let body = body_sense_from_cockpit_status_with_pose_adapter(
+            status,
+            wall_time_ms(),
+            &mut self.physical_pose,
+        );
         let brainstem_events = self.cockpit.poll_events()?;
         let mut packets = poll_sensors_lossy(&mut self.sensors, &mut self.sensor_poll_health).await;
         let t_ms = body.last_update_ms.max(wall_time_ms());
@@ -262,7 +268,11 @@ where
         }
 
         let status_before = self.cockpit.refresh_status()?;
-        let body_before = body_sense_from_cockpit_status(status_before.clone(), wall_time_ms());
+        let body_before = body_sense_from_cockpit_status_with_pose_adapter(
+            status_before.clone(),
+            wall_time_ms(),
+            &mut self.physical_pose,
+        );
         let recovery_decision =
             self.apply_possession_recovery(&body_before, &brainstem_events, &status_before)?;
         let mut packets = poll_sensors_lossy(&mut self.sensors, &mut self.sensor_poll_health).await;

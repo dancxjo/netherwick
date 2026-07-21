@@ -219,8 +219,9 @@ async fn generate_representation_report(
         place_recognition_warnings.insert("no place-recognition candidates emitted".to_string());
     }
 
+    let return_to_start = return_to_start_validation(&local_map);
     Ok(RepresentationHealthReport {
-        schema_version: 1,
+        schema_version: 2,
         frame_count,
         input,
         warnings: warnings.into_iter().collect(),
@@ -264,7 +265,91 @@ async fn generate_representation_report(
             repeated_place_hints,
             warnings: place_recognition_warnings.into_iter().collect(),
         },
+        return_to_start,
     })
+}
+
+fn return_to_start_validation(map: &LocalMap) -> ReturnToStartValidation {
+    const MAX_FINAL_DISTANCE_M: f32 = 0.25;
+    let registration = map.pose_graph.edges.iter().rev().find_map(|edge| {
+        if !edge.active {
+            return None;
+        }
+        match &edge.source {
+            PoseEdgeSource::LoopClosureCandidate { registration, .. } => registration.as_ref(),
+            _ => None,
+        }
+    });
+    let optimization = map.pose_graph_optimization;
+    let graph_error_reduced = optimization.initial_mean_error > 0.0
+        && optimization.final_mean_error < optimization.initial_mean_error;
+    let wall_overlap_before = registration.map(|measurement| measurement.odometry_geometric_overlap);
+    let wall_overlap_after = registration.map(|measurement| measurement.geometric_overlap);
+    let wall_overlap_improved = matches!(
+        (wall_overlap_before, wall_overlap_after),
+        (Some(before), Some(after)) if after > before
+    );
+    let raw_poses = map
+        .observations
+        .iter()
+        .filter_map(|observation| {
+            let pose = observation.source_snapshot.pointer("/body/odometry")?;
+            Some((
+                pose.get("x_m")?.as_f64()? as f32,
+                pose.get("y_m")?.as_f64()? as f32,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let raw_final_distance_to_start_m = raw_poses.first().zip(raw_poses.last()).map(|(start, end)| {
+        (end.0 - start.0).hypot(end.1 - start.1)
+    });
+    let corrected_final_distance_to_start_m = map
+        .pose_graph
+        .nodes
+        .first()
+        .zip(map.pose_graph.nodes.last())
+        .map(|(start, end)| {
+            (end.pose_estimate.pose.x_m - start.pose_estimate.pose.x_m)
+                .hypot(end.pose_estimate.pose.y_m - start.pose_estimate.pose.y_m)
+        });
+    let corrected_pose_near_start = corrected_final_distance_to_start_m
+        .is_some_and(|distance| distance <= MAX_FINAL_DISTANCE_M);
+    let evaluated = map.pose_graph.nodes.len() >= 3 && registration.is_some();
+    let mut reasons = Vec::new();
+    if registration.is_none() {
+        reasons.push("no active measured loop registration".to_string());
+    }
+    if !graph_error_reduced {
+        reasons.push("pose-graph error did not decrease".to_string());
+    }
+    if !wall_overlap_improved {
+        reasons.push("registered wall overlap did not improve over raw odometry".to_string());
+    }
+    if !corrected_pose_near_start {
+        reasons.push(format!(
+            "corrected final pose is not within {MAX_FINAL_DISTANCE_M:.2}m of the start"
+        ));
+    }
+    let passed = evaluated
+        && graph_error_reduced
+        && wall_overlap_improved
+        && corrected_pose_near_start;
+    ReturnToStartValidation {
+        evaluated,
+        passed,
+        measured_loop_constraint: registration.is_some(),
+        graph_error_before: optimization.initial_mean_error,
+        graph_error_after: optimization.final_mean_error,
+        graph_error_reduced,
+        wall_overlap_before,
+        wall_overlap_after,
+        wall_overlap_improved,
+        raw_final_distance_to_start_m,
+        corrected_final_distance_to_start_m,
+        max_corrected_distance_to_start_m: MAX_FINAL_DISTANCE_M,
+        corrected_pose_near_start,
+        reasons,
+    }
 }
 
 fn summarize_confidence_distribution(values: &[f32]) -> RepresentationConfidenceDistribution {

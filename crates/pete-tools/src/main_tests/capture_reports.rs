@@ -26,6 +26,170 @@ fn sensor_only_live_publish_does_not_refresh_body_timestamp() {
 }
 
 #[test]
+fn geometry_truth_rejects_stale_and_unsynchronized_kinect_imu_samples() {
+    let timestamps = GeometryTimestampDiagnostics {
+        frame_count: 3,
+        depth_frame_count: 3,
+        first_frame_t_ms: Some(1_000),
+        last_frame_t_ms: Some(1_200),
+        frame_timestamps_monotonic: true,
+        median_frame_dt_ms: Some(100),
+        max_frame_dt_ms: Some(100),
+        body_last_update_age_ms: Some(0),
+        eye_frame_age_ms: None,
+        ear_pcm_age_ms: None,
+        kinect_capture_timestamp_present: true,
+        kinect_capture_age_ms: Some(50),
+        imu_capture_timestamp_present: true,
+        imu_capture_age_ms: Some(23_000),
+        kinect_imu_skew_ms: Some(22_950),
+        note: String::new(),
+    };
+    let imu = GeometryImuInterpretation {
+        raw_orientation: vec![0.0, 0.0],
+        assumed_units: "radians".to_string(),
+        assumed_axis_order: "[roll, pitch]".to_string(),
+        roll_deg: Some(0.0),
+        pitch_deg: Some(0.0),
+        yaw_deg: None,
+        roll_pitch_correction_active: true,
+        yaw_source: "OdometryHeading".to_string(),
+        contract_known: true,
+        contract_source: "test".to_string(),
+        note: String::new(),
+    };
+    let stationary = StationaryRotationDiagnostics {
+        evaluated: true,
+        reason: "test".to_string(),
+        frame_count: 3,
+        heading_delta_deg: 90.0,
+        translation_delta_m: 0.0,
+        raw_points_seen: 100,
+        voxel_count: 20,
+        stable_voxel_count: 10,
+        stable_voxel_ratio: 0.5,
+        stable_z_span_m: Some(0.2),
+        stable_z_median_m: Some(0.5),
+    };
+    let args = GeometryDebugArgs {
+        capture: None,
+        live_now_url: None,
+        out: String::new(),
+        samples: 16,
+        max_below_floor_ratio: 0.02,
+        max_body_timestamp_age_ms: 200,
+        max_kinect_timestamp_age_ms: 200,
+        max_imu_timestamp_age_ms: 200,
+        max_kinect_imu_skew_ms: 100,
+        min_depth_frames: 2,
+        min_stationary_rotation_deg: 45.0,
+        max_stationary_translation_m: 0.2,
+        min_stationary_stable_voxel_ratio: 0.05,
+        max_stationary_stable_z_span_m: 1.5,
+    };
+
+    let report = sensor_truth_report(false, &timestamps, &imu, 0.0, &stationary, &args);
+
+    assert!(!report.ready_for_real_slam);
+    for name in ["imu_timestamp_fresh", "kinect_imu_synchronized"] {
+        assert_eq!(
+            report
+                .gates
+                .iter()
+                .find(|gate| gate.name == name)
+                .unwrap()
+                .status,
+            SensorTruthStatus::Fail
+        );
+    }
+}
+
+#[test]
+fn return_to_start_gate_requires_measured_error_overlap_and_endpoint_improvement() {
+    let pose = |x_m: f32| {
+        let mut pose = BodySense::default().odometry;
+        pose.x_m = x_m;
+        pose
+    };
+    let estimate = |x_m: f32, t_ms: u64| pete_map::PoseEstimate {
+        pose: pose(x_m),
+        confidence: 0.9,
+        covariance: [0.05, 0.05, 0.1],
+        source: "test".to_string(),
+        t_ms,
+    };
+    let mut map = LocalMap::default();
+    map.pose_graph.nodes = vec![
+        pete_map::PoseNode {
+            id: "start".to_string(),
+            pose_estimate: estimate(0.0, 0),
+            t_ms: 0,
+            source_frame_id: Some("start".to_string()),
+        },
+        pete_map::PoseNode {
+            id: "away".to_string(),
+            pose_estimate: estimate(1.0, 100),
+            t_ms: 100,
+            source_frame_id: Some("away".to_string()),
+        },
+        pete_map::PoseNode {
+            id: "return".to_string(),
+            pose_estimate: estimate(0.1, 200),
+            t_ms: 200,
+            source_frame_id: Some("return".to_string()),
+        },
+    ];
+    map.pose_graph.edges.push(pete_map::PoseEdge {
+        from: "return".to_string(),
+        to: "start".to_string(),
+        transform: pose(0.0),
+        covariance: [0.02, 0.02, 0.04],
+        confidence: 0.95,
+        source: PoseEdgeSource::LoopClosureCandidate {
+            kind: "test".to_string(),
+            target_frame_id: Some("start".to_string()),
+            source_frame_id: Some("return".to_string()),
+            source_experience_id: None,
+            source_instant_frame_id: None,
+            source_vector_refs: Vec::new(),
+            source_vector_id: None,
+            query_vector_id: None,
+            query_experience_id: None,
+            registration: Some(pete_map::LoopRegistrationMeasurement {
+                algorithm: "correlative_occupancy_submap_registration".to_string(),
+                registered_pose: pose(0.0),
+                score: 0.8,
+                odometry_score: 0.2,
+                geometric_overlap: 0.8,
+                odometry_geometric_overlap: 0.2,
+            }),
+        },
+        active: true,
+        rejection_reason: None,
+    });
+    map.pose_graph_optimization.initial_mean_error = 0.3;
+    map.pose_graph_optimization.final_mean_error = 0.1;
+    for (x_m, t_ms) in [(0.0, 0), (0.4, 200)] {
+        map.observations.push(pete_map::MapObservation {
+            pose: estimate(x_m, t_ms),
+            range_beams: Vec::new(),
+            source_snapshot: serde_json::json!({"body":{"odometry":pose(x_m)}}),
+            t_ms,
+        });
+    }
+
+    let validation = return_to_start_validation(&map);
+
+    assert!(validation.evaluated);
+    assert!(validation.passed);
+    assert!(validation.graph_error_reduced);
+    assert!(validation.wall_overlap_improved);
+    assert!(validation.corrected_pose_near_start);
+    assert_eq!(validation.raw_final_distance_to_start_m, Some(0.4));
+    assert_eq!(validation.corrected_final_distance_to_start_m, Some(0.1));
+}
+
+#[test]
 fn missing_streams_generate_warnings() {
     let mut counts = StreamCounts::default();
     counts.observe(&WorldSnapshot::default());
@@ -427,4 +591,3 @@ async fn capture_real_mock_exports_assets_and_pointclouds() {
     assert!(replay.is_ok());
     let _ = fs::remove_dir_all(&temp_dir);
 }
-

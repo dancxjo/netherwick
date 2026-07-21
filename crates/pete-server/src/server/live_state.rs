@@ -139,11 +139,22 @@ impl LiveViewState {
     }
 
     pub fn update(&self, snapshot: WorldSnapshot) {
+        self.update_with_runtime_map(snapshot, None);
+    }
+
+    pub fn update_with_runtime_map(
+        &self,
+        snapshot: WorldSnapshot,
+        runtime_map: Option<&LocalMap>,
+    ) {
         let now = snapshot.to_now(snapshot.body.last_update_ms);
-        self.map
-            .lock()
-            .expect("live map mutex poisoned")
-            .observe_snapshot(&snapshot, snapshot.body.last_update_ms);
+        let mut map = self.map.lock().expect("live map mutex poisoned");
+        if let Some(runtime_map) = runtime_map {
+            *map = runtime_map.clone();
+        } else {
+            map.observe_snapshot(&snapshot, snapshot.body.last_update_ms);
+        }
+        drop(map);
         {
             let calibration = self
                 .scene_metadata()

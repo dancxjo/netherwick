@@ -478,7 +478,8 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         }
         play_lua_skill_audio(&mouth, &tick, &mut played_skill_audio);
         if let Some(live_state) = &live_state {
-            live_state.update(snapshot.clone());
+            let runtime_map = runner.runtime.canonical_map();
+            live_state.update_with_runtime_map(snapshot.clone(), runtime_map.as_ref());
             live_state.update_embodied_context(tick.frame.embodied_context());
         }
         if let Some(writer) = capture.as_mut() {

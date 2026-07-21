@@ -24,6 +24,10 @@ pub trait RuntimeLoop {
     }
 
     fn observe_skill_status(&mut self, _status: &SkillStatus) {}
+
+    fn canonical_map(&self) -> Option<LocalMap> {
+        None
+    }
 }
 
 #[async_trait::async_trait]
@@ -47,6 +51,10 @@ where
 
     fn observe_skill_status(&mut self, status: &SkillStatus) {
         self.goal_system.observe_skill_status(status);
+    }
+
+    fn canonical_map(&self) -> Option<LocalMap> {
+        Some(self.local_map.clone())
     }
 
     async fn tick(
@@ -85,6 +93,15 @@ pub struct RealRobotRunner<R, C> {
     motion_rejection: MotionRejectionState,
     possessor_skills: PossessorSkillRuntime,
     sensor_poll_health: Vec<SensorPollHealth>,
+    physical_pose: PhysicalPoseAdapter,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PhysicalPoseAdapter {
+    pose: Pose2,
+    last_distance_mm: Option<i32>,
+    last_heading_mrad: Option<i32>,
+    last_reset_count: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default)]

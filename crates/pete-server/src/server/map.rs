@@ -144,6 +144,8 @@ fn map_world_projection(
     let stable_cells = cells.iter().filter(|cell| cell.stable).count();
     let aligned_with_3d = point_cloud.observations > 0 && !cells.is_empty();
     let corrected_slam_ready = map_summary.slam_status.mode == SlamMode::LoopClosedPoseGraph;
+    let graph_correction_not_applied_to_voxels = corrected_slam_ready
+        && map_summary.pose_graph_optimization.max_node_update_m > 0.001;
     let has_depth = !latest.kinect.depth_m.is_empty();
     let calibrated_depth = !has_depth
         || metadata
@@ -177,11 +179,18 @@ fn map_world_projection(
             map_summary.slam_status.mode
         ));
     }
+    if graph_correction_not_applied_to_voxels {
+        reasons.push(
+            "pose-graph corrections have not been applied to the accumulated 3D voxels"
+                .to_string(),
+        );
+    }
     let geometry_trusted = aligned_with_3d
         && below_floor_ratio <= MAX_TRUSTED_BELOW_FLOOR_RATIO
         && stable_cells > 0
         && calibrated_depth
-        && depth_orientation_trusted;
+        && depth_orientation_trusted
+        && !graph_correction_not_applied_to_voxels;
     let navigation_trusted = geometry_trusted && corrected_slam_ready;
 
     MapWorldProjection {
