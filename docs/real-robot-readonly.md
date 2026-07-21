@@ -87,11 +87,21 @@ This enters the same guarded possession path while restoring normal configured
 sensor discovery: Kinect RGB/depth by default (set `PETE_KINECT_DEPTH=0` to use
 `CAMERA_DEVICE` through V4L), `MIC_DEVICE`, `GPS_SERIAL_PORT`, `IMU_DEVICE` or a
 discovered supported local IMU, and Ollama-backed cognition. Individual inputs
-remain best effort unless their matching `--require-camera`, `--require-mic`,
-`--require-gps`, or `--require-imu` flag is passed. Use `--llm-config PATH` to
-select a specific cognition policy, or `--llm-provider disabled` to isolate the
-physical sensors. `just possess-sensorium-rpi5` selects the same sensorium
-profile over the local RPi 5 brainstem backend.
+remain best effort unless their matching `--require-camera`, `--require-kinect`,
+`--require-mic`, `--require-gps`, `--require-lidar`, `--require-imu`, or
+`--require-llm` flag is passed. Startup waits up to three seconds for first
+usable data while continuing to poll the brainstem, then prints every stream as
+active or missing. Change that bound with `--sensor-readiness-timeout-ms` or
+`PETE_SENSOR_READINESS_TIMEOUT_MS`. A required miss stops and exorcizes before
+the command fails; an optional miss is recorded as an explicit degradation.
+
+The default LLM policy is `configs/llm.possession.toml`: one advisory Ollama
+path, a 2-second request timeout, 2,048-token context, 128 generated tokens, two
+CPU threads, and live-image enrichment disabled to avoid competing model jobs
+on the Pi. Use `--llm-config PATH` for a different bounded policy or
+`--llm-provider disabled` to isolate physical sensors.
+`just possess-sensorium-rpi5` selects the same sensorium profile over the local
+RPi 5 brainstem backend.
 
 Both direct-RPi recipes default to `--wheels-off-floor` because the local
 Brainstem process has no watchdog independent of the RPi 5. To authorize floor
@@ -100,10 +110,10 @@ motion despite that reduced safety class, use the deliberately specific
 that removes drive power. See [RPi 5 direct Create brainstem](029-rpi5-direct-brainstem.md)
 for the residual whole-Pi freeze failure mode and the dashboard/capture evidence.
 
-A successful sensorium run proves only the inputs that initialization reports
-as active and the behaviors actually exercised during that run. For example,
-an open microphone alone is not proof that a hotword or speech episode reached
-the runtime.
+A successful sensorium run proves only streams reported active after first
+data and the behaviors actually exercised during that run. The same readiness
+contract and background-queue drop counts are stored in the capture metadata
+and `sensor.health` diagnostics.
 
 The recipe requires `PETE_BRAINSTEM_DEVICE_ID` in `.env`;
 `PETE_COCKPIT_PORT` may pin the `/dev/serial/by-id/DEVICE` path. On a boot-ID

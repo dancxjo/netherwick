@@ -73,6 +73,18 @@ just brainstem-rpi5-check
 just possess-rpi5
 ```
 
+After body-only possession is healthy, the strict higher-sensor wheels-up path
+is:
+
+```sh
+just possess-sensorium-rpi5 \
+  --require-kinect --require-lidar --require-imu --require-llm
+```
+
+It retains the same local Brainstem safety boundary while requiring first data
+from each named stream. Optional camera, microphone, and GPS inputs can be made
+strict with their corresponding `--require-*` flags.
+
 The direct-RPi recipes declare `--wheels-off-floor` by default. Autonomous
 motion on the physical floor is refused unless the operator replaces that
 declaration with the explicit residual-risk acknowledgement:

@@ -389,6 +389,20 @@ pass `--llm-config PATH` / `--llm-provider disabled` explicitly. Both profiles
 retain the same identity pinning, possession lease, motion limits, safety and
 autonomic vetoes, reconnect behavior, STOP, and exorcize shutdown.
 
+The default sensorium Ollama policy is bounded for the RPi 5 by
+`configs/llm.possession.toml`. Startup reports every configured stream as
+active or missing after first-data readiness. For a strict wheels-up run, use:
+
+```bash
+just possess-sensorium --wheels-off-floor \
+  --require-kinect --require-lidar --require-imu --require-llm
+```
+
+Add the matching `--require-camera`, `--require-mic`, or `--require-gps` flags
+when those optional devices are part of the run. Required misses fail startup;
+optional misses degrade explicitly and remain visible in capture metadata and
+`sensor.health`.
+
 Set `PETE_BRAINSTEM_DEVICE_ID` in `.env` first; optionally pin
 `PETE_COCKPIT_PORT=/dev/serial/by-id/DEVICE`. The recipe learns the current boot
 ID from the pinned device, saves it as `PETE_BRAINSTEM_BOOT_ID`, and retries
