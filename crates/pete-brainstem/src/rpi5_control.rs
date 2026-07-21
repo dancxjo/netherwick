@@ -518,6 +518,10 @@ fn parse_command(line: &str) -> Result<(u32, BrainstemCommand), u32> {
             seq,
             kind: parse_feedback_kind(parts.next().ok_or(seq)?).ok_or(seq)?,
         },
+        "SET_SILENT" => BrainstemCommand::SetAudioSilent {
+            seq,
+            silent: parse_bool(parts.next()).ok_or(seq)?,
+        },
         "POWER_STATE" => BrainstemCommand::PowerState {
             seq,
             request: parse_power_request(parts.next().ok_or(seq)?).ok_or(seq)?,
@@ -695,7 +699,9 @@ fn compact_status(seq: u32) -> String {
             "imu_accel_z_mm_s2={} imu_accel_mag_mm_s2={} imu_tilt_mrad={} ",
             "imu_roughness_mm_s2={} imu_impact_mm_s2={} imu_motion_consistency={} ",
             "imu_calibration={} firmware_version={} git_commit={} git_dirty={} build_id={} ",
-            "careful_mode={} careful_remaining_ms={}\n"
+            "careful_mode={} careful_remaining_ms={} ",
+            "audio_silent={} audio_last_requested={} audio_last_played={} audio_last_playback_ms={} ",
+            "audio_suppressed={} audio_dropped={}\n"
         ),
         seq,
         snapshot.uptime_ms,
@@ -776,6 +782,12 @@ fn compact_status(seq: u32) -> String {
         snapshot.build_id,
         status::careful_mode_remaining_ms(snapshot.uptime_ms) > 0,
         status::careful_mode_remaining_ms(snapshot.uptime_ms),
+        snapshot.audio_silent,
+        crate::audio::cue_name(snapshot.audio_last_requested_cue),
+        crate::audio::cue_name(snapshot.audio_last_played_cue),
+        snapshot.audio_last_playback_timestamp_ms,
+        snapshot.audio_suppressed_by_silent_count,
+        snapshot.audio_dropped_or_replaced_count,
     )
 }
 
@@ -825,6 +837,16 @@ mod tests {
         assert!(matches!(
             parse_command("FACE_BEARING 8 0 0"),
             Ok((8, BrainstemCommand::Unsupported { seq: 8 }))
+        ));
+        assert!(matches!(
+            parse_command("SET_SILENT 9 true"),
+            Ok((
+                9,
+                BrainstemCommand::SetAudioSilent {
+                    silent: true,
+                    seq: 9
+                }
+            ))
         ));
     }
 

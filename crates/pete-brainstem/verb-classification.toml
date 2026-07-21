@@ -80,7 +80,7 @@ lifecycle = "typed command and sensor events"
 exposed = true
 
 [[verbs]]
-names = ["song_define", "song_play", "define_chirp", "play_feedback", "set_lights"]
+names = ["song_define", "song_play", "define_chirp", "play_feedback", "set_silent", "set_lights"]
 category = "body-native"
 authority = "control lease"
 sensors = "responsive Create OI"

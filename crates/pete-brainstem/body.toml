@@ -48,6 +48,7 @@ verbs = [
   "song_play",
   "define_chirp",
   "play_feedback",
+  "set_silent",
   "power_state",
   "create_power_on",
   "create_power_off",
@@ -117,6 +118,7 @@ events = [
   "impact_detected",
   "contact_withdrawal_started",
   "contact_withdrawal_completed",
+  "audio_state_changed",
   "error",
 ]
 song_slots = 3

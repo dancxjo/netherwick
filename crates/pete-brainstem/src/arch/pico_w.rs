@@ -2483,6 +2483,10 @@ fn parse_forebrain_uart_command(line: &str) -> Result<(u32, BrainstemCommand), u
             seq,
             kind: parse_feedback_kind(parts.next().ok_or(seq)?).ok_or(seq)?,
         },
+        "SET_SILENT" => BrainstemCommand::SetAudioSilent {
+            seq,
+            silent: parse_bool(parts.next()).ok_or(seq)?,
+        },
         "POWER_STATE" => BrainstemCommand::PowerState {
             seq,
             request: parse_power_request(parts.next().ok_or(seq)?).ok_or(seq)?,
@@ -3480,6 +3484,10 @@ fn parse_command(command_id: u32, body: &str) -> Option<BrainstemCommand> {
             kind: parse_feedback_kind(json_str(body, "feedback")?)?,
             seq: json_u32(body, "seq").unwrap_or(command_id),
         }),
+        "set_silent" | "set_audio_silent" => Some(BrainstemCommand::SetAudioSilent {
+            silent: json_bool(body, "silent")?,
+            seq: json_u32(body, "seq").unwrap_or(command_id),
+        }),
         "power_state" => Some(BrainstemCommand::PowerState {
             request: parse_power_request(json_str(body, "request")?)?,
             seq: json_u32(body, "seq").unwrap_or(command_id),
@@ -4282,6 +4290,30 @@ mod tests {
             r#"{"command_id":103,"kind":"get_events","since_seq":491garbage}"#
         )
         .is_none());
+    }
+
+    #[test]
+    fn silent_mode_parses_on_http_and_compact_uart() {
+        assert!(matches!(
+            parse_command(
+                104,
+                r#"{"command_id":104,"kind":"set_silent","silent":true,"seq":104}"#
+            ),
+            Some(BrainstemCommand::SetAudioSilent {
+                silent: true,
+                seq: 104
+            })
+        ));
+        assert!(matches!(
+            parse_forebrain_uart_command("SET_SILENT 105 false"),
+            Ok((
+                105,
+                BrainstemCommand::SetAudioSilent {
+                    silent: false,
+                    seq: 105
+                }
+            ))
+        ));
     }
 
     #[test]

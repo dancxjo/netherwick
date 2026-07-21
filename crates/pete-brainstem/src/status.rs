@@ -4,6 +4,8 @@ use core::{
 };
 pub use pete_cockpit_protocol::CommandRejectReason;
 
+#[cfg(feature = "pico-w")]
+use crate::audio::cue_name;
 use crate::body;
 use crate::commands::{
     BrainstemCommand, CreateOiMode, FeedbackKind, PowerStateRequest, RuntimeCommand,
@@ -124,6 +126,12 @@ static PENDING_SONG_TONES: [AtomicU32; MAX_SONG_TONES] =
 static CREATE_SONG_LAST_DEFINED_ID: AtomicU8 = AtomicU8::new(0);
 static CREATE_SONG_LAST_DEFINED_LEN: AtomicU8 = AtomicU8::new(0);
 static CREATE_SONG_LAST_PLAYED_ID: AtomicU8 = AtomicU8::new(0);
+static AUDIO_SILENT: AtomicU8 = AtomicU8::new(OFF);
+static AUDIO_LAST_REQUESTED_CUE: AtomicU8 = AtomicU8::new(0);
+static AUDIO_LAST_PLAYED_CUE: AtomicU8 = AtomicU8::new(0);
+static AUDIO_LAST_PLAYBACK_TIMESTAMP_MS: AtomicU32 = AtomicU32::new(0);
+static AUDIO_SUPPRESSED_BY_SILENT_COUNT: AtomicU32 = AtomicU32::new(0);
+static AUDIO_DROPPED_OR_REPLACED_COUNT: AtomicU32 = AtomicU32::new(0);
 static ODOMETRY_RESET_COUNT: AtomicU32 = AtomicU32::new(0);
 static ODOMETRY_DISTANCE_MM: AtomicU32 = AtomicU32::new(0);
 static ODOMETRY_HEADING_MRAD: AtomicU32 = AtomicU32::new(0);
@@ -290,6 +298,12 @@ pub struct BrainstemStatus {
     pub create_song_last_defined_id: u8,
     pub create_song_last_defined_len: u8,
     pub create_song_last_played_id: u8,
+    pub audio_silent: bool,
+    pub audio_last_requested_cue: u8,
+    pub audio_last_played_cue: u8,
+    pub audio_last_playback_timestamp_ms: u32,
+    pub audio_suppressed_by_silent_count: u32,
+    pub audio_dropped_or_replaced_count: u32,
     pub odometry_reset_count: u32,
     pub odometry_distance_mm: i32,
     pub odometry_heading_mrad: i32,
@@ -472,6 +486,7 @@ pub enum PublicEventKind {
     ContactWithdrawalStarted = 50,
     ContactWithdrawalCompleted = 51,
     CommandRenewed = 52,
+    AudioStateChanged = 53,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -609,6 +624,7 @@ enum ControlCommandCode {
     ClearSafetyLatch = 48,
     CarefulMode = 49,
     EscapeMotion = 50,
+    SetAudioSilent = 51,
 }
 
 pub fn set_runtime_state(state: RuntimeState) {
@@ -645,6 +661,7 @@ pub fn set_command(command: Option<RuntimeCommand>) -> u8 {
         | Some(RuntimeCommand::ClearMotionQueue)
         | Some(RuntimeCommand::DefineChirp { .. })
         | Some(RuntimeCommand::PlayFeedback { .. })
+        | Some(RuntimeCommand::SetAudioSilent { .. })
         | Some(RuntimeCommand::CalibrateTurn { .. })
         | Some(RuntimeCommand::OrientationProbe { .. })
         | Some(RuntimeCommand::ResetOdometry)
@@ -1221,6 +1238,9 @@ pub fn authority_expired(now_ms: u32) -> bool {
     let deadline = ACTIVE_LEASE_EXPIRES_MS.load(Ordering::Acquire);
     deadline == 0 || now_ms.wrapping_sub(deadline) < u32::MAX / 2
 }
+pub fn has_active_authority(now_ms: u32) -> bool {
+    ACTIVE_LEASE_HASH.load(Ordering::Acquire) != 0 && !authority_expired(now_ms)
+}
 pub fn active_authority_matches(session_hash: u32, lease_hash: u32, now_ms: u32) -> bool {
     !authority_expired(now_ms)
         && ACTIVE_LEASE_HASH.load(Ordering::Acquire) == lease_hash
@@ -1499,6 +1519,14 @@ fn encode_control_command(
             0,
             None,
         )),
+        BrainstemCommand::SetAudioSilent { silent, .. } => Some((
+            ControlCommandCode::SetAudioSilent,
+            silent as u32,
+            0,
+            0,
+            0,
+            None,
+        )),
         BrainstemCommand::PowerState { request, .. } => Some((
             ControlCommandCode::PowerState,
             encode_power_request(request) as u32,
@@ -1671,6 +1699,12 @@ fn decode_control_command(
             kind: decode_feedback_kind(a as u8)?,
             seq,
         }),
+        x if x == ControlCommandCode::SetAudioSilent as u8 => {
+            Some(BrainstemCommand::SetAudioSilent {
+                silent: a != 0,
+                seq,
+            })
+        }
         x if x == ControlCommandCode::PowerState as u8 => Some(BrainstemCommand::PowerState {
             request: decode_power_request(a as u8)?,
             seq,
@@ -1747,6 +1781,7 @@ fn command_seq(command: BrainstemCommand) -> u32 {
         | BrainstemCommand::ClearMotionQueue { seq, .. }
         | BrainstemCommand::DefineChirp { seq, .. }
         | BrainstemCommand::PlayFeedback { seq, .. }
+        | BrainstemCommand::SetAudioSilent { seq, .. }
         | BrainstemCommand::PowerState { seq, .. }
         | BrainstemCommand::CalibrateTurn { seq, .. }
         | BrainstemCommand::OrientationProbe { seq, .. }
@@ -2177,6 +2212,49 @@ pub fn mark_song_defined(id: u8, tone_count: u8) {
 
 pub fn mark_song_played(id: u8) {
     CREATE_SONG_LAST_PLAYED_ID.store(id, Ordering::Relaxed);
+}
+
+pub fn audio_silent() -> bool {
+    AUDIO_SILENT.load(Ordering::Acquire) == ON
+}
+
+pub fn set_audio_silent(silent: bool) {
+    let new = if silent { ON } else { OFF };
+    let old = AUDIO_SILENT.load(Ordering::Acquire);
+    AUDIO_SILENT.store(new, Ordering::Release);
+    if old != new {
+        record_public_event(PublicEventKind::AudioStateChanged, silent as u32, 0, 0);
+    }
+}
+
+pub fn mark_audio_cue_requested(cue: u8) {
+    AUDIO_LAST_REQUESTED_CUE.store(cue, Ordering::Relaxed);
+}
+
+pub fn mark_audio_cue_played(cue: u8, timestamp_ms: u32) {
+    AUDIO_LAST_PLAYED_CUE.store(cue, Ordering::Relaxed);
+    AUDIO_LAST_PLAYBACK_TIMESTAMP_MS.store(timestamp_ms, Ordering::Relaxed);
+}
+
+pub fn increment_audio_suppressed_by_silent() {
+    increment(&AUDIO_SUPPRESSED_BY_SILENT_COUNT);
+}
+
+pub fn increment_audio_dropped_or_replaced(count: u32) {
+    if count > 0 {
+        let current = AUDIO_DROPPED_OR_REPLACED_COUNT.load(Ordering::Relaxed);
+        AUDIO_DROPPED_OR_REPLACED_COUNT.store(current.wrapping_add(count), Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+pub fn reset_audio_observability() {
+    AUDIO_SILENT.store(OFF, Ordering::Relaxed);
+    AUDIO_LAST_REQUESTED_CUE.store(0, Ordering::Relaxed);
+    AUDIO_LAST_PLAYED_CUE.store(0, Ordering::Relaxed);
+    AUDIO_LAST_PLAYBACK_TIMESTAMP_MS.store(0, Ordering::Relaxed);
+    AUDIO_SUPPRESSED_BY_SILENT_COUNT.store(0, Ordering::Relaxed);
+    AUDIO_DROPPED_OR_REPLACED_COUNT.store(0, Ordering::Relaxed);
 }
 
 pub fn mark_odometry_reset() {
@@ -2914,7 +2992,7 @@ const fn event_index(seq: u32) -> usize {
 }
 
 #[cfg(test)]
-fn reset_event_log_for_test() {
+pub(crate) fn reset_event_log_for_test() {
     EVENT_NEXT_SEQ.store(1, Ordering::Relaxed);
     SAFETY_HAZARD_GENERATION.store(0, Ordering::Relaxed);
     clear_velocity_stream();
@@ -3253,6 +3331,12 @@ pub fn snapshot(uptime_ms: u32) -> BrainstemStatus {
         create_song_last_defined_id: CREATE_SONG_LAST_DEFINED_ID.load(Ordering::Relaxed),
         create_song_last_defined_len: CREATE_SONG_LAST_DEFINED_LEN.load(Ordering::Relaxed),
         create_song_last_played_id: CREATE_SONG_LAST_PLAYED_ID.load(Ordering::Relaxed),
+        audio_silent: audio_silent(),
+        audio_last_requested_cue: AUDIO_LAST_REQUESTED_CUE.load(Ordering::Relaxed),
+        audio_last_played_cue: AUDIO_LAST_PLAYED_CUE.load(Ordering::Relaxed),
+        audio_last_playback_timestamp_ms: AUDIO_LAST_PLAYBACK_TIMESTAMP_MS.load(Ordering::Relaxed),
+        audio_suppressed_by_silent_count: AUDIO_SUPPRESSED_BY_SILENT_COUNT.load(Ordering::Relaxed),
+        audio_dropped_or_replaced_count: AUDIO_DROPPED_OR_REPLACED_COUNT.load(Ordering::Relaxed),
         odometry_reset_count: ODOMETRY_RESET_COUNT.load(Ordering::Relaxed),
         odometry_distance_mm: decode_signed_i32(ODOMETRY_DISTANCE_MM.load(Ordering::Relaxed)),
         odometry_heading_mrad: decode_signed_i32(ODOMETRY_HEADING_MRAD.load(Ordering::Relaxed)),
@@ -3365,6 +3449,8 @@ struct StatusJson {
     last_interrupted_command_id: u32,
     last_timed_out_command_id: u32,
     event_next_seq: u32,
+    audio_silent: bool,
+    audio: AudioStatusJson,
     create_songs: CreateSongStatusJson,
     odometry: OdometryStatusJson,
     imu: ImuStatusJson,
@@ -3378,6 +3464,17 @@ struct CreateSongStatusJson {
     last_defined_id: u8,
     last_defined_len: u8,
     last_played_id: u8,
+}
+
+#[cfg(feature = "pico-w")]
+#[derive(serde::Serialize)]
+struct AudioStatusJson {
+    silent: bool,
+    last_requested_cue: &'static str,
+    last_played_cue: &'static str,
+    last_playback_timestamp_ms: u32,
+    suppressed_by_silent_count: u32,
+    dropped_or_replaced_count: u32,
 }
 
 #[cfg(feature = "pico-w")]
@@ -3542,6 +3639,15 @@ pub fn render_json<'a>(snapshot: BrainstemStatus, buffer: &'a mut [u8]) -> Resul
         last_interrupted_command_id: snapshot.last_interrupted_command_id,
         last_timed_out_command_id: snapshot.last_timed_out_command_id,
         event_next_seq: snapshot.event_next_seq,
+        audio_silent: snapshot.audio_silent,
+        audio: AudioStatusJson {
+            silent: snapshot.audio_silent,
+            last_requested_cue: cue_name(snapshot.audio_last_requested_cue),
+            last_played_cue: cue_name(snapshot.audio_last_played_cue),
+            last_playback_timestamp_ms: snapshot.audio_last_playback_timestamp_ms,
+            suppressed_by_silent_count: snapshot.audio_suppressed_by_silent_count,
+            dropped_or_replaced_count: snapshot.audio_dropped_or_replaced_count,
+        },
         create_songs: CreateSongStatusJson {
             last_defined_id: snapshot.create_song_last_defined_id,
             last_defined_len: snapshot.create_song_last_defined_len,
@@ -3725,6 +3831,7 @@ pub fn public_event_kind_text(code: u8) -> &'static str {
         x if x == PublicEventKind::ContactWithdrawalCompleted as u8 => {
             "contact_withdrawal_completed"
         }
+        x if x == PublicEventKind::AudioStateChanged as u8 => "audio_state_changed",
         x if x == PublicEventKind::Error as u8 => "error",
         _ => "none",
     }
@@ -3917,6 +4024,7 @@ fn control_command_text(code: u8) -> &'static str {
         x if x == ControlCommandCode::ClearMotionQueue as u8 => "clear_motion_queue",
         x if x == ControlCommandCode::DefineChirp as u8 => "define_chirp",
         x if x == ControlCommandCode::PlayFeedback as u8 => "play_feedback",
+        x if x == ControlCommandCode::SetAudioSilent as u8 => "set_silent",
         x if x == ControlCommandCode::PowerState as u8 => "power_state",
         x if x == ControlCommandCode::CalibrateTurn as u8 => "calibrate_turn",
         x if x == ControlCommandCode::OrientationProbe as u8 => "orientation_probe",

@@ -610,6 +610,10 @@ pub trait Cockpit {
         expect_accepted(self.execute(CockpitRequest::PlayFeedback { feedback: kind })?)
     }
 
+    fn set_audio_silent(&mut self, silent: bool) -> Result<()> {
+        expect_accepted(self.execute(CockpitRequest::SetAudioSilent { silent })?)
+    }
+
     fn power_state(&mut self, request: PowerStateRequest) -> Result<()> {
         expect_accepted(self.execute(CockpitRequest::PowerState { request })?)
     }
@@ -1470,6 +1474,18 @@ pub struct StatusSummary {
     pub careful_mode_active: Option<bool>,
     #[serde(default)]
     pub careful_mode_remaining_ms: Option<u32>,
+    #[serde(default)]
+    pub audio_silent: Option<bool>,
+    #[serde(default)]
+    pub audio_last_requested_cue: Option<String>,
+    #[serde(default)]
+    pub audio_last_played_cue: Option<String>,
+    #[serde(default)]
+    pub audio_last_playback_timestamp_ms: Option<u32>,
+    #[serde(default)]
+    pub audio_suppressed_by_silent_count: Option<u32>,
+    #[serde(default)]
+    pub audio_dropped_or_replaced_count: Option<u32>,
     pub active_motion: Option<bool>,
     pub event_next_seq: Option<u32>,
     pub body_packet_count: Option<u32>,
@@ -1520,6 +1536,12 @@ impl StatusSummary {
             safety_hazard_generation: number_for(raw, "safety_hazard_generation"),
             careful_mode_active: bool_for(raw, "careful_mode"),
             careful_mode_remaining_ms: number_for(raw, "careful_remaining_ms"),
+            audio_silent: bool_for(raw, "audio_silent"),
+            audio_last_requested_cue: value_for(raw, "audio_last_requested").map(ToOwned::to_owned),
+            audio_last_played_cue: value_for(raw, "audio_last_played").map(ToOwned::to_owned),
+            audio_last_playback_timestamp_ms: number_for(raw, "audio_last_playback_ms"),
+            audio_suppressed_by_silent_count: number_for(raw, "audio_suppressed"),
+            audio_dropped_or_replaced_count: number_for(raw, "audio_dropped"),
             active_motion: bool_for(raw, "active_cmd_vel"),
             event_next_seq: number_for(raw, "event_next_seq"),
             body_packet_count: packet_count,
@@ -1535,6 +1557,7 @@ impl StatusSummary {
 
     fn from_json(raw: &str, value: &serde_json::Value) -> Self {
         let sensors = value.get("create_sensors");
+        let audio = value.get("audio");
         let packet_count =
             sensors.and_then(|sensors| json_u32_value(sensors, "complete_packet_count"));
         let packet_age_ms = match (
@@ -1568,6 +1591,20 @@ impl StatusSummary {
             safety_hazard_generation: json_u32_value(value, "safety_hazard_generation"),
             careful_mode_active: json_bool_value(value, "careful_mode_active"),
             careful_mode_remaining_ms: json_u32_value(value, "careful_mode_remaining_ms"),
+            audio_silent: json_bool_value(value, "audio_silent")
+                .or_else(|| audio.and_then(|audio| json_bool_value(audio, "silent"))),
+            audio_last_requested_cue: audio
+                .and_then(|audio| json_str_value(audio, "last_requested_cue"))
+                .map(ToOwned::to_owned),
+            audio_last_played_cue: audio
+                .and_then(|audio| json_str_value(audio, "last_played_cue"))
+                .map(ToOwned::to_owned),
+            audio_last_playback_timestamp_ms: audio
+                .and_then(|audio| json_u32_value(audio, "last_playback_timestamp_ms")),
+            audio_suppressed_by_silent_count: audio
+                .and_then(|audio| json_u32_value(audio, "suppressed_by_silent_count")),
+            audio_dropped_or_replaced_count: audio
+                .and_then(|audio| json_u32_value(audio, "dropped_or_replaced_count")),
             active_motion: json_str_value(value, "current_command")
                 .map(|command| command == "drive"),
             event_next_seq: json_u32_value(value, "event_next_seq"),
@@ -2028,6 +2065,9 @@ pub enum CockpitRequest {
     PlayFeedback {
         feedback: FeedbackKind,
     },
+    SetAudioSilent {
+        silent: bool,
+    },
     PowerState {
         request: PowerStateRequest,
     },
@@ -2167,6 +2207,7 @@ impl CockpitRequest {
             Self::ClearMotionQueue => "clear_motion_queue",
             Self::DefineChirp { .. } => "define_chirp",
             Self::PlayFeedback { .. } => "play_feedback",
+            Self::SetAudioSilent { .. } => "set_silent",
             Self::PowerState { .. } => "power_state",
             Self::CreatePowerOn => "create_power_on",
             Self::CreatePowerOff => "create_power_off",
@@ -2456,6 +2497,9 @@ impl CockpitRequest {
             Self::PlayFeedback { feedback } => client
                 .play_feedback(*feedback)
                 .map(|()| CockpitResponse::Accepted),
+            Self::SetAudioSilent { silent } => client
+                .set_audio_silent(*silent)
+                .map(|()| CockpitResponse::Accepted),
             Self::PowerState { request } => client
                 .power_state(*request)
                 .map(|()| CockpitResponse::Accepted),
@@ -2504,6 +2548,8 @@ impl CockpitRequest {
                     *kind = "estop".into();
                 } else if kind == "clear_e_stop" {
                     *kind = "clear_estop".into();
+                } else if kind == "set_audio_silent" {
+                    *kind = "set_silent".into();
                 }
             }
         }
@@ -2770,6 +2816,7 @@ impl CockpitRequest {
             Self::PlayFeedback { feedback } => {
                 format!("PLAY_FEEDBACK {seq} {}\n", feedback.as_str())
             }
+            Self::SetAudioSilent { silent } => format!("SET_SILENT {seq} {silent}\n"),
             Self::PowerState { request } => format!("POWER_STATE {seq} {}\n", request.as_str()),
             Self::CreatePowerOn => format!("CREATE_POWER_ON {seq}\n"),
             Self::CreatePowerOff => format!("CREATE_POWER_OFF {seq}\n"),
@@ -2863,6 +2910,7 @@ fn sample_cockpit_capability_verbs() -> Vec<&'static str> {
         "song_play",
         "define_chirp",
         "play_feedback",
+        "set_silent",
         "power_state",
         "create_power_on",
         "create_power_off",
@@ -2885,6 +2933,7 @@ fn optional_cockpit_verbs() -> Vec<&'static str> {
         "reset_motherbrain",
         "careful_mode",
         "escape_motion",
+        "set_silent",
     ]
 }
 
@@ -3185,6 +3234,7 @@ pub enum CockpitEventKind {
     MotherbrainResetRefused,
     ContactWithdrawalStarted,
     ContactWithdrawalCompleted,
+    AudioStateChanged,
     Error,
     Unknown(String),
 }
@@ -3244,6 +3294,7 @@ impl From<&str> for CockpitEventKind {
             "motherbrain_reset_refused" => Self::MotherbrainResetRefused,
             "contact_withdrawal_started" => Self::ContactWithdrawalStarted,
             "contact_withdrawal_completed" => Self::ContactWithdrawalCompleted,
+            "audio_state_changed" => Self::AudioStateChanged,
             "error" => Self::Error,
             other => Self::Unknown(other.to_owned()),
         }
@@ -3305,6 +3356,7 @@ impl CockpitEventKind {
             Self::MotherbrainResetRefused => "motherbrain_reset_refused",
             Self::ContactWithdrawalStarted => "contact_withdrawal_started",
             Self::ContactWithdrawalCompleted => "contact_withdrawal_completed",
+            Self::AudioStateChanged => "audio_state_changed",
             Self::Error => "error",
             Self::Unknown(kind) => kind.as_str(),
         }
@@ -3356,6 +3408,7 @@ pub struct SimCockpit {
     last_contact_withdrawal_at_ms: Option<u32>,
     repeated_contact_count: u8,
     heartbeat_stop_at_ms: Option<u32>,
+    audio_silent: bool,
     odometry_reset_count: u32,
     imu_calibration: u8,
     device_id: String,
@@ -3452,6 +3505,7 @@ impl SimCockpit {
                     "impact_detected",
                     "contact_withdrawal_started",
                     "contact_withdrawal_completed",
+                    "audio_state_changed",
                 ]
                 .into_iter()
                 .map(ToOwned::to_owned)
@@ -3491,6 +3545,7 @@ impl SimCockpit {
             last_contact_withdrawal_at_ms: None,
             repeated_contact_count: 0,
             heartbeat_stop_at_ms: None,
+            audio_silent: false,
             odometry_reset_count: 0,
             imu_calibration: 3,
             device_id: "pete-brainstem-sim".into(),
@@ -3564,6 +3619,7 @@ impl SimCockpit {
         self.armed = false;
         self.interrupt_active_motion();
         self.heartbeat_stop_at_ms = None;
+        self.audio_silent = false;
         self.last_hello = None;
         self.push_event(CockpitEventKind::Boot, 0, 0, 0);
     }
@@ -4131,6 +4187,15 @@ impl Cockpit for SimCockpit {
             CockpitRequest::ClearImuOrientation => self
                 .clear_imu_orientation()
                 .map(|()| CockpitResponse::Accepted),
+            CockpitRequest::SetAudioSilent { silent } => {
+                let id = self.accept_command();
+                if self.audio_silent != silent {
+                    self.audio_silent = silent;
+                    self.push_event(CockpitEventKind::AudioStateChanged, silent as u32, 0, 0);
+                }
+                self.complete_command(id);
+                Ok(CockpitResponse::Accepted)
+            }
             _ => {
                 let id = self.accept_command();
                 self.complete_command(id);
@@ -4326,7 +4391,7 @@ impl Cockpit for SimCockpit {
         self.expire_heartbeat_if_due();
         Ok(CockpitStatus {
             raw: format!(
-                "OK 0 STATUS sim=true now_ms={} uptime_ms={} create_body_packets=1 create_last_body_packet_ms={} armed={} estop={} safety_tripped={} safety_latch_kind={} safety_hazard_generation={} event_next_seq={} active_cmd_vel={} bump_left={} bump_right={} cliff_left={} cliff_front_left={} cliff_front_right={} cliff_right={} wheel_drop={} wall={} virtual_wall={} ir_byte={} buttons={} charging_state={} charge_mah={} capacity_mah={} voltage_mv={} current_ma={} odometry_resets={} odometry_distance_mm={} odometry_heading_mrad={} imu_present=2 imu_health=1 imu_samples=1 imu_age_ms=0 imu_poll_ms=20 imu_yaw_mrad=0 imu_pitch_mrad=0 imu_roll_mrad=0 imu_yaw_rate_mrad_s=0 imu_gyro_x_mrad_s=0 imu_gyro_y_mrad_s=0 imu_gyro_z_mrad_s=0 imu_accel_x_mm_s2=0 imu_accel_y_mm_s2=0 imu_accel_z_mm_s2=9807 imu_accel_mag_mm_s2=9807 imu_tilt_mrad=0 imu_roughness_mm_s2=0 imu_impact_mm_s2=0 imu_motion_consistency=1 imu_calibration={}",
+                "OK 0 STATUS sim=true now_ms={} uptime_ms={} create_body_packets=1 create_last_body_packet_ms={} armed={} estop={} safety_tripped={} safety_latch_kind={} safety_hazard_generation={} event_next_seq={} active_cmd_vel={} bump_left={} bump_right={} cliff_left={} cliff_front_left={} cliff_front_right={} cliff_right={} wheel_drop={} wall={} virtual_wall={} ir_byte={} buttons={} charging_state={} charge_mah={} capacity_mah={} voltage_mv={} current_ma={} odometry_resets={} odometry_distance_mm={} odometry_heading_mrad={} imu_present=2 imu_health=1 imu_samples=1 imu_age_ms=0 imu_poll_ms=20 imu_yaw_mrad=0 imu_pitch_mrad=0 imu_roll_mrad=0 imu_yaw_rate_mrad_s=0 imu_gyro_x_mrad_s=0 imu_gyro_y_mrad_s=0 imu_gyro_z_mrad_s=0 imu_accel_x_mm_s2=0 imu_accel_y_mm_s2=0 imu_accel_z_mm_s2=9807 imu_accel_mag_mm_s2=9807 imu_tilt_mrad=0 imu_roughness_mm_s2=0 imu_impact_mm_s2=0 imu_motion_consistency=1 imu_calibration={} audio_silent={} audio_last_requested=none audio_last_played=none audio_last_playback_ms=0 audio_suppressed=0 audio_dropped=0",
                 self.now_ms,
                 self.now_ms,
                 self.now_ms,
@@ -4361,7 +4426,8 @@ impl Cockpit for SimCockpit {
                 self.odometry_reset_count,
                 self.odometry_distance_mm,
                 self.odometry_heading_mrad,
-                self.imu_calibration
+                self.imu_calibration,
+                self.audio_silent
             ),
         })
     }
@@ -8106,6 +8172,29 @@ mod tests {
     }
 
     #[test]
+    fn simulator_audio_state_round_trips_through_status_and_events() {
+        let mut sim = SimCockpit::new().with_unscoped_bench_mode();
+        assert_eq!(
+            sim.execute(CockpitRequest::SetAudioSilent { silent: true })
+                .unwrap(),
+            CockpitResponse::Accepted
+        );
+        let status = sim.get_status().unwrap().summary();
+        assert_eq!(status.audio_silent, Some(true));
+        let events = sim.get_events_since(0).unwrap();
+        assert!(events
+            .events
+            .iter()
+            .any(|event| { event.kind == CockpitEventKind::AudioStateChanged && event.a == 1 }));
+        sim.execute(CockpitRequest::SetAudioSilent { silent: false })
+            .unwrap();
+        assert_eq!(
+            sim.get_status().unwrap().summary().audio_silent,
+            Some(false)
+        );
+    }
+
+    #[test]
     fn cockpit_request_covers_public_firmware_verbs_from_body_toml() {
         let cockpit_verbs: BTreeSet<_> = sample_cockpit_requests()
             .into_iter()
@@ -8285,7 +8374,7 @@ mod tests {
         let status = parse_json_cockpit_response(
             1,
             &CockpitRequest::GetStatus,
-            r#"{"type":"status","current_runtime_state":"idle","oi_mode":"safe","estop_latched":false,"safety_tripped":true,"safety_latch_kind":"tilt","event_next_seq":8,"create_sensors":{"charging_sources":2,"charging_indicator":"on"}}"#,
+            r#"{"type":"status","current_runtime_state":"idle","oi_mode":"safe","estop_latched":false,"safety_tripped":true,"safety_latch_kind":"tilt","event_next_seq":8,"audio_silent":true,"audio":{"silent":true,"last_requested_cue":"cliff","last_played_cue":"authority_acquired","last_playback_timestamp_ms":700,"suppressed_by_silent_count":2,"dropped_or_replaced_count":3},"create_sensors":{"charging_sources":2,"charging_indicator":"on"}}"#,
         )
         .unwrap();
         let CockpitResponse::Status(status) = status else {
@@ -8298,6 +8387,15 @@ mod tests {
         assert_eq!(summary.safety_tripped, Some(true));
         assert_eq!(summary.safety_latch_kind, Some(SafetyLatchKind::Tilt));
         assert_eq!(summary.event_next_seq, Some(8));
+        assert_eq!(summary.audio_silent, Some(true));
+        assert_eq!(summary.audio_last_requested_cue.as_deref(), Some("cliff"));
+        assert_eq!(
+            summary.audio_last_played_cue.as_deref(),
+            Some("authority_acquired")
+        );
+        assert_eq!(summary.audio_last_playback_timestamp_ms, Some(700));
+        assert_eq!(summary.audio_suppressed_by_silent_count, Some(2));
+        assert_eq!(summary.audio_dropped_or_replaced_count, Some(3));
         assert_eq!(summary.battery.charging_indicator, Some(true));
         assert!(summary.battery.home_base());
 
@@ -9109,6 +9207,7 @@ mod tests {
             ("song_play", "song_play", "SONG_PLAY"),
             ("define_chirp", "define_chirp", "DEFINE_CHIRP"),
             ("play_feedback", "play_feedback", "PLAY_FEEDBACK"),
+            ("set_silent", "set_silent", "SET_SILENT"),
             ("power_state", "power_state", "POWER_STATE"),
             ("create_power_on", "create_power_on", "CREATE_POWER_ON"),
             ("create_power_off", "create_power_off", "CREATE_POWER_OFF"),
@@ -9371,6 +9470,7 @@ mod tests {
             "play_feedback" => CockpitRequest::PlayFeedback {
                 feedback: FeedbackKind::Ok,
             },
+            "set_silent" => CockpitRequest::SetAudioSilent { silent: true },
             "power_state" => CockpitRequest::PowerState {
                 request: PowerStateRequest::Wake,
             },

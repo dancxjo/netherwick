@@ -46,6 +46,11 @@ enum Command {
         since: Option<u32>,
     },
     Stop,
+    /// Configure Brainstem-owned auditory annunciation.
+    Audio {
+        #[command(subcommand)]
+        mode: AudioCommand,
+    },
     /// Renew a bounded velocity primitive while live safety telemetry stays healthy.
     Drive {
         #[arg(long, allow_hyphen_values = true)]
@@ -70,6 +75,12 @@ enum Command {
         #[arg(long)]
         careful: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum AudioCommand {
+    Silent,
+    Audible,
 }
 
 fn main() -> Result<()> {
@@ -98,6 +109,17 @@ fn main() -> Result<()> {
         Command::Stop => {
             accepted(session.execute(CockpitRequest::Stop)?)?;
             println!("stopped");
+            Ok(())
+        }
+        Command::Audio { mode } => {
+            let silent = matches!(mode, AudioCommand::Silent);
+            session.acquire_control(ControlAuthority::OperatorDebug, 10_000)?;
+            accepted(session.execute(CockpitRequest::SetAudioSilent { silent })?)?;
+            let status = read_status(&mut session)?;
+            if status.audio_silent != Some(silent) {
+                return Err("Brainstem did not confirm the requested audio state".into());
+            }
+            println!("audio {}", if silent { "silent" } else { "audible" });
             Ok(())
         }
         Command::Drive {
@@ -332,7 +354,7 @@ fn print_json(value: &impl serde::Serialize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{operator_control_hello, Cli, Command};
+    use super::{operator_control_hello, AudioCommand, Cli, Command};
     use clap::Parser;
     use pete_cockpit::SessionPurpose;
 
@@ -357,5 +379,20 @@ mod tests {
             operator_control_hello().session_purpose,
             SessionPurpose::Control
         );
+    }
+
+    #[test]
+    fn audio_cli_accepts_silent_and_audible_modes() {
+        for (mode, silent) in [("silent", true), ("audible", false)] {
+            let cli = Cli::try_parse_from(["pete-cockpit", "audio", mode]).unwrap();
+            assert!(
+                matches!(
+                    cli.command,
+                    Command::Audio {
+                        mode: AudioCommand::Silent
+                    }
+                ) == silent
+            );
+        }
     }
 }

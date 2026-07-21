@@ -1,6 +1,7 @@
 #![cfg_attr(not(any(test, feature = "rpi5")), no_std)]
 
 pub mod arch;
+mod audio;
 mod body;
 mod build_identity;
 mod capabilities;

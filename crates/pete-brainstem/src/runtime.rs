@@ -1,6 +1,10 @@
 use heapless::Deque;
 use pete_cockpit_protocol::{CONTACT_WITHDRAWAL_DURATION_MS, CONTACT_WITHDRAWAL_SPEED_MM_S};
 
+use crate::audio::{
+    cue_tones, tone_duration_ms, AudioAnnunciator, AuditoryCue, CueRequestResult,
+    AUTOMATIC_CUE_SLOT,
+};
 use crate::body;
 use crate::commands::{
     BrainstemCommand, FeedbackKind, PowerStateRequest, RuntimeCommand, SafetyLatchKind, SongTone,
@@ -23,6 +27,7 @@ const SENSOR_PROBE_PERIOD_MS: u32 = 100;
 const FULL_MODE_REFRESH_PERIOD_MS: u32 = 1_000;
 const HEALTHY_LIGHT_STEP_MS: u32 = 100;
 const LOW_BATTERY_PERCENT: u32 = 20;
+const LOW_BATTERY_AUDIO_CLEAR_PERCENT: u32 = 25;
 const WAKE_PROBE_RESPONSE_BYTES_REQUIRED: u8 = 1;
 const CREATE_AXLE_TRACK_MM: i32 = 258;
 const FEEDBACK_SLOT_BASE: u8 = 10;
@@ -217,6 +222,8 @@ where
     charging_interlock_latched: bool,
     chirps: [[SongTone; MAX_SONG_TONES]; FEEDBACK_KIND_COUNT],
     chirp_counts: [u8; FEEDBACK_KIND_COUNT],
+    audio: AudioAnnunciator,
+    song_durations_ms: [u32; 16],
     error_blink_next_ms: u32,
     error_blink_on: bool,
     error_blink_count: u8,
@@ -240,6 +247,17 @@ where
     repeated_contact_count: u8,
     last_observed_uart_rx_packets: u32,
     last_create_packet_at_ms: Option<u32>,
+    low_battery_active: bool,
+    charging_active: bool,
+    imu_recovery_since_ms: Option<u32>,
+    motion_inconsistency_cooldown_until_ms: u32,
+    docking_active: bool,
+    last_dock_ir: u8,
+    restart_create_pending: bool,
+    create_full_ready: bool,
+    ever_create_full_ready: bool,
+    imu_fault_active: bool,
+    last_motion_inconsistent: bool,
 }
 
 impl<H> Runtime<H>
@@ -254,6 +272,7 @@ where
         status::set_runtime_state(RuntimeState::Booting);
         status::set_body_state(BodyState::NotStarted);
         status::set_careful_mode_until(None);
+        status::set_audio_silent(false);
         Self {
             hardware,
             events,
@@ -282,6 +301,8 @@ where
             charging_interlock_latched: false,
             chirps: [[SongTone::default(); MAX_SONG_TONES]; FEEDBACK_KIND_COUNT],
             chirp_counts: [0; FEEDBACK_KIND_COUNT],
+            audio: AudioAnnunciator::new(),
+            song_durations_ms: [0; 16],
             error_blink_next_ms: 0,
             error_blink_on: false,
             error_blink_count: 0,
@@ -305,6 +326,17 @@ where
             repeated_contact_count: 0,
             last_observed_uart_rx_packets: observed_uart_rx_packets,
             last_create_packet_at_ms: None,
+            low_battery_active: false,
+            charging_active: false,
+            imu_recovery_since_ms: None,
+            motion_inconsistency_cooldown_until_ms: 0,
+            docking_active: false,
+            last_dock_ir: 0,
+            restart_create_pending: false,
+            create_full_ready: false,
+            ever_create_full_ready: false,
+            imu_fault_active: false,
+            last_motion_inconsistent: false,
         }
     }
 
@@ -348,6 +380,7 @@ where
         self.hardware.feed_watchdog();
         self.poll_charging_indicator();
         self.poll_imu();
+        self.observe_audio_transitions();
         if let Err(error) = self.poll_sensor_stream() {
             self.enter_error(error);
             return;
@@ -374,6 +407,7 @@ where
             return;
         }
         if status::take_expired_authority(self.now_ms()) {
+            self.request_audio(AuditoryCue::AuthorityLost);
             self.heartbeat_stop_at_ms = None;
             self.cancel_careful_mode();
             if self.active_contact_withdrawal.is_none() {
@@ -402,6 +436,7 @@ where
             RuntimeMode::Idle => self.idle_tick(),
             RuntimeMode::Error => self.error_tick(),
         }
+        self.poll_audio();
     }
 
     fn poll(&mut self) {
@@ -411,6 +446,7 @@ where
         self.create_uart.poll(&mut self.hardware, &mut self.events);
         let now_ms = self.now_ms();
         let snapshot = status::snapshot(now_ms);
+        let was_create_responsive = self.create_responsive;
         if snapshot.uart_rx_packets != self.last_observed_uart_rx_packets {
             self.last_observed_uart_rx_packets = snapshot.uart_rx_packets;
             self.last_create_packet_at_ms = Some(now_ms);
@@ -430,6 +466,10 @@ where
             self.cancel_careful_mode();
             status::set_oi_mode_unknown();
         }
+        if was_create_responsive && !self.create_responsive {
+            self.create_full_ready = false;
+            self.request_audio(AuditoryCue::CreateError);
+        }
         self.poll_control_command();
     }
 
@@ -437,10 +477,12 @@ where
         let Some(generation) = status::pending_authority_transition() else {
             return;
         };
-        if status::pending_authority_continues_owner(self.now_ms()) {
+        let now_ms = self.now_ms();
+        if status::pending_authority_continues_owner(now_ms) {
             status::acknowledge_authority_transition(generation);
             return;
         }
+        let replacing = status::has_active_authority(now_ms);
         self.heartbeat_stop_at_ms = None;
         self.cancel_careful_mode();
         if self.active_contact_withdrawal.is_none() {
@@ -453,14 +495,11 @@ where
             status::set_body_state(BodyState::Idle);
         }
         status::acknowledge_authority_transition(generation);
-        if self.active_contact_withdrawal.is_none() {
-            let _ = self.commands.push_back(QueuedCommand::new(
-                0,
-                RuntimeCommand::PlayFeedback {
-                    kind: FeedbackKind::Ok,
-                },
-            ));
-        }
+        self.request_audio(if replacing {
+            AuditoryCue::AuthorityReplaced
+        } else {
+            AuditoryCue::AuthorityAcquired
+        });
     }
 
     fn queue_create_acquisition(&mut self, command_id: u32) {
@@ -613,6 +652,7 @@ where
 
         match command {
             BrainstemCommand::Stop | BrainstemCommand::EStop => {
+                self.docking_active = false;
                 self.interrupt_active_command();
                 self.commands.clear();
                 self.active = ActiveAction::None;
@@ -651,6 +691,7 @@ where
                 self.mode = RuntimeMode::Running;
             }
             BrainstemCommand::RestartCreate => {
+                self.restart_create_pending = true;
                 self.interrupt_active_command();
                 self.commands.clear();
                 self.active = ActiveAction::None;
@@ -767,6 +808,7 @@ where
             };
             self.remember_motherbrain_reset(record);
             Self::replay_motherbrain_reset_outcome(record);
+            self.request_audio(AuditoryCue::ServiceFailure);
             return;
         }
 
@@ -798,6 +840,7 @@ where
             };
             self.remember_motherbrain_reset(record);
             Self::replay_motherbrain_reset_outcome(record);
+            self.request_audio(AuditoryCue::ServiceComplete);
         }
     }
 
@@ -938,12 +981,14 @@ where
                 self.estop_latched = true;
                 status::mark_estop_latched();
                 status::mark_safety_tripped(status::SafetyEventKind::EStop);
+                self.request_audio(AuditoryCue::EStop);
                 self.active = ActiveAction::None;
             }
             RuntimeCommand::ClearEStop => {
                 self.estop_latched = false;
                 status::mark_estop_cleared();
                 status::mark_safety_cleared(status::SafetyEventKind::EStop);
+                self.request_audio(AuditoryCue::SafetyClear);
             }
             RuntimeCommand::WakeCreate => {
                 self.create_responsive = false;
@@ -1127,35 +1172,64 @@ where
                 let index = feedback_index(kind);
                 self.chirps[index] = tones;
                 self.chirp_counts[index] = tone_count.min(MAX_SONG_TONES as u8);
-                self.ensure_create_responsive()?;
-                self.create_uart.define_song(
-                    &mut self.hardware,
-                    &mut self.events,
-                    feedback_slot(kind),
-                    &self.chirps[index],
-                    self.chirp_counts[index],
-                )?;
+                self.song_durations_ms[feedback_slot(kind) as usize] =
+                    tone_duration_ms(&tones, self.chirp_counts[index]);
+                if self.create_responsive
+                    && self
+                        .create_uart
+                        .define_song(
+                            &mut self.hardware,
+                            &mut self.events,
+                            feedback_slot(kind),
+                            &self.chirps[index],
+                            self.chirp_counts[index],
+                        )
+                        .is_err()
+                {
+                    status::increment_audio_dropped_or_replaced(1);
+                }
             }
             RuntimeCommand::PlayFeedback { kind } => {
+                if self.audio.silent() {
+                    status::increment_audio_suppressed_by_silent();
+                    self.active = ActiveAction::None;
+                    self.complete_active_command();
+                    return Ok(());
+                }
                 if !self.create_responsive {
                     self.active = ActiveAction::None;
                     self.complete_active_command();
                     return Ok(());
                 }
-                self.ensure_create_responsive()?;
                 let (tones, tone_count) = self.feedback_tones(kind);
-                self.create_uart.define_song(
-                    &mut self.hardware,
-                    &mut self.events,
-                    feedback_slot(kind),
-                    &tones,
-                    tone_count,
-                )?;
-                self.create_uart.play_song(
-                    &mut self.hardware,
-                    &mut self.events,
-                    feedback_slot(kind),
-                )?;
+                if !self.audio.playback_available(now_ms) {
+                    status::increment_audio_dropped_or_replaced(1);
+                } else if self
+                    .create_uart
+                    .define_song(
+                        &mut self.hardware,
+                        &mut self.events,
+                        feedback_slot(kind),
+                        &tones,
+                        tone_count,
+                    )
+                    .and_then(|()| {
+                        self.create_uart.play_song(
+                            &mut self.hardware,
+                            &mut self.events,
+                            feedback_slot(kind),
+                        )
+                    })
+                    .is_err()
+                {
+                    status::increment_audio_dropped_or_replaced(1);
+                } else {
+                    self.audio
+                        .mark_manual_played(now_ms, tone_duration_ms(&tones, tone_count));
+                }
+            }
+            RuntimeCommand::SetAudioSilent { silent } => {
+                self.set_audio_silent(silent);
             }
             RuntimeCommand::CalibrateTurn {
                 angular_mrad_s,
@@ -1179,28 +1253,50 @@ where
                 status::clear_imu_orientation_calibration();
             }
             RuntimeCommand::SongPlay { id } => {
-                self.ensure_create_responsive()?;
-                self.create_uart
-                    .play_song(&mut self.hardware, &mut self.events, id)?;
+                if self.audio.silent() {
+                    status::increment_audio_suppressed_by_silent();
+                } else if !self.audio.playback_available(now_ms) {
+                    status::increment_audio_dropped_or_replaced(1);
+                } else if self.create_responsive
+                    && self
+                        .create_uart
+                        .play_song(&mut self.hardware, &mut self.events, id)
+                        .is_err()
+                {
+                    status::increment_audio_dropped_or_replaced(1);
+                } else if self.create_responsive {
+                    let duration_ms = self
+                        .song_durations_ms
+                        .get(id as usize)
+                        .copied()
+                        .unwrap_or(0)
+                        .max(1_000);
+                    self.audio.mark_manual_played(now_ms, duration_ms);
+                }
             }
             RuntimeCommand::SongDefine {
                 id,
                 tones,
                 tone_count,
             } => {
-                self.ensure_create_responsive()?;
-                self.create_uart.define_song(
-                    &mut self.hardware,
-                    &mut self.events,
-                    id,
-                    &tones,
-                    tone_count,
-                )?;
+                if let Some(duration) = self.song_durations_ms.get_mut(id as usize) {
+                    *duration = tone_duration_ms(&tones, tone_count);
+                }
+                if self.create_responsive
+                    && self
+                        .create_uart
+                        .define_song(&mut self.hardware, &mut self.events, id, &tones, tone_count)
+                        .is_err()
+                {
+                    status::increment_audio_dropped_or_replaced(1);
+                }
             }
             RuntimeCommand::Dock => {
                 self.ensure_create_responsive()?;
                 self.create_uart
                     .seek_dock(&mut self.hardware, &mut self.events)?;
+                self.docking_active = true;
+                self.last_dock_ir = status::snapshot(now_ms).create_sensor_ir_byte;
             }
             RuntimeCommand::SetLights {
                 led_bits,
@@ -1596,6 +1692,85 @@ where
         status::mark_create_charging_indicator(active);
     }
 
+    fn observe_audio_transitions(&mut self) {
+        const IMU_RECOVERY_STABLE_MS: u32 = 500;
+        const MOTION_INCONSISTENCY_COOLDOWN_MS: u32 = 5_000;
+
+        let now_ms = self.now_ms();
+        let snapshot = status::snapshot(now_ms);
+        let low_battery_threshold = if self.low_battery_active {
+            LOW_BATTERY_AUDIO_CLEAR_PERCENT
+        } else {
+            LOW_BATTERY_PERCENT
+        };
+        let low_battery = snapshot.create_sensor_capacity_mah > 0
+            && u32::from(snapshot.create_sensor_charge_mah) * 100
+                <= u32::from(snapshot.create_sensor_capacity_mah) * low_battery_threshold;
+        if low_battery && !self.low_battery_active {
+            self.request_audio(AuditoryCue::LowBattery);
+        }
+        self.low_battery_active = low_battery;
+
+        let charging = status::charging_interlock_active(&snapshot)
+            || snapshot.create_sensor_charging_sources & 0b10 != 0;
+        if charging && !self.charging_active {
+            self.request_audio(AuditoryCue::DockContact);
+            self.docking_active = false;
+        }
+        self.charging_active = charging;
+
+        let imu_fault = matches!(
+            snapshot.imu_health,
+            x if x == status::ImuHealthCode::Fault as u8
+                || x == status::ImuHealthCode::Absent as u8
+        );
+        if imu_fault && !self.imu_fault_active {
+            self.request_audio(AuditoryCue::ImuFault);
+            self.imu_fault_active = true;
+            self.imu_recovery_since_ms = None;
+        } else if self.imu_fault_active && snapshot.imu_health == status::ImuHealthCode::Ok as u8 {
+            let recovery_since = *self.imu_recovery_since_ms.get_or_insert(now_ms);
+            if now_ms.wrapping_sub(recovery_since) >= IMU_RECOVERY_STABLE_MS {
+                self.request_audio(AuditoryCue::Recovery);
+                self.imu_fault_active = false;
+                self.imu_recovery_since_ms = None;
+            }
+        } else if self.imu_fault_active {
+            self.imu_recovery_since_ms = None;
+        }
+        let inconsistent =
+            snapshot.imu_motion_consistency == status::MotionConsistencyCode::Inconsistent as u8;
+        if inconsistent
+            && !self.last_motion_inconsistent
+            && time_reached(now_ms, self.motion_inconsistency_cooldown_until_ms)
+        {
+            self.request_audio(AuditoryCue::MotionInconsistency);
+            self.motion_inconsistency_cooldown_until_ms =
+                now_ms.wrapping_add(MOTION_INCONSISTENCY_COOLDOWN_MS);
+        }
+        self.last_motion_inconsistent = inconsistent;
+
+        if self.docking_active && snapshot.create_sensor_ir_byte != 0 && self.last_dock_ir == 0 {
+            self.request_audio(AuditoryCue::DockSeen);
+        }
+        self.last_dock_ir = snapshot.create_sensor_ir_byte;
+
+        let full_ready = self.create_responsive && snapshot.oi_mode == 3;
+        if full_ready && !self.create_full_ready {
+            let cue = if self.restart_create_pending {
+                self.restart_create_pending = false;
+                AuditoryCue::ServiceComplete
+            } else if self.ever_create_full_ready {
+                AuditoryCue::Recovery
+            } else {
+                AuditoryCue::Armed
+            };
+            self.request_audio(cue);
+            self.ever_create_full_ready = true;
+        }
+        self.create_full_ready = full_ready;
+    }
+
     fn enforce_safety_policy(&mut self) -> Result<(), BrainstemError> {
         let now_ms = self.now_ms();
         let snapshot = status::snapshot(now_ms);
@@ -1660,7 +1835,7 @@ where
             if let Some(kind) = dominating_hazard {
                 status::mark_safety_tripped(kind);
                 self.apply_safety_response(kind, SafetyResponse::Stop)?;
-                let _ = self.play_feedback_now(FeedbackKind::Danger);
+                self.request_audio(safety_auditory_cue(kind));
                 self.update_safety_edges(bump, cliff, wheel_drop);
                 return Ok(());
             }
@@ -1749,7 +1924,7 @@ where
                     Some(status::SafetyEventKind::WheelDrop),
                     true,
                 );
-                let _ = self.play_feedback_now(FeedbackKind::Danger);
+                self.request_audio(AuditoryCue::WheelDrop);
             }
             return Ok(());
         }
@@ -1788,7 +1963,7 @@ where
             (status::SafetyEventKind::Bump, SafetyResponse::Stop)
         };
         self.apply_safety_response(kind, response)?;
-        let _ = self.play_feedback_now(FeedbackKind::Danger);
+        self.request_audio(safety_auditory_cue(kind));
         Ok(())
     }
 
@@ -1857,6 +2032,7 @@ where
         // incident. Reconcile only those two contact latches once packet 34
         // proves the source; every stronger latch remains untouched.
         status::mark_safety_cleared(kind);
+        self.request_audio(AuditoryCue::SafetyClear);
         self.safety_latched = false;
         self.safety_latch_kind = None;
     }
@@ -1895,6 +2071,7 @@ where
             return;
         }
         status::mark_safety_cleared(kind);
+        self.request_audio(AuditoryCue::SafetyClear);
         if kind == status::SafetyEventKind::WheelDrop {
             status::mark_wheel_drop_cleared();
         }
@@ -1928,6 +2105,7 @@ where
     fn clear_sensor_gates_for_careful(&mut self) {
         if let Some(kind) = self.safety_latch_kind.take() {
             status::mark_safety_cleared(kind);
+            self.request_audio(AuditoryCue::SafetyClear);
             if kind == status::SafetyEventKind::WheelDrop {
                 status::mark_wheel_drop_cleared();
             }
@@ -1997,18 +2175,51 @@ where
         default_feedback_tones(kind)
     }
 
-    fn play_feedback_now(&mut self, kind: FeedbackKind) -> Result<(), BrainstemError> {
-        self.ensure_create_responsive()?;
-        let (tones, tone_count) = self.feedback_tones(kind);
-        self.create_uart.define_song(
-            &mut self.hardware,
-            &mut self.events,
-            feedback_slot(kind),
-            &tones,
-            tone_count,
-        )?;
-        self.create_uart
-            .play_song(&mut self.hardware, &mut self.events, feedback_slot(kind))
+    fn set_audio_silent(&mut self, silent: bool) {
+        let dropped = self.audio.set_silent(silent);
+        status::increment_audio_dropped_or_replaced(dropped);
+        status::set_audio_silent(silent);
+    }
+
+    fn request_audio(&mut self, cue: AuditoryCue) {
+        let now_ms = self.now_ms();
+        status::mark_audio_cue_requested(cue.code());
+        match self.audio.request(cue, now_ms) {
+            CueRequestResult::Suppressed => status::increment_audio_suppressed_by_silent(),
+            CueRequestResult::Dropped => status::increment_audio_dropped_or_replaced(1),
+            CueRequestResult::Ready | CueRequestResult::Queued => {}
+        }
+    }
+
+    fn poll_audio(&mut self) {
+        let now_ms = self.now_ms();
+        if !self.create_responsive {
+            return;
+        }
+        let Some(cue) = self.audio.take_ready(now_ms) else {
+            return;
+        };
+        let (tones, tone_count) = cue_tones(cue);
+        let played = self
+            .create_uart
+            .define_song(
+                &mut self.hardware,
+                &mut self.events,
+                AUTOMATIC_CUE_SLOT,
+                &tones,
+                tone_count,
+            )
+            .and_then(|()| {
+                self.create_uart
+                    .play_song(&mut self.hardware, &mut self.events, AUTOMATIC_CUE_SLOT)
+            })
+            .is_ok();
+        if played {
+            self.audio.mark_played(cue, now_ms);
+            status::mark_audio_cue_played(cue.code(), now_ms);
+        } else {
+            status::increment_audio_dropped_or_replaced(1);
+        }
     }
 
     fn start_drive_direct(
@@ -2117,6 +2328,7 @@ where
             status::revoke_authority();
             status::mark_heartbeat_expired();
             status::mark_safety_tripped(status::SafetyEventKind::Heartbeat);
+            self.request_audio(AuditoryCue::HeartbeatLost);
             if self.active_contact_withdrawal.is_none() {
                 self.interrupt_active_command();
                 self.commands.clear();
@@ -2160,7 +2372,7 @@ where
         self.error_blink_count = 0;
         self.error_blink_on = false;
         if self.create_responsive {
-            let _ = self.play_feedback_now(FeedbackKind::Error);
+            self.request_audio(AuditoryCue::RuntimeError);
         }
     }
 
@@ -2298,6 +2510,13 @@ where
             displacement,
             now_ms.wrapping_sub(active.started_at_ms),
         );
+        if matches!(
+            outcome,
+            status::ContactWithdrawalOutcome::SafetyPreempted
+                | status::ContactWithdrawalOutcome::Failed
+        ) {
+            self.request_audio(AuditoryCue::ServiceFailure);
+        }
     }
 
     fn update_safety_edges(&mut self, bump: bool, cliff: bool, wheel_drop: bool) {
@@ -2332,6 +2551,19 @@ fn low_battery_and_charging(snapshot: &status::BrainstemStatus) -> bool {
 fn create_charging_active(snapshot: &status::BrainstemStatus) -> bool {
     snapshot.create_charging_indicator_state == 2
         || matches!(snapshot.create_sensor_charging_state, 1..=3)
+}
+
+fn safety_auditory_cue(kind: status::SafetyEventKind) -> AuditoryCue {
+    match kind {
+        status::SafetyEventKind::EStop => AuditoryCue::EStop,
+        status::SafetyEventKind::Bump => AuditoryCue::BumpContact,
+        status::SafetyEventKind::Cliff => AuditoryCue::Cliff,
+        status::SafetyEventKind::WheelDrop => AuditoryCue::WheelDrop,
+        status::SafetyEventKind::Heartbeat => AuditoryCue::HeartbeatLost,
+        status::SafetyEventKind::Tilt => AuditoryCue::Tilt,
+        status::SafetyEventKind::Impact => AuditoryCue::Impact,
+        status::SafetyEventKind::Charging => AuditoryCue::DockContact,
+    }
 }
 
 fn command_preempts_contact_withdrawal(command: BrainstemCommand) -> bool {
@@ -2433,6 +2665,9 @@ fn runtime_command_from_forebrain(command: BrainstemCommand) -> Option<RuntimeCo
             tone_count,
         }),
         BrainstemCommand::PlayFeedback { kind, .. } => Some(RuntimeCommand::PlayFeedback { kind }),
+        BrainstemCommand::SetAudioSilent { silent, .. } => {
+            Some(RuntimeCommand::SetAudioSilent { silent })
+        }
         BrainstemCommand::PowerState { request, .. } => match request {
             PowerStateRequest::Wake => Some(RuntimeCommand::WakeCreate),
             PowerStateRequest::Sleep => Some(RuntimeCommand::SleepCreate),
@@ -2574,13 +2809,13 @@ fn feedback_slot(kind: FeedbackKind) -> u8 {
 fn default_feedback_tones(kind: FeedbackKind) -> ([SongTone; MAX_SONG_TONES], u8) {
     let mut tones = [SongTone::default(); MAX_SONG_TONES];
     let notes: &[(u8, u8)] = match kind {
-        FeedbackKind::Ok => &[(76, 6), (84, 10)],
-        FeedbackKind::Error => &[(45, 12), (40, 16)],
+        FeedbackKind::Ok => &[(60, 8), (64, 8), (67, 12)],
+        FeedbackKind::Error => &[(64, 8), (62, 8), (60, 12)],
         // Solresol "fasolsi": prepare / make ready.
         FeedbackKind::Armed => &[(65, 8), (67, 8), (71, 12)],
         FeedbackKind::LostTarget => &[(55, 8), (52, 8), (48, 12)],
         FeedbackKind::DockSeen => &[(67, 8), (71, 8), (74, 12)],
-        FeedbackKind::Danger => &[(40, 6), (40, 6), (40, 12)],
+        FeedbackKind::Danger => &[(48, 6), (48, 6), (48, 12)],
     };
     for (i, (note, duration_64ths)) in notes.iter().enumerate() {
         tones[i] = SongTone {
@@ -2608,14 +2843,28 @@ mod tests {
         }
     }
 
+    struct AudioStatusCleanup;
+
+    impl Drop for AudioStatusCleanup {
+        fn drop(&mut self) {
+            status::reset_audio_observability();
+            status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
+            status::mark_imu_health(crate::drivers::imu::ImuHealth::Unknown);
+            status::revoke_authority();
+            status::set_oi_mode_unknown();
+            status::reset_event_log_for_test();
+        }
+    }
+
     struct FakeHardware {
         now_us: u32,
-        writes: heapless::Vec<u8, 32>,
+        writes: heapless::Vec<u8, 256>,
         imu_sample: Option<ImuSample>,
         imu_health: Option<crate::drivers::imu::ImuHealth>,
         reset_levels: heapless::Vec<bool, 8>,
         power_toggle_levels: heapless::Vec<bool, 8>,
         charging_indicator: Option<bool>,
+        fail_writes: bool,
     }
 
     impl FakeHardware {
@@ -2628,6 +2877,7 @@ mod tests {
                 reset_levels: heapless::Vec::new(),
                 power_toggle_levels: heapless::Vec::new(),
                 charging_indicator: None,
+                fail_writes: false,
             }
         }
 
@@ -2640,6 +2890,7 @@ mod tests {
                 reset_levels: heapless::Vec::new(),
                 power_toggle_levels: heapless::Vec::new(),
                 charging_indicator: None,
+                fail_writes: false,
             }
         }
     }
@@ -2673,6 +2924,9 @@ mod tests {
         }
 
         fn write_byte(&mut self, byte: u8) -> Result<(), ()> {
+            if self.fail_writes {
+                return Err(());
+            }
             let _ = self.writes.push(byte);
             Ok(())
         }
@@ -4516,5 +4770,239 @@ mod tests {
             command_id: 0,
         });
         assert!(runtime.hardware.reset_levels.is_empty());
+    }
+
+    #[test]
+    fn battery_charging_and_imu_cues_are_edge_based() {
+        let _guard = status::status_test_guard();
+        let _cleanup = AudioStatusCleanup;
+        status::reset_audio_observability();
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                charge_mah: 1_000,
+                capacity_mah: 2_000,
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        status::mark_imu_health(crate::drivers::imu::ImuHealth::Ok);
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.observe_audio_transitions();
+        assert_eq!(status::snapshot(1_000).audio_last_requested_cue, 0);
+
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                charge_mah: 200,
+                capacity_mah: 2_000,
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        runtime.observe_audio_transitions();
+        assert_eq!(
+            status::snapshot(1_000).audio_last_requested_cue,
+            AuditoryCue::LowBattery.code()
+        );
+        status::reset_audio_observability();
+        runtime.observe_audio_transitions();
+        assert_eq!(status::snapshot(1_000).audio_last_requested_cue, 0);
+
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                charge_mah: 420,
+                capacity_mah: 2_000,
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        runtime.observe_audio_transitions();
+        assert_eq!(status::snapshot(1_000).audio_last_requested_cue, 0);
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                charge_mah: 520,
+                capacity_mah: 2_000,
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        runtime.observe_audio_transitions();
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                charge_mah: 400,
+                capacity_mah: 2_000,
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        runtime.observe_audio_transitions();
+        assert_eq!(
+            status::snapshot(1_000).audio_last_requested_cue,
+            AuditoryCue::LowBattery.code()
+        );
+
+        status::mark_create_sensor_packet(
+            0,
+            crate::events::CreateSensorPacket {
+                charging_state: 2,
+                charge_mah: 200,
+                capacity_mah: 2_000,
+                ..crate::events::CreateSensorPacket::default()
+            },
+        );
+        runtime.observe_audio_transitions();
+        assert_eq!(
+            status::snapshot(1_000).audio_last_requested_cue,
+            AuditoryCue::DockContact.code()
+        );
+
+        status::reset_audio_observability();
+        status::mark_imu_health(crate::drivers::imu::ImuHealth::Fault);
+        runtime.observe_audio_transitions();
+        assert_eq!(
+            status::snapshot(1_000).audio_last_requested_cue,
+            AuditoryCue::ImuFault.code()
+        );
+        status::mark_imu_health(crate::drivers::imu::ImuHealth::Ok);
+        runtime.observe_audio_transitions();
+        status::reset_audio_observability();
+        runtime.hardware.now_us += 500_000;
+        runtime.observe_audio_transitions();
+        assert_eq!(
+            status::snapshot(1_500).audio_last_requested_cue,
+            AuditoryCue::Recovery.code()
+        );
+    }
+
+    #[test]
+    fn heartbeat_and_authority_cues_deduplicate_real_transitions() {
+        let _guard = status::status_test_guard();
+        let _cleanup = AudioStatusCleanup;
+        status::revoke_authority();
+        status::reset_audio_observability();
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.heartbeat_stop_at_ms = Some(900);
+        assert!(runtime.enforce_heartbeat_stop().is_ok());
+        assert_eq!(
+            status::snapshot(1_000).audio_last_requested_cue,
+            AuditoryCue::HeartbeatLost.code()
+        );
+        status::reset_audio_observability();
+        assert!(runtime.enforce_heartbeat_stop().is_ok());
+        assert_eq!(status::snapshot(1_000).audio_last_requested_cue, 0);
+
+        status::request_authority_transition(71, 11, 21, 10_000);
+        runtime.poll_authority_transition();
+        assert_eq!(
+            status::snapshot(1_000).audio_last_requested_cue,
+            AuditoryCue::AuthorityAcquired.code()
+        );
+        status::reset_audio_observability();
+        status::request_authority_transition(72, 12, 22, 10_000);
+        runtime.poll_authority_transition();
+        assert_eq!(
+            status::snapshot(1_000).audio_last_requested_cue,
+            AuditoryCue::AuthorityReplaced.code()
+        );
+        status::revoke_authority();
+    }
+
+    #[test]
+    fn held_safety_sensor_requests_only_one_cue() {
+        let _guard = status::status_test_guard();
+        let _cleanup = AudioStatusCleanup;
+        status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
+        status::reset_audio_observability();
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        assert!(runtime.enforce_safety_policy().is_ok());
+
+        let cliff = crate::events::CreateSensorPacket {
+            flags: crate::events::CreateSensorFlags {
+                cliff_front_left: true,
+                ..crate::events::CreateSensorFlags::default()
+            },
+            ..crate::events::CreateSensorPacket::default()
+        };
+        status::mark_create_sensor_packet(0, cliff);
+        assert!(runtime.enforce_safety_policy().is_ok());
+        assert_eq!(
+            status::snapshot(1_000).audio_last_requested_cue,
+            AuditoryCue::Cliff.code()
+        );
+
+        status::reset_audio_observability();
+        status::mark_create_sensor_packet(0, cliff);
+        assert!(runtime.enforce_safety_policy().is_ok());
+        assert_eq!(status::snapshot(1_000).audio_last_requested_cue, 0);
+    }
+
+    #[test]
+    fn silent_mode_suppresses_automatic_and_direct_playback_without_replay() {
+        let _guard = status::status_test_guard();
+        let _cleanup = AudioStatusCleanup;
+        status::reset_audio_observability();
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.create_responsive = true;
+        runtime.set_audio_silent(true);
+        runtime.hardware.writes.clear();
+
+        assert!(runtime
+            .enqueue_command(RuntimeCommand::PlayFeedback {
+                kind: FeedbackKind::Danger,
+            })
+            .is_ok());
+        assert!(runtime.start_next_command().is_ok());
+        assert!(runtime
+            .enqueue_command(RuntimeCommand::SongPlay { id: 1 })
+            .is_ok());
+        assert!(runtime.start_next_command().is_ok());
+        runtime.request_audio(AuditoryCue::EStop);
+        runtime.poll_audio();
+        assert!(runtime.hardware.writes.is_empty());
+        assert_eq!(status::snapshot(1_000).audio_suppressed_by_silent_count, 3);
+
+        runtime.set_audio_silent(false);
+        runtime.poll_audio();
+        assert!(runtime.hardware.writes.is_empty());
+    }
+
+    #[test]
+    fn create_loss_cue_and_audio_failure_do_not_enter_runtime_error() {
+        let _guard = status::status_test_guard();
+        let _cleanup = AudioStatusCleanup;
+        status::revoke_authority();
+        status::reset_audio_observability();
+        status::set_oi_mode(CreateOiMode::Full);
+        let mut runtime = Runtime::new(FakeHardware::new(2_000));
+        runtime.create_responsive = true;
+        runtime.last_create_packet_at_ms = Some(1);
+        runtime.poll();
+        assert_eq!(
+            status::snapshot(2_000).audio_last_requested_cue,
+            AuditoryCue::CreateError.code()
+        );
+
+        runtime.create_responsive = true;
+        runtime.hardware.fail_writes = true;
+        runtime.request_audio(AuditoryCue::EStop);
+        runtime.poll_audio();
+        assert!(runtime.mode == RuntimeMode::Running);
+        runtime.hardware.fail_writes = false;
+        runtime.active = ActiveAction::Driving { stop_at_ms: 3_000 };
+        runtime.stop_sent = false;
+        assert!(runtime.stop_drive().is_ok());
+        assert!(runtime.stop_sent);
+    }
+
+    #[test]
+    fn ordinary_observations_do_not_request_audio() {
+        let _guard = status::status_test_guard();
+        let _cleanup = AudioStatusCleanup;
+        status::reset_audio_observability();
+        status::mark_create_sensor_packet(0, crate::events::CreateSensorPacket::default());
+        status::mark_imu_health(crate::drivers::imu::ImuHealth::Ok);
+        let mut runtime = Runtime::new(FakeHardware::new(1_000));
+        runtime.observe_audio_transitions();
+        assert_eq!(status::snapshot(1_000).audio_last_requested_cue, 0);
     }
 }

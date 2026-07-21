@@ -95,6 +95,10 @@ pub enum BrainstemCommand {
         kind: FeedbackKind,
         seq: u32,
     },
+    SetAudioSilent {
+        silent: bool,
+        seq: u32,
+    },
     PowerState {
         request: PowerStateRequest,
         seq: u32,
@@ -227,6 +231,9 @@ pub(crate) enum RuntimeCommand {
     PlayFeedback {
         kind: FeedbackKind,
     },
+    SetAudioSilent {
+        silent: bool,
+    },
     CalibrateTurn {
         angular_mrad_s: i16,
         duration_ms: u32,
@@ -267,9 +274,6 @@ pub(crate) const ACQUIRE_CREATE_SCRIPT: &[RuntimeCommand] = &[
     RuntimeCommand::WakeCreate,
     RuntimeCommand::StartOi,
     RuntimeCommand::SetMode(CreateOiMode::Full),
-    RuntimeCommand::PlayFeedback {
-        kind: FeedbackKind::Armed,
-    },
 ];
 
 // DISARM is retained as a legacy wire verb, but surrendering a controller must
