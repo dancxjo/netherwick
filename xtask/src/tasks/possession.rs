@@ -432,7 +432,10 @@ fn possession_sense_args(
             if long_option_value(caller_args, "--llm-provider").is_none()
                 && long_option_value(caller_args, "--llm-config").is_none() =>
         {
-            vec!["--llm-provider".to_owned(), "ollama".to_owned()]
+            vec![
+                "--llm-config".to_owned(),
+                "configs/llm.possession.toml".to_owned(),
+            ]
         }
         PossessionSenseProfile::Sensorium => Vec::new(),
     }

@@ -105,7 +105,7 @@ fn possession_profiles_keep_body_only_off_and_sensorium_opted_in() {
 
     assert_eq!(
         possession_sense_args(PossessionSenseProfile::Sensorium, &[]),
-        ["--llm-provider", "ollama"]
+        ["--llm-config", "configs/llm.possession.toml"]
     );
     assert!(possession_sense_overrides(PossessionSenseProfile::Sensorium).is_empty());
     assert!(possession_sense_args(
