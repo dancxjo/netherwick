@@ -22,16 +22,27 @@ impl TemplateImpressionGenerator {
                 }
             }
             (Modality::Vision, SensationPayloadKind::Crop) => {
-                match sensation
+                if let Some(label) = sensation
                     .metadata
                     .properties
-                    .get("detection_kind")
+                    .get("detection_label")
                     .and_then(Value::as_str)
                 {
-                    Some("face") => "I see a face close to me.".to_string(),
-                    Some("object") => "I notice an object-shaped region ahead.".to_string(),
-                    Some("salient_region") => "I notice a salient patch of the scene.".to_string(),
-                    _ => "I focus on a smaller part of what I see.".to_string(),
+                    format!("I see an object that may be a {label}.")
+                } else {
+                    match sensation
+                        .metadata
+                        .properties
+                        .get("detection_kind")
+                        .and_then(Value::as_str)
+                    {
+                        Some("face") => "I see a face close to me.".to_string(),
+                        Some("object") => "I notice an object-shaped region ahead.".to_string(),
+                        Some("salient_region") => {
+                            "I notice a salient patch of the scene.".to_string()
+                        }
+                        _ => "I focus on a smaller part of what I see.".to_string(),
+                    }
                 }
             }
             (Modality::Audio, SensationPayloadKind::AudioPcm) => {

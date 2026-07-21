@@ -42,7 +42,56 @@ impl EntityMemory {
         self.decay(elapsed_ticks, now.t_ms);
         self.last_tick = Some(now.t_ms);
 
+        let mut detector_observation_keys = BTreeSet::new();
+        for detection in &now.objects.detections {
+            let Some(label) = detection.labels.first() else {
+                continue;
+            };
+            let observation = ObjectObservation {
+                label: label.label.clone(),
+                class: ObjectClass::Unknown,
+                bearing_rad: ((detection.bbox.x as f32 + detection.bbox.width as f32 * 0.5)
+                    / detection.image_width.max(1) as f32
+                    - 0.5),
+                distance_m: detection.position.as_ref().map(|position| position.depth_m),
+                confidence: label.confidence,
+                source: if detection.source_stream.contains("kinect") {
+                    ObjectObservationSource::Kinect
+                } else {
+                    ObjectObservationSource::Unknown
+                },
+            };
+            detector_observation_keys.insert((
+                observation.label.clone(),
+                observation.confidence.to_bits(),
+                format!("{:?}", observation.source),
+            ));
+            let evidence_id = detection
+                .track_id
+                .as_deref()
+                .unwrap_or(&detection.descendant_sensation_id);
+            let id = format!("entity:visual-hypothesis:{}", stable_slug(evidence_id));
+            if let Some(existing) = self.entities.get_mut(&id) {
+                existing.merge_observation(&observation, now.t_ms, cell_key);
+            } else {
+                let mut hypothesis =
+                    EntityHypothesis::from_observation(&observation, now.t_ms, cell_key);
+                hypothesis.id = id.clone();
+                // A detector label is a mutable hypothesis, never the entity's
+                // permanent display identity.
+                hypothesis.display_name = None;
+                self.entities.insert(id, hypothesis);
+            }
+        }
+
         for observation in &now.objects.observations {
+            if detector_observation_keys.contains(&(
+                observation.label.clone(),
+                observation.confidence.to_bits(),
+                format!("{:?}", observation.source),
+            )) {
+                continue;
+            }
             let kind = object_class_slug(&observation.class).to_string();
             let id = format!("entity:{}:{}", kind, stable_slug(&observation.label));
             if let Some(existing) = self.entities.get_mut(&id) {
@@ -54,10 +103,17 @@ impl EntityMemory {
             }
         }
 
-        let current_entity_ids = now
+        let mut current_entity_ids = now
             .objects
             .observations
             .iter()
+            .filter(|observation| {
+                !detector_observation_keys.contains(&(
+                    observation.label.clone(),
+                    observation.confidence.to_bits(),
+                    format!("{:?}", observation.source),
+                ))
+            })
             .map(|observation| {
                 format!(
                     "entity:{}:{}",
@@ -66,6 +122,13 @@ impl EntityMemory {
                 )
             })
             .collect::<BTreeSet<_>>();
+        current_entity_ids.extend(now.objects.detections.iter().map(|detection| {
+            let evidence_id = detection
+                .track_id
+                .as_deref()
+                .unwrap_or(&detection.descendant_sensation_id);
+            format!("entity:visual-hypothesis:{}", stable_slug(evidence_id))
+        }));
 
         // Face vectors propose person bindings; they do not fan out to every person.
         for artifact in &now.face.vectors {

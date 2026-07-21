@@ -9,6 +9,67 @@ fn make_object_observation(label: &str, class: ObjectClass, confidence: f32) -> 
     }
 }
 
+fn tracked_detection(label: &str, track_id: &str) -> pete_now::VisionDetection {
+    pete_now::VisionDetection {
+        source_frame_id: "rgbd-1".to_string(),
+        source_sensation_id: "vision-source-1".to_string(),
+        descendant_sensation_id: format!("vision-source-1-{track_id}"),
+        source_snapshot_id: "rgbd-1:epoch:1".to_string(),
+        source_stream: "kinect_rgb".to_string(),
+        producer_timestamp_ms: 100,
+        image_width: 640,
+        image_height: 480,
+        bbox: pete_now::VisionBoundingBox {
+            x: 100,
+            y: 100,
+            width: 80,
+            height: 100,
+        },
+        labels: vec![pete_now::VisionLabelHypothesis {
+            label: label.to_string(),
+            confidence: 0.61,
+        }],
+        track_id: Some(track_id.to_string()),
+        ..pete_now::VisionDetection::default()
+    }
+}
+
+#[test]
+fn detector_labels_strengthen_tracks_without_becoming_entity_identity() {
+    let mut memory = EntityMemory::new();
+    let mut first = Now::blank(100, pete_body::BodySense::default());
+    first
+        .objects
+        .detections
+        .push(tracked_detection("chair", "track-a"));
+    let mut second = Now::blank(200, pete_body::BodySense::default());
+    second
+        .objects
+        .detections
+        .push(tracked_detection("chair", "track-a"));
+    second
+        .objects
+        .detections
+        .push(tracked_detection("chair", "track-b"));
+
+    memory.observe_now(&first, None);
+    memory.observe_now(&second, None);
+
+    assert_eq!(memory.entities.len(), 2);
+    assert_eq!(
+        memory.entities["entity:visual-hypothesis:track-a"].observation_count,
+        2
+    );
+    assert_eq!(
+        memory.entities["entity:visual-hypothesis:track-b"].observation_count,
+        1
+    );
+    assert!(memory
+        .entities
+        .values()
+        .all(|entity| entity.display_name.is_none()));
+}
+
 #[test]
 fn entity_memory_repeated_observation_merges_not_duplicates() {
     let mut memory = EntityMemory::new();

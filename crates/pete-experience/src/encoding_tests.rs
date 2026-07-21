@@ -955,6 +955,84 @@ fn primary_sensation_from_now_preserves_raw_visual_bytes() {
     assert_eq!(decoded, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
 }
 
+#[tokio::test]
+async fn provenance_bearing_detection_becomes_a_vectorized_visual_descendant() {
+    let mut now = Now::blank(220, BodySense::default());
+    now.eye_frame = Some(pete_now::EyeFrame {
+        rgbd_frame_id: Some("rgbd-vision-1".to_string()),
+        device_timestamp_ms: None,
+        captured_at_ms: 200,
+        width: 4,
+        height: 4,
+        format: pete_now::EyeFrameFormat::Rgb8,
+        bytes: vec![10; 4 * 4 * 3],
+        source: Some("kinect_rgb".to_string()),
+    });
+    now.objects.detections.push(pete_now::VisionDetection {
+        source_frame_id: "rgbd-vision-1".to_string(),
+        source_sensation_id: "vision-source-1".to_string(),
+        descendant_sensation_id: "vision-source-1-detection-0".to_string(),
+        source_snapshot_id: "rgbd-vision-1:epoch:4".to_string(),
+        source_stream: "kinect_rgb".to_string(),
+        producer_timestamp_ms: 200,
+        image_width: 4,
+        image_height: 4,
+        bbox: pete_now::VisionBoundingBox {
+            x: 1,
+            y: 1,
+            width: 2,
+            height: 2,
+        },
+        labels: vec![pete_now::VisionLabelHypothesis {
+            label: "chair".to_string(),
+            confidence: 0.62,
+        }],
+        model: pete_now::VisionModelIdentity {
+            backend: "test".to_string(),
+            model_id: "fixture".to_string(),
+            version: "1".to_string(),
+            checksum: Some("sha256:test".to_string()),
+        },
+        track_id: Some("vision-track-3".to_string()),
+        calibration_epoch: Some(4),
+        geometry_trust: "trusted".to_string(),
+        crop_rgb8: vec![220; 2 * 2 * 3],
+        ..pete_now::VisionDetection::default()
+    });
+
+    let sensations = primary_sensations_from_now(&now);
+    let image = sensations
+        .iter()
+        .find(|sensation| sensation.payload_kind == SensationPayloadKind::ImageBytes)
+        .expect("image sensation");
+    let detection = sensations
+        .iter()
+        .find(|sensation| sensation.kind == "vision.object_detection")
+        .expect("detection descendant");
+    assert_eq!(detection.parent_id, Some(image.id));
+    assert_eq!(detection.metadata.confidence, Some(0.62));
+    assert_eq!(
+        detection
+            .metadata
+            .properties
+            .get("track_id")
+            .and_then(Value::as_str),
+        Some("vision-track-3")
+    );
+    assert!(detection.payload.get("raw_bytes_b64").is_some());
+
+    let batch = EmbodiedPipeline::new()
+        .ingest_primary(detection.clone())
+        .await
+        .unwrap();
+    assert_eq!(batch.sensations[0].parent_id, Some(image.id));
+    assert!(batch.sensations[0].vector.is_some());
+    assert_eq!(
+        batch.impressions[0].text,
+        "I see an object that may be a chair."
+    );
+}
+
 #[test]
 fn experience_fuser_links_sensations_impressions_and_summary() {
     let mut sensation = Sensation::primary(

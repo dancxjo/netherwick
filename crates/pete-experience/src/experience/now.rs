@@ -50,7 +50,12 @@ pub fn primary_sensations_from_now(now: &Now) -> Vec<Sensation> {
     if let Some(frame) = &now.eye_frame {
         let mut source = SensationSource::new("eye.frame");
         source.device_id = frame.source.clone();
-        source.frame_id = Some(frame.captured_at_ms.to_string());
+        source.frame_id = Some(
+            frame
+                .rgbd_frame_id
+                .clone()
+                .unwrap_or_else(|| frame.captured_at_ms.to_string()),
+        );
         let mut sensation =
             Sensation::primary(Modality::Vision, source, frame.captured_at_ms, now.t_ms, {
                 let mut payload = SensationPayload::image_metadata(
@@ -72,7 +77,97 @@ pub fn primary_sensations_from_now(now: &Now) -> Vec<Sensation> {
             "raw_bytes_present".to_string(),
             json!(!frame.bytes.is_empty()),
         );
+        sensation
+            .metadata
+            .properties
+            .insert("rgbd_frame_id".to_string(), json!(frame.rgbd_frame_id));
+        let mut detection_descendants = Vec::new();
+        for detection in now.objects.detections.iter().filter(|detection| {
+            detection.producer_timestamp_ms == frame.captured_at_ms
+                && detection.image_width == frame.width
+                && detection.image_height == frame.height
+        }) {
+            let Some(label) = detection.labels.first() else {
+                continue;
+            };
+            let mut metadata = sensation.metadata.clone();
+            metadata.bbox = Some(BoundingBox {
+                x: detection.bbox.x,
+                y: detection.bbox.y,
+                width: detection.bbox.width,
+                height: detection.bbox.height,
+            });
+            metadata.confidence = Some(label.confidence);
+            metadata.labels = detection
+                .labels
+                .iter()
+                .map(|hypothesis| hypothesis.label.clone())
+                .collect();
+            metadata.properties.insert(
+                "detection_kind".to_string(),
+                Value::String("object".to_string()),
+            );
+            metadata.properties.insert(
+                "detection_label".to_string(),
+                Value::String(label.label.clone()),
+            );
+            metadata
+                .properties
+                .insert("track_id".to_string(), json!(detection.track_id));
+            metadata.properties.insert(
+                "source_snapshot_id".to_string(),
+                Value::String(detection.source_snapshot_id.clone()),
+            );
+            metadata.properties.insert(
+                "calibration_epoch".to_string(),
+                json!(detection.calibration_epoch),
+            );
+            metadata.properties.insert(
+                "geometry_trust".to_string(),
+                Value::String(detection.geometry_trust.clone()),
+            );
+            let mut payload = json!({
+                "parent_image": sensation.id,
+                "source_frame_id": detection.source_frame_id,
+                "source_sensation_id": detection.source_sensation_id,
+                "descendant_sensation_id": detection.descendant_sensation_id,
+                "source_stream": detection.source_stream,
+                "producer_timestamp_ms": detection.producer_timestamp_ms,
+                "bbox": detection.bbox,
+                "width": detection.bbox.width,
+                "height": detection.bbox.height,
+                "format": "rgb8",
+                "labels": detection.labels,
+                "model": detection.model,
+                "inference_started_at_ms": detection.inference_started_at_ms,
+                "inference_completed_at_ms": detection.inference_completed_at_ms,
+                "inference_duration_ms": detection.inference_duration_ms,
+                "deadline_ms": detection.deadline_ms,
+                "track_id": detection.track_id,
+                "calibration_epoch": detection.calibration_epoch,
+                "geometry_trust": detection.geometry_trust,
+                "position": detection.position,
+                "position_unavailable_reasons": detection.position_unavailable_reasons,
+            });
+            if !detection.crop_rgb8.is_empty() {
+                payload["raw_bytes_b64"] = Value::String(
+                    base64::engine::general_purpose::STANDARD.encode(&detection.crop_rgb8),
+                );
+            }
+            detection_descendants.push(
+                Sensation::descendant(
+                    &sensation,
+                    "vision.object_detection",
+                    SensationPayloadKind::Crop,
+                    payload,
+                    metadata,
+                    "descendant.object_detection",
+                )
+                .with_summary(format!("I see an object that may be a {}.", label.label)),
+            );
+        }
         sensations.push(sensation);
+        sensations.extend(detection_descendants);
     } else if !now.eye.frames.is_empty()
         || !now.eye.image_vectors.is_empty()
         || !now.eye.scene_vectors.is_empty()
