@@ -107,6 +107,150 @@ async fn llm_startup_status(config: &LlmConfig, required: bool) -> StartupStream
     }
 }
 
+async fn settle_sensor_startup(
+    cockpit: &mut dyn Cockpit,
+    mut streams: Vec<StartupStreamStatus>,
+    pending: &[PendingSensorReadiness],
+    timeout_ms: u64,
+    require_imu: bool,
+    imu_source: ImuSourceArg,
+) -> Result<SensorStartupReport> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+    let mut brainstem_polls = 0_u64;
+    let final_status = loop {
+        let status = cockpit
+            .get_status()
+            .context("failed to poll brainstem during sensor startup readiness")?
+            .summary();
+        brainstem_polls = brainstem_polls.saturating_add(1);
+        let all_background_ready = pending.iter().all(|probe| {
+            probe.readiness.snapshot().received_packets > 0
+        });
+        if all_background_ready || Instant::now() >= deadline {
+            break status;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+
+    streams.push(startup_stream(
+        "body",
+        true,
+        final_status.has_fresh_complete_body_packet(CREATE_SENSOR_FRESHNESS_MAX_AGE_MS),
+        format!(
+            "Create complete_packet={:?}, count={:?}, age_ms={:?}",
+            final_status.body_packet_complete,
+            final_status.body_packet_count,
+            final_status.body_packet_age_ms,
+        ),
+    ));
+    for probe in pending {
+        let state = probe.readiness.snapshot();
+        let active = state.received_packets > 0;
+        let detail = if active {
+            format!(
+                "first data received; packets={}, dropped_or_replaced={}",
+                state.received_packets, state.dropped_or_replaced_packets
+            )
+        } else {
+            state.last_error.clone().unwrap_or_else(|| {
+                format!("no usable packet within {} ms", timeout_ms.max(1))
+            })
+        };
+        let mut stream = startup_stream(probe.name, probe.required, active, detail);
+        stream.diagnostics = serde_json::json!({
+            "received_packets": state.received_packets,
+            "queued_packets": state.pending.len(),
+            "dropped_or_replaced_packets": state.dropped_or_replaced_packets,
+            "last_error": state.last_error,
+        });
+        streams.push(stream);
+    }
+
+    let brainstem_imu_present = final_status
+        .imu
+        .present
+        .as_deref()
+        .is_some_and(|value| matches!(value, "1" | "2" | "true" | "on" | "present"));
+    let brainstem_imu_healthy = final_status
+        .imu
+        .health
+        .as_deref()
+        .is_some_and(|value| matches!(value, "1" | "ok"));
+    let brainstem_imu_active = brainstem_imu_present
+        && brainstem_imu_healthy
+        && final_status.imu.sample_count.unwrap_or(0) > 0;
+    streams.push(StartupStreamStatus {
+        name: "brainstem-imu".to_string(),
+        required: require_imu && imu_source == ImuSourceArg::Brainstem,
+        active: brainstem_imu_active,
+        detail: format!(
+            "present={:?}, health={:?}, samples={:?}, age_ms={:?}; arbitration policy={imu_source:?}",
+            final_status.imu.present,
+            final_status.imu.health,
+            final_status.imu.sample_count,
+            final_status.imu.sample_age_ms,
+        ),
+        diagnostics: serde_json::to_value(&final_status.imu).unwrap_or(Value::Null),
+    });
+    streams.sort_by(|left, right| left.name.cmp(&right.name));
+
+    println!(
+        "sensor startup readiness ({} ms, {} brainstem polls):",
+        timeout_ms.max(1),
+        brainstem_polls
+    );
+    for stream in &streams {
+        println!(
+            "  {:<18} {:<8} {}: {}",
+            stream.name,
+            if stream.required { "required" } else { "optional" },
+            if stream.active { "active" } else { "missing" },
+            stream.detail,
+        );
+    }
+
+    let missing_required = missing_required_startup_streams(
+        &streams,
+        require_imu,
+        imu_source,
+        brainstem_imu_active,
+    );
+    if !missing_required.is_empty() {
+        anyhow::bail!(
+            "required sensor streams failed startup readiness: {}",
+            missing_required.join(", ")
+        );
+    }
+
+    Ok(SensorStartupReport {
+        timeout_ms: timeout_ms.max(1),
+        brainstem_polls,
+        streams,
+    })
+}
+
+fn missing_required_startup_streams(
+    streams: &[StartupStreamStatus],
+    require_imu: bool,
+    imu_source: ImuSourceArg,
+    brainstem_imu_active: bool,
+) -> Vec<String> {
+    let mut missing_required = streams
+        .iter()
+        .filter(|stream| stream.required && !stream.active)
+        .map(|stream| stream.name.clone())
+        .collect::<Vec<_>>();
+    if require_imu && imu_source == ImuSourceArg::Auto {
+        let local_active = streams
+            .iter()
+            .any(|stream| stream.name == "local-imu" && stream.active);
+        if !brainstem_imu_active && !local_active {
+            missing_required.push("imu(auto: brainstem or local)".to_string());
+        }
+    }
+    missing_required
+}
+
 async fn run_robot(args: RobotArgs) -> Result<()> {
     let env_report = collect_hardware_env_report().await;
     let llm_config = configured_llm_config(&args.llm)?;
@@ -567,6 +711,28 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         ));
     }
 
+    let sensor_startup = match settle_sensor_startup(
+        cockpit.as_mut(),
+        startup_streams,
+        &pending_sensor_readiness,
+        args.sensor_readiness_timeout_ms,
+        args.require_imu,
+        args.imu_source,
+    )
+    .await
+    {
+        Ok(report) => report,
+        Err(readiness_error) if robot_mode == RobotMode::Slow => {
+            return match run_possession_shutdown(cockpit.as_mut()) {
+                Ok(()) => Err(readiness_error),
+                Err(shutdown_error) => anyhow::bail!(
+                    "sensor startup failed and possession shutdown also failed: readiness: {readiness_error:#}; shutdown: {shutdown_error:#}"
+                ),
+            };
+        }
+        Err(error) => return Err(error),
+    };
+
     let mut mouth = match QueuedPiperCpalMouth::from_env() {
         Ok(Some(mouth)) => Some(mouth),
         Ok(None) => {
@@ -599,13 +765,13 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         recall,
         SimpleConductor::default(),
         SimpleSafety::default(),
-        configured_llm_agent(&args.llm)?,
+        ConfiguredLlmAgent::from_config(llm_config.clone())?,
         reign_queue,
     );
-    let live_image_enricher = LiveImageEnricher::new(configured_llm_config(&args.llm)?)?;
+    let live_image_enricher = LiveImageEnricher::new(llm_config)?;
     let mut frame_processor_warnings = Vec::new();
     let active_sensor_count = sensors.len();
-    let initialization = robot_initialization_metadata(
+    let mut initialization = robot_initialization_metadata(
         robot_mode,
         &args,
         is_mock_body,
@@ -615,6 +781,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         &brainstem_capabilities,
         &motion_safety,
     );
+    initialization["sensor_startup"] = serde_json::to_value(&sensor_startup)?;
     let mut runner = RealRobotRunner::new(robot_mode, cockpit, sensors, runtime)
         .with_frame_processor(real_robot_frame_processor(&mut frame_processor_warnings).await)
         .with_live_image_enricher(live_image_enricher)
@@ -635,8 +802,13 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
                 brainstem_firmware_identity(runner.cockpit.client_mut().as_mut());
             writer.manifest_mut().brainstem_safety =
                 Some(brainstem_motion_safety_metadata(&motion_safety));
+            writer.manifest_mut().device_availability = serde_json::to_value(&sensor_startup)?;
+            writer.manifest_mut().streams = CaptureStreams {
+                present: sensor_startup.active_names(),
+                missing: sensor_startup.missing_names(),
+            };
             writer.manifest_mut().notes.push(
-                "raw RGB, depth, and audio assets are exported when present; paths are relative to the capture root"
+                "raw sensor assets are written by a bounded background queue; paths are relative to the capture root"
                     .to_string(),
             );
             Some(writer)

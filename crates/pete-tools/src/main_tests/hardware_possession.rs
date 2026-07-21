@@ -71,6 +71,36 @@ fn imu_source_overrides_never_start_a_duplicate_local_provider() {
 }
 
 #[test]
+fn startup_readiness_enforces_required_streams_and_auto_imu_alternatives() {
+    let streams = vec![
+        startup_stream("kinect-rgb-depth", true, false, "no frame"),
+        startup_stream("local-imu", false, true, "first data received"),
+    ];
+    assert_eq!(
+        missing_required_startup_streams(&streams, true, ImuSourceArg::Auto, false),
+        ["kinect-rgb-depth"]
+    );
+
+    let no_imu = vec![startup_stream(
+        "local-imu",
+        false,
+        false,
+        "not detected",
+    )];
+    assert_eq!(
+        missing_required_startup_streams(&no_imu, true, ImuSourceArg::Auto, false),
+        ["imu(auto: brainstem or local)"]
+    );
+    assert!(missing_required_startup_streams(
+        &no_imu,
+        true,
+        ImuSourceArg::Auto,
+        true
+    )
+    .is_empty());
+}
+
+#[test]
 fn serial_auto_selection_keeps_lidar_gps_and_create_separate() {
     let report = serde_json::json!({
         "serial_devices": [
