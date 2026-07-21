@@ -1,0 +1,696 @@
+#[async_trait]
+pub trait SenseProducer {
+    fn source_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
+    async fn poll(&mut self) -> Result<SensePacket>;
+}
+
+#[async_trait]
+pub trait World: Send {
+    async fn snapshot(&mut self) -> Result<WorldSnapshot>;
+    async fn apply_update(&mut self, update: WorldUpdate) -> Result<()>;
+
+    async fn set_body(&mut self, body: BodySense) -> Result<()> {
+        self.apply_update(WorldUpdate {
+            body: Some(body),
+            ..WorldUpdate::default()
+        })
+        .await
+    }
+
+    async fn set_eye_frame(&mut self, frame: EyeFrame) -> Result<()> {
+        self.apply_update(WorldUpdate {
+            eye_frame: Some(frame),
+            ..WorldUpdate::default()
+        })
+        .await
+    }
+
+    async fn set_eye_sense(&mut self, eye: EyeSense) -> Result<()> {
+        self.apply_update(WorldUpdate {
+            eye: Some(eye),
+            ..WorldUpdate::default()
+        })
+        .await
+    }
+
+    async fn set_ear_pcm_frame(&mut self, frame: PcmAudioFrame) -> Result<()> {
+        self.apply_update(WorldUpdate {
+            ear_pcm: Some(frame),
+            ..WorldUpdate::default()
+        })
+        .await
+    }
+
+    async fn set_ear_sense(&mut self, ear: EarSense) -> Result<()> {
+        self.apply_update(WorldUpdate {
+            ear: Some(ear),
+            ..WorldUpdate::default()
+        })
+        .await
+    }
+
+    async fn set_range_sense(&mut self, range: RangeSense) -> Result<()> {
+        self.apply_update(WorldUpdate {
+            range: Some(range),
+            ..WorldUpdate::default()
+        })
+        .await
+    }
+
+    async fn set_imu_sense(&mut self, imu: ImuSense) -> Result<()> {
+        self.apply_update(WorldUpdate {
+            imu: Some(imu),
+            ..WorldUpdate::default()
+        })
+        .await
+    }
+
+    async fn set_gps_sense(&mut self, gps: Option<GpsSense>) -> Result<()> {
+        self.apply_update(WorldUpdate {
+            gps,
+            ..WorldUpdate::default()
+        })
+        .await
+    }
+
+    async fn set_kinect_sense(&mut self, kinect: KinectSense) -> Result<()> {
+        self.apply_update(WorldUpdate {
+            kinect: Some(kinect),
+            ..WorldUpdate::default()
+        })
+        .await
+    }
+
+    async fn set_object_sense(&mut self, objects: ObjectSense) -> Result<()> {
+        self.apply_update(WorldUpdate {
+            objects: Some(objects),
+            ..WorldUpdate::default()
+        })
+        .await
+    }
+
+    async fn set_face_sense(&mut self, face: FaceSense) -> Result<()> {
+        self.apply_update(WorldUpdate {
+            face: Some(face),
+            ..WorldUpdate::default()
+        })
+        .await
+    }
+
+    async fn set_voice_sense(&mut self, voice: VoiceSense) -> Result<()> {
+        self.apply_update(WorldUpdate {
+            voice: Some(voice),
+            ..WorldUpdate::default()
+        })
+        .await
+    }
+
+    async fn set_extensions(&mut self, extensions: Vec<ExtensionSense>) -> Result<()> {
+        self.apply_update(WorldUpdate {
+            extensions: Some(extensions),
+            ..WorldUpdate::default()
+        })
+        .await
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SensePacket {
+    Eye(EyeSense),
+    EyeFrame(EyeFrame),
+    Ear(EarSense),
+    EarPcm(PcmAudioFrame),
+    Range(RangeSense),
+    Imu(ImuSense),
+    Gps(GpsSense),
+    Kinect(KinectSense),
+    Face(FaceSense),
+    Voice(VoiceSense),
+    Objects(ObjectSense),
+    Extension(ExtensionSense),
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NowBuilder {
+    last_snapshot: WorldSnapshot,
+    last_updates: SensorUpdateTimes,
+}
+
+#[derive(Clone, Default)]
+pub struct FrameProcessor {
+    last_processed_frame_key: Option<FrameKey>,
+    face_detector: Option<Arc<dyn FaceDetector>>,
+    object_detector: Option<Arc<dyn ObjectDetector>>,
+    kinect_range_projection: Option<DepthRangeProjectionConfig>,
+}
+
+impl std::fmt::Debug for FrameProcessor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrameProcessor")
+            .field("last_processed_frame_key", &self.last_processed_frame_key)
+            .field("face_detector", &self.face_detector.is_some())
+            .field("object_detector", &self.object_detector.is_some())
+            .field("kinect_range_projection", &self.kinect_range_projection)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DepthRangeProjectionConfig {
+    pub compact_depth_beam_count: usize,
+    pub compact_depth_fov_rad: f32,
+    pub depth_scale: f32,
+    pub camera_forward_m: f32,
+    pub camera_height_m: f32,
+    pub camera_pitch_rad: f32,
+    pub camera_roll_rad: f32,
+    pub camera_yaw_rad: f32,
+    pub min_depth_m: f32,
+    pub max_depth_m: f32,
+}
+
+impl Default for DepthRangeProjectionConfig {
+    fn default() -> Self {
+        Self {
+            compact_depth_beam_count: 32,
+            compact_depth_fov_rad: std::f32::consts::PI * 0.75,
+            depth_scale: 1.0,
+            camera_forward_m: 0.0,
+            camera_height_m: 0.0,
+            camera_pitch_rad: 0.0,
+            camera_roll_rad: 0.0,
+            camera_yaw_rad: 0.0,
+            min_depth_m: 0.2,
+            max_depth_m: 8.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FrameKey {
+    captured_at_ms: u64,
+    width: u32,
+    height: u32,
+    format: String,
+    byte_len: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessedFrame {
+    pub eye: EyeSense,
+    pub face: FaceSense,
+    pub objects: ObjectSense,
+    pub summary: String,
+    pub source_frame_id: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SensorUpdateTimes {
+    pub body: Option<TimeMs>,
+    pub eye: Option<TimeMs>,
+    pub ear: Option<TimeMs>,
+    pub range: Option<TimeMs>,
+    pub imu: Option<TimeMs>,
+    pub gps: Option<TimeMs>,
+    pub kinect: Option<TimeMs>,
+    pub face: Option<TimeMs>,
+    pub objects: Option<TimeMs>,
+    pub voice: Option<TimeMs>,
+}
+
+impl NowBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn build(
+        &mut self,
+        t_ms: TimeMs,
+        mut body: BodySense,
+        packets: Vec<SensePacket>,
+    ) -> Result<Now> {
+        body.last_update_ms = body.last_update_ms.max(t_ms);
+        self.last_updates.body = Some(body.last_update_ms);
+        self.last_snapshot.body = body;
+        self.last_snapshot.extensions.clear();
+        let mut saw_range_packet = false;
+
+        for packet in packets {
+            match packet {
+                SensePacket::Eye(eye) => {
+                    self.last_snapshot.eye = eye;
+                    self.last_updates.eye = Some(t_ms);
+                }
+                SensePacket::EyeFrame(frame) => {
+                    self.last_snapshot.eye.frames = vec![bytes_to_unit_signal(&frame.bytes)];
+                    self.last_snapshot.eye_frame = Some(frame);
+                    self.last_updates.eye = Some(t_ms);
+                }
+                SensePacket::Ear(ear) => {
+                    self.last_snapshot.ear = ear;
+                    self.last_updates.ear = Some(t_ms);
+                }
+                SensePacket::EarPcm(frame) => {
+                    self.last_snapshot.ear.features = vec![pcm_to_unit_signal(&frame.samples)];
+                    self.last_snapshot.ear_pcm = Some(frame);
+                    self.last_updates.ear = Some(t_ms);
+                }
+                SensePacket::Range(range) => {
+                    self.last_snapshot.range = range;
+                    self.last_updates.range = Some(t_ms);
+                    saw_range_packet = true;
+                }
+                SensePacket::Imu(imu) => {
+                    self.last_snapshot.imu = imu;
+                    self.last_updates.imu = Some(t_ms);
+                }
+                SensePacket::Gps(gps) => {
+                    self.last_snapshot.gps = Some(gps);
+                    self.last_updates.gps = Some(t_ms);
+                }
+                SensePacket::Kinect(kinect) => {
+                    if !saw_range_packet {
+                        if let Some(range) = range_from_kinect_depth(&kinect) {
+                            self.last_snapshot.range = range;
+                            self.last_updates.range = Some(t_ms);
+                        }
+                    }
+                    self.last_snapshot.kinect = kinect;
+                    self.last_updates.kinect = Some(t_ms);
+                }
+                SensePacket::Face(face) => {
+                    self.last_snapshot.face = face;
+                    self.last_updates.face = Some(t_ms);
+                }
+                SensePacket::Voice(voice) => {
+                    self.last_snapshot.voice = voice;
+                    self.last_updates.voice = Some(t_ms);
+                }
+                SensePacket::Objects(objects) => {
+                    self.last_snapshot.objects = objects;
+                    self.last_updates.objects = Some(t_ms);
+                }
+                SensePacket::Extension(extension) => {
+                    self.last_snapshot.extensions.push(extension);
+                }
+            }
+        }
+
+        let mut now = self.last_snapshot.to_now(t_ms);
+        now.extensions.insert(
+            "sensor_status".to_string(),
+            serde_json::json!({
+                "last_update_ms": self.last_updates,
+                "age_ms": self.last_updates.age_ms(t_ms),
+            }),
+        );
+        Ok(now)
+    }
+
+    pub fn snapshot(&self) -> WorldSnapshot {
+        self.last_snapshot.clone()
+    }
+}
+
+fn range_from_kinect_depth(kinect: &KinectSense) -> Option<RangeSense> {
+    range_from_kinect_depth_with_config(kinect, None)
+}
+
+fn range_from_kinect_depth_with_config(
+    kinect: &KinectSense,
+    config: Option<DepthRangeProjectionConfig>,
+) -> Option<RangeSense> {
+    const FALLBACK_BEAM_COUNT: usize = 32;
+    let depth = &kinect.depth_m;
+    if depth.is_empty() {
+        return None;
+    }
+    let transform = config.unwrap_or_default();
+    let min_depth = positive_or(kinect.min_depth_m, transform.min_depth_m);
+    let max_depth = if kinect.max_depth_m > min_depth {
+        kinect.max_depth_m
+    } else {
+        transform.max_depth_m.max(min_depth)
+    };
+    let valid_depth = |value: f32| value.is_finite() && value >= min_depth && value <= max_depth;
+
+    if let Some(projection) = RangeDepthProjection::from_kinect(kinect, min_depth, max_depth) {
+        let beam_count = config
+            .map(|config| config.compact_depth_beam_count)
+            .filter(|count| *count > 0)
+            .unwrap_or(FALLBACK_BEAM_COUNT)
+            .min(projection.width.max(1));
+        return range_from_depth_image(depth, projection, beam_count, transform);
+    }
+
+    if config.is_some() && depth.len() == transform.compact_depth_beam_count {
+        return range_from_compact_depth(depth, transform, min_depth, max_depth);
+    }
+
+    let beams = depth
+        .iter()
+        .copied()
+        .filter(|value| valid_depth(*value))
+        .take(FALLBACK_BEAM_COUNT)
+        .collect::<Vec<_>>();
+
+    if beams.is_empty() {
+        return None;
+    }
+    let nearest_m = beams.iter().copied().reduce(f32::min);
+    Some(RangeSense {
+        schema_version: 1,
+        captured_at_ms: kinect.captured_at_ms,
+        beams,
+        nearest_m,
+        beam_angles_rad: Vec::new(),
+        frame: None,
+        source: Some("kinect_depth_legacy_range".to_string()),
+        extrinsics: None,
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RangeDepthProjection {
+    width: usize,
+    height: usize,
+    fx: f32,
+    fy: f32,
+    cx: f32,
+    cy: f32,
+    min_depth_m: f32,
+    max_depth_m: f32,
+}
+
+impl RangeDepthProjection {
+    fn from_kinect(kinect: &KinectSense, min_depth_m: f32, max_depth_m: f32) -> Option<Self> {
+        let width = usize::try_from(kinect.depth_width).ok()?;
+        let height = usize::try_from(kinect.depth_height).ok()?;
+        if width == 0 || height == 0 || width.checked_mul(height)? != kinect.depth_m.len() {
+            return None;
+        }
+        Some(Self {
+            width,
+            height,
+            fx: positive_or(kinect.depth_fx, 594.0),
+            fy: positive_or(kinect.depth_fy, 591.0),
+            cx: positive_or(kinect.depth_cx, (width as f32 - 1.0) * 0.5),
+            cy: positive_or(kinect.depth_cy, (height as f32 - 1.0) * 0.5),
+            min_depth_m,
+            max_depth_m,
+        })
+    }
+}
+
+fn range_from_depth_image(
+    depth: &[f32],
+    projection: RangeDepthProjection,
+    beam_count: usize,
+    transform: DepthRangeProjectionConfig,
+) -> Option<RangeSense> {
+    let beam_count = beam_count.max(1);
+    let row_start = projection.height / 3;
+    let row_end = (projection.height * 2 / 3)
+        .max(row_start + 1)
+        .min(projection.height);
+    let mut beams = vec![projection.max_depth_m; beam_count];
+    let mut angles = (0..beam_count)
+        .map(|beam| {
+            let u = ((beam as f32 + 0.5) * projection.width as f32 / beam_count as f32)
+                .clamp(0.0, projection.width.saturating_sub(1) as f32);
+            let v = (projection.height as f32 - 1.0) * 0.5;
+            let camera = depth_image_camera_point(u, v, 1.0, projection);
+            robot_angle_for_camera_point(camera, transform)
+        })
+        .collect::<Vec<_>>();
+    let mut saw_valid = false;
+
+    for y in row_start..row_end {
+        let row = y * projection.width;
+        for x in 0..projection.width {
+            let depth_m = depth[row + x] * transform.depth_scale;
+            if !depth_m.is_finite()
+                || depth_m < projection.min_depth_m
+                || depth_m > projection.max_depth_m
+            {
+                continue;
+            }
+            let beam = (x * beam_count / projection.width).min(beam_count - 1);
+            let camera = depth_image_camera_point(x as f32, y as f32, depth_m, projection);
+            let robot = depth_camera_point_to_robot(camera, transform);
+            let planar_distance = robot[0].hypot(robot[1]);
+            if planar_distance.is_finite() && planar_distance < beams[beam] {
+                beams[beam] = planar_distance;
+                angles[beam] = robot[1].atan2(robot[0]);
+                saw_valid = true;
+            }
+        }
+    }
+
+    if !saw_valid {
+        return None;
+    }
+    let nearest_m = beams.iter().copied().reduce(f32::min);
+    Some(RangeSense {
+        schema_version: 1,
+        captured_at_ms: 0,
+        beams,
+        nearest_m,
+        beam_angles_rad: angles,
+        frame: Some("robot_base".to_string()),
+        source: Some("kinect_depth_image".to_string()),
+        extrinsics: None,
+    })
+}
+
+fn range_from_compact_depth(
+    depth: &[f32],
+    transform: DepthRangeProjectionConfig,
+    min_depth_m: f32,
+    max_depth_m: f32,
+) -> Option<RangeSense> {
+    let beam_count = depth.len().max(1);
+    let fov_rad = transform
+        .compact_depth_fov_rad
+        .clamp(0.01, std::f32::consts::TAU);
+    let start = if beam_count == 1 { 0.0 } else { -fov_rad * 0.5 };
+    let step = if beam_count == 1 {
+        0.0
+    } else {
+        fov_rad / (beam_count - 1) as f32
+    };
+    let mut beams = Vec::with_capacity(depth.len());
+    let mut angles = Vec::with_capacity(depth.len());
+
+    for (index, depth_m) in depth.iter().enumerate() {
+        let scaled = *depth_m * transform.depth_scale;
+        if !scaled.is_finite() || scaled < min_depth_m || scaled > max_depth_m {
+            continue;
+        }
+        let angle = start + step * index as f32;
+        let robot = depth_apply_robot_extrinsics(
+            [angle.cos() * scaled, angle.sin() * scaled, 0.0],
+            transform,
+        );
+        let planar_distance = robot[0].hypot(robot[1]);
+        if !planar_distance.is_finite() {
+            continue;
+        }
+        beams.push(planar_distance);
+        angles.push(robot[1].atan2(robot[0]));
+    }
+
+    if beams.is_empty() {
+        return None;
+    }
+    let nearest_m = beams.iter().copied().reduce(f32::min);
+    Some(RangeSense {
+        schema_version: 1,
+        captured_at_ms: 0,
+        beams,
+        nearest_m,
+        beam_angles_rad: angles,
+        frame: Some("robot_base".to_string()),
+        source: Some("kinect_compact_depth".to_string()),
+        extrinsics: None,
+    })
+}
+
+fn depth_image_camera_point(
+    u: f32,
+    v: f32,
+    depth_m: f32,
+    projection: RangeDepthProjection,
+) -> [f32; 3] {
+    [
+        (u - projection.cx) * depth_m / projection.fx.max(f32::EPSILON),
+        (v - projection.cy) * depth_m / projection.fy.max(f32::EPSILON),
+        depth_m,
+    ]
+}
+
+fn robot_angle_for_camera_point(camera: [f32; 3], transform: DepthRangeProjectionConfig) -> f32 {
+    let robot = depth_camera_point_to_robot(camera, transform);
+    robot[1].atan2(robot[0])
+}
+
+fn depth_camera_point_to_robot(
+    camera: [f32; 3],
+    transform: DepthRangeProjectionConfig,
+) -> [f32; 3] {
+    depth_apply_robot_extrinsics([camera[2], -camera[0], -camera[1]], transform)
+}
+
+fn depth_apply_robot_extrinsics(base: [f32; 3], transform: DepthRangeProjectionConfig) -> [f32; 3] {
+    let rotated = depth_rotate_robot_extrinsic(
+        base,
+        transform.camera_pitch_rad,
+        transform.camera_roll_rad,
+        transform.camera_yaw_rad,
+    );
+    [
+        rotated[0] + transform.camera_forward_m,
+        rotated[1],
+        rotated[2] + transform.camera_height_m,
+    ]
+}
+
+fn depth_rotate_robot_extrinsic(
+    point: [f32; 3],
+    pitch_rad: f32,
+    roll_rad: f32,
+    yaw_rad: f32,
+) -> [f32; 3] {
+    let (pitch_sin, pitch_cos) = pitch_rad.sin_cos();
+    let mut x = point[0] * pitch_cos + point[2] * pitch_sin;
+    let y = point[1];
+    let mut z = -point[0] * pitch_sin + point[2] * pitch_cos;
+
+    let (roll_sin, roll_cos) = roll_rad.sin_cos();
+    let rolled_y = y * roll_cos - z * roll_sin;
+    z = y * roll_sin + z * roll_cos;
+
+    let (yaw_sin, yaw_cos) = yaw_rad.sin_cos();
+    let yawed_x = x * yaw_cos - rolled_y * yaw_sin;
+    let yawed_y = x * yaw_sin + rolled_y * yaw_cos;
+    x = yawed_x;
+
+    [x, yawed_y, z]
+}
+
+fn positive_or(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        fallback
+    }
+}
+
+impl FrameProcessor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_face_detector(mut self, detector: Arc<dyn FaceDetector>) -> Self {
+        self.face_detector = Some(detector);
+        self
+    }
+
+    pub fn with_object_detector(mut self, detector: Arc<dyn ObjectDetector>) -> Self {
+        self.object_detector = Some(detector);
+        self
+    }
+
+    pub fn with_kinect_range_projection(mut self, config: DepthRangeProjectionConfig) -> Self {
+        self.kinect_range_projection = Some(config);
+        self
+    }
+
+    pub fn process_packets(&mut self, t_ms: TimeMs, packets: &mut Vec<SensePacket>) {
+        self.process_kinect_range_packets(packets);
+
+        let Some(frame) = packets.iter().rev().find_map(|packet| match packet {
+            SensePacket::EyeFrame(frame) => Some(frame),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(processed) = self.process_frame(t_ms, frame) else {
+            return;
+        };
+        let summary_values = summary_extension_values(&processed);
+        packets.push(SensePacket::Eye(processed.eye));
+        if !processed.face.vectors.is_empty() {
+            packets.push(SensePacket::Face(processed.face));
+        }
+        if !processed.objects.observations.is_empty() || !processed.objects.vectors.is_empty() {
+            packets.push(SensePacket::Objects(processed.objects));
+        }
+        packets.push(SensePacket::Extension(ExtensionSense {
+            schema_version: 1,
+            name: "vision.frame_summary".to_string(),
+            values: summary_values,
+        }));
+    }
+
+    fn process_kinect_range_packets(&self, packets: &mut Vec<SensePacket>) {
+        if packets
+            .iter()
+            .any(|packet| matches!(packet, SensePacket::Range(_)))
+        {
+            return;
+        }
+        let Some(config) = self.kinect_range_projection else {
+            return;
+        };
+        let Some(kinect) = packets.iter().rev().find_map(|packet| match packet {
+            SensePacket::Kinect(kinect) => Some(kinect),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(range) = range_from_kinect_depth_with_config(kinect, Some(config)) else {
+            return;
+        };
+        packets.insert(0, SensePacket::Range(range));
+    }
+
+    pub fn process_snapshot(&mut self, t_ms: TimeMs, snapshot: &mut WorldSnapshot) {
+        let Some(frame) = snapshot.eye_frame.clone() else {
+            return;
+        };
+        let Some(processed) = self.process_frame(t_ms, &frame) else {
+            return;
+        };
+        let summary_values = summary_extension_values(&processed);
+        snapshot.eye = processed.eye;
+        if !processed.face.vectors.is_empty() {
+            snapshot.face = processed.face;
+        }
+        if !processed.objects.observations.is_empty() || !processed.objects.vectors.is_empty() {
+            snapshot.objects = processed.objects;
+        }
+        snapshot.extensions.push(ExtensionSense {
+            schema_version: 1,
+            name: "vision.frame_summary".to_string(),
+            values: summary_values,
+        });
+    }
+
+    pub fn process_frame(&mut self, t_ms: TimeMs, frame: &EyeFrame) -> Option<ProcessedFrame> {
+        let key = FrameKey::from(frame);
+        if self.last_processed_frame_key.as_ref() == Some(&key) {
+            return None;
+        }
+        self.last_processed_frame_key = Some(key);
+        Some(process_eye_frame(
+            t_ms,
+            frame,
+            self.face_detector.as_deref(),
+            self.object_detector.as_deref(),
+        ))
+    }
+}
