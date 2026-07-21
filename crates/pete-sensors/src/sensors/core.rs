@@ -4,6 +4,12 @@ pub trait SenseProducer {
         std::any::type_name::<Self>()
     }
 
+    /// Producer-owned health details such as queue depth and drop counts.
+    /// The runtime records this alongside its own timeout/failure accounting.
+    fn health_diagnostics(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     async fn poll(&mut self) -> Result<SensePacket>;
 }
 

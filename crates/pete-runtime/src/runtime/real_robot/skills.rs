@@ -115,6 +115,7 @@ struct SensorPollHealth {
     last_error: Option<String>,
     last_report_ms: TimeMs,
     last_success_ms: TimeMs,
+    producer: Option<serde_json::Value>,
 }
 
 const SENSOR_FAILURE_REPORT_INTERVAL_MS: TimeMs = 30_000;

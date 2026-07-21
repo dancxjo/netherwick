@@ -54,6 +54,7 @@ async fn poll_sensors_lossy(
         }));
     }
     for (sensor, health) in sensors.iter_mut().zip(health.iter_mut()) {
+        health.producer = sensor.health_diagnostics();
         let now_ms = wall_time_ms();
         match tokio::time::timeout(std::time::Duration::from_millis(25), sensor.poll()).await {
             Ok(Ok(packet)) => {
@@ -105,6 +106,7 @@ fn insert_sensor_health(now: &mut Now, health: &[SensorPollHealth]) {
                         "last_error": health.last_error,
                         "last_success_ms": health.last_success_ms,
                         "body_evidence_independent": true,
+                        "producer": health.producer,
                     })
                 })
                 .collect(),
