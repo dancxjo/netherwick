@@ -6,6 +6,11 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Add adaptive local-IMU calibration with odometry-confirmed stationary windows,
+  gyro bias/noise and temperature tracking, gravity-derived mounting, explicit
+  yaw observability and rotation-scale evidence, remount epochs, trust-gated
+  arbitration/fusion, capture provenance, and deterministic motion/remount tests.
+
 - Add the shared adaptive Kinect mount-calibration foundation: configured,
   estimating, trusted, degraded, and invalidated states; six-degree transform
   covariance and observability; evidence-source interfaces; residual-based

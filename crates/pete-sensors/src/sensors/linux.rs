@@ -413,6 +413,7 @@ fn mpu6050_samples_to_imu(bytes: [u8; 14], captured_at_ms: TimeMs) -> ImuSense {
     let accel_x = read_i16_be(bytes[0], bytes[1]) as f32 / 16_384.0;
     let accel_y = read_i16_be(bytes[2], bytes[3]) as f32 / 16_384.0;
     let accel_z = read_i16_be(bytes[4], bytes[5]) as f32 / 16_384.0;
+    let temperature_c = read_i16_be(bytes[6], bytes[7]) as f32 / 340.0 + 36.53;
     let gyro_x = (read_i16_be(bytes[8], bytes[9]) as f32 / 131.0).to_radians();
     let gyro_y = (read_i16_be(bytes[10], bytes[11]) as f32 / 131.0).to_radians();
     let gyro_z = (read_i16_be(bytes[12], bytes[13]) as f32 / 131.0).to_radians();
@@ -426,6 +427,7 @@ fn mpu6050_samples_to_imu(bytes: [u8; 14], captured_at_ms: TimeMs) -> ImuSense {
         orientation: vec![roll_rad, pitch_rad],
         acceleration: vec![accel_x, accel_y, accel_z],
         angular_velocity: vec![gyro_x, gyro_y, gyro_z],
+        temperature_c: Some(temperature_c),
         ..ImuSense::default()
     }
 }

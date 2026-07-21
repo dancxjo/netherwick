@@ -11,9 +11,11 @@ fn trustworthy_imu(source: &str, captured_at_ms: u64, source_epoch: u64) -> ImuS
         orientation: vec![0.1, -0.1],
         acceleration: vec![0.0, 0.0, 1.0],
         angular_velocity: vec![0.0, 0.0, 0.0],
+        temperature_c: None,
         orientation_confidence: 0.9,
         gyro_bias_calibrated: true,
         mounting_calibrated: true,
+        calibration: None,
         orientation_source: Some(format!("{source}@{source_epoch}:accel_gyro_roll_pitch")),
     }
 }
@@ -79,6 +81,45 @@ fn imu_auto_discovers_uncalibrated_brainstem_then_selects_after_calibration() {
     assert_eq!(
         arbiter.select(1_020).selected_source.as_deref(),
         Some("brainstem_board_imu")
+    );
+}
+
+#[test]
+fn schema3_imu_requires_trusted_adaptive_calibration() {
+    let mut missing = trustworthy_imu("local_i2c_mpu6050", 990, 0);
+    missing.schema_version = 3;
+    let mut arbiter = ImuArbiter::default();
+    arbiter.observe(missing, 1_000);
+    let rejected = arbiter.select(1_000);
+    assert!(rejected.selected_source.is_none());
+    assert!(rejected.diagnostics["candidates"][0]["rejection_reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("state is missing")));
+
+    let mut estimator = pete_now::ImuCalibrationEstimator::new(
+        pete_now::RigidTransform3::default(),
+        false,
+        0,
+        pete_now::ImuCalibrationConfig::default(),
+    );
+    for index in 0..60 {
+        estimator.observe(
+            [0.0, 0.0, 1.0],
+            [0.0; 3],
+            None,
+            pete_now::ImuMotionContext::default(),
+            index * 10,
+        );
+    }
+    for timestamp in [1_005, 1_010] {
+        let mut trusted = trustworthy_imu("local_i2c_mpu6050", timestamp, 0);
+        trusted.schema_version = 3;
+        trusted.calibration = Some(estimator.state().clone());
+        arbiter.observe(trusted, timestamp);
+    }
+    assert_eq!(
+        arbiter.select(1_010).selected_source.as_deref(),
+        Some("local_i2c_mpu6050")
     );
 }
 
@@ -664,6 +705,7 @@ fn converts_mpu6050_raw_samples_to_imu_sense() {
     assert_eq!(imu.schema_version, 1);
     assert_eq!(imu.captured_at_ms, 1234);
     assert_eq!(imu.acceleration, vec![0.0, 0.0, 1.0]);
+    assert_eq!(imu.temperature_c, Some(36.53));
     assert!((imu.angular_velocity[0] - 1.0_f32.to_radians()).abs() < 0.0001);
     assert!((imu.angular_velocity[1] - (-1.0_f32).to_radians()).abs() < 0.0001);
     assert!((imu.angular_velocity[2] - 2.0_f32.to_radians()).abs() < 0.0001);
@@ -695,8 +737,15 @@ fn mpu6050_filter_calibrates_bias_and_uses_gyro_when_acceleration_is_untrusted()
     assert!(moving.orientation[0] > 0.04);
     assert_eq!(
         moving.orientation_source.as_deref(),
-        Some("local_i2c_mpu6050@0:mpu6050_complementary_accel_gyro")
+        Some("local_i2c_mpu6050@0:adaptive_accel_gyro")
     );
+    let calibration = moving.calibration.expect("adaptive calibration");
+    assert!(calibration
+        .gyro_variance
+        .iter()
+        .all(|value| value.is_finite()));
+    assert!(calibration.temperature_c.is_none());
+    assert!(!calibration.yaw_axis_observable);
 }
 
 #[test]

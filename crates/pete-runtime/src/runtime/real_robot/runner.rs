@@ -238,7 +238,12 @@ where
         let observation = self.refresh_brainstem_observation()?;
         let body = observation.body.clone();
         let brainstem_events = self.cockpit.poll_events()?;
-        let mut packets = poll_sensors_lossy(&mut self.sensors, &mut self.sensor_poll_health).await;
+        let mut packets = poll_sensors_lossy(
+            &mut self.sensors,
+            &mut self.sensor_poll_health,
+            imu_motion_context(&body),
+        )
+        .await;
         let t_ms = body.last_update_ms.max(wall_time_ms());
         self.frame_processor.process_packets(t_ms, &mut packets);
         self.arbitrate_imu(&observation, &mut packets, t_ms);
@@ -337,7 +342,12 @@ where
         let body_before = observation.body.clone();
         let recovery_decision =
             self.apply_possession_recovery(&body_before, &brainstem_events, status_before)?;
-        let mut packets = poll_sensors_lossy(&mut self.sensors, &mut self.sensor_poll_health).await;
+        let mut packets = poll_sensors_lossy(
+            &mut self.sensors,
+            &mut self.sensor_poll_health,
+            imu_motion_context(&body_before),
+        )
+        .await;
         let t_ms = body_before.last_update_ms.max(wall_time_ms());
         self.frame_processor.process_packets(t_ms, &mut packets);
         self.arbitrate_imu(&observation, &mut packets, t_ms);

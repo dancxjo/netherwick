@@ -44,6 +44,7 @@ async fn enrich_now_latest_image(cognition: &mut LiveImageCognition, now: &mut N
 async fn poll_sensors_lossy(
     sensors: &mut [Box<dyn SenseProducer + Send>],
     health: &mut Vec<SensorPollHealth>,
+    motion_context: ImuMotionContext,
 ) -> Vec<pete_sensors::SensePacket> {
     let mut packets = Vec::new();
     if health.len() != sensors.len() {
@@ -54,6 +55,7 @@ async fn poll_sensors_lossy(
         }));
     }
     for (sensor, health) in sensors.iter_mut().zip(health.iter_mut()) {
+        sensor.set_motion_context(motion_context);
         health.producer = sensor.health_diagnostics();
         let now_ms = wall_time_ms();
         match tokio::time::timeout(std::time::Duration::from_millis(25), sensor.poll()).await {
@@ -75,6 +77,14 @@ async fn poll_sensors_lossy(
         }
     }
     packets
+}
+
+fn imu_motion_context(body: &BodySense) -> ImuMotionContext {
+    ImuMotionContext {
+        odometry_linear_mps: body.velocity.forward_m_s,
+        odometry_angular_rps: body.velocity.turn_rad_s,
+        ..ImuMotionContext::default()
+    }
 }
 
 fn record_optional_sensor_failure(health: &mut SensorPollHealth, error: String, now_ms: TimeMs) {
@@ -370,9 +380,11 @@ fn brainstem_imu_sense(
         orientation: vec![roll, pitch],
         acceleration: acceleration.to_vec(),
         angular_velocity: gyro.to_vec(),
+        temperature_c: None,
         orientation_confidence: f32::from(orientation_confidence).clamp(0.0, 1_000.0) / 1_000.0,
         gyro_bias_calibrated,
         mounting_calibrated,
+        calibration: None,
         orientation_source: Some(format!(
             "{source_id}@{}:{orientation_source}",
             source_epoch

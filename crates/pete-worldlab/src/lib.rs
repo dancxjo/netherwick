@@ -1101,6 +1101,11 @@ fn export_snapshot_assets_with_context(
             written_asset_metadata(root, &rel, capture_t_ms, Some(snapshot.imu.captured_at_ms), serde_json::json!({
                 "format": "imu_selection_json", "selected_source": snapshot.imu.source_id(),
                 "source_epoch": snapshot.imu.source_epoch(),
+                "calibration_epoch": snapshot.imu.calibration.as_ref().map(|value| value.epoch.id),
+                "calibration_trust": snapshot.imu.calibration.as_ref().map(|value| value.trust_state),
+                "temperature_c": snapshot.imu.temperature_c,
+                "gyro_bias_rad_s": snapshot.imu.calibration.as_ref().map(|value| value.gyro_bias_rad_s),
+                "gyro_variance": snapshot.imu.calibration.as_ref().map(|value| value.gyro_variance),
                 "candidate_count": context.imu_selection.as_ref().and_then(|value| value.get("candidates")).and_then(Value::as_array).map(Vec::len).unwrap_or(0),
             }))?,
         );

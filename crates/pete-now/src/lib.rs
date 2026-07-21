@@ -13,6 +13,7 @@ pub mod beliefs;
 pub mod calibration;
 pub mod depth_geometry;
 pub mod epistemic;
+pub mod imu_calibration;
 pub mod semantic;
 pub mod social;
 pub mod temporal;
@@ -40,6 +41,10 @@ pub use epistemic::{
     BeliefRef, EpistemicActionKind, EpistemicAffordance, EpistemicAttempt, EpistemicMetrics,
     EpistemicOutcome, EpistemicQuestion, EpistemicQuestionFamily, EpistemicSnapshot, HypothesisRef,
     QuestionId,
+};
+pub use imu_calibration::{
+    ImuCalibrationConfig, ImuCalibrationEstimator, ImuCalibrationState, ImuCalibrationTrustState,
+    ImuMotionContext,
 };
 pub use semantic::{
     SemanticActionId, SemanticBehaviorId, SemanticConceptId, SemanticContext, SemanticDriveId,
@@ -626,6 +631,8 @@ pub struct ImuSense {
     pub acceleration: Vec<f32>,
     /// Angular velocity in radians per second, `[x, y, z]`.
     pub angular_velocity: Vec<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature_c: Option<f32>,
     /// Confidence of the filtered orientation in the range 0..=1.
     #[serde(default)]
     pub orientation_confidence: f32,
@@ -635,6 +642,8 @@ pub struct ImuSense {
     /// True only when the IMU-to-base mounting transform was explicitly supplied.
     #[serde(default)]
     pub mounting_calibrated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration: Option<ImuCalibrationState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orientation_source: Option<String>,
 }
@@ -677,10 +686,20 @@ pub fn trusted_imu_orientation(imu: &ImuSense) -> TrustedImuOrientation {
     let roll = finite(0);
     let pitch = finite(1);
     let yaw = finite(2);
+    let adaptive_calibration_trusted = imu.schema_version < 3
+        || imu.calibration.as_ref().is_some_and(|calibration| {
+            calibration.trust_state == ImuCalibrationTrustState::Trusted
+                && calibration.roll_pitch_observable
+                && calibration
+                    .gyro_variance
+                    .iter()
+                    .all(|variance| variance.is_finite())
+        });
     let filter_trusted = imu.schema_version < 2
         || (imu.mounting_calibrated
             && imu.gyro_bias_calibrated
-            && imu.orientation_confidence >= 0.5);
+            && imu.orientation_confidence >= 0.5
+            && adaptive_calibration_trusted);
     let plausible = filter_trusted
         && roll.is_some_and(|value| value.abs() <= std::f32::consts::FRAC_PI_4)
         && pitch.is_some_and(|value| value.abs() <= std::f32::consts::FRAC_PI_4);

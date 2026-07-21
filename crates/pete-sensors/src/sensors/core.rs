@@ -10,6 +10,10 @@ pub trait SenseProducer {
         None
     }
 
+    /// Supplies current robot motion evidence before polling. Producers that
+    /// estimate stationary calibration may consume this; all others ignore it.
+    fn set_motion_context(&mut self, _motion: pete_now::ImuMotionContext) {}
+
     async fn poll(&mut self) -> Result<SensePacket>;
 }
 

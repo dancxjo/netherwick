@@ -89,3 +89,24 @@ count, and `kinect_history_ready`. Expected normal observations are:
 If a local provider is explicitly present, its candidate remains visible with its own history.
 Seeing `selected_source: brainstem_board_imu` plus the same provenance inside Kinect alignment is
 the direct proof that fusion is not using local I2C.
+
+## Adaptive local-IMU calibration
+
+The optional Motherbrain-local MPU-6050 now publishes calibration schema 3. Before every hardware
+poll, the real-robot runner supplies the latest Create linear and angular velocity. A stationary
+sample is accepted only when both inertial bounds and that independent odometry evidence agree;
+motion-contaminated candidates are counted and rejected. Accepted windows estimate gyro bias and
+noise, gravity direction, roll/pitch mounting, warm-up state, and temperature-dependent bias.
+
+Yaw mounting remains explicitly unobservable from gravity. Repeated odometry or environmental
+rotation evidence is required to determine its sign and bounded rate scale. Until evidence is
+available, the calibration record names yaw as uncertain rather than manufacturing confidence.
+An abrupt gravity or stationary-bias shift invalidates the current epoch, clears learned statistics,
+and requires stationary reconvergence. Schema-3 candidates must be in the trusted state with finite
+bias covariance before arbitration or geometry consumers accept them. Older schema-2 brainstem
+telemetry retains its existing compatibility gates.
+
+WorldLab capture metadata records calibration epoch, trust state, temperature, bias, and covariance
+so warm-up, remount, and drift behavior can be replayed without hardware. Physical acceptance still
+requires cold and warm stationary trials plus deliberate remount and clockwise/counter-clockwise
+rotation trials on the assembled robot.

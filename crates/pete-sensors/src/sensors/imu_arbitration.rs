@@ -434,6 +434,27 @@ fn candidate_rejection(
     if !sample.gyro_bias_calibrated {
         return Some("stationary gyro bias is uncalibrated".to_string());
     }
+    if sample.schema_version >= 3 {
+        let Some(calibration) = sample.calibration.as_ref() else {
+            return Some("adaptive IMU calibration state is missing".to_string());
+        };
+        if calibration.trust_state != pete_now::ImuCalibrationTrustState::Trusted {
+            return Some(format!(
+                "adaptive IMU calibration is {:?}",
+                calibration.trust_state
+            ));
+        }
+        if !calibration.roll_pitch_observable {
+            return Some("gravity-axis orientation is unobservable".to_string());
+        }
+        if calibration
+            .gyro_variance
+            .iter()
+            .any(|variance| !variance.is_finite())
+        {
+            return Some("gyro bias variance is invalid".to_string());
+        }
+    }
     if sample.orientation_confidence < IMU_MIN_ORIENTATION_CONFIDENCE {
         return Some("orientation confidence is inadequate".to_string());
     }
