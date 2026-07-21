@@ -404,6 +404,28 @@ fn udp_connector_runs_shared_session_conformance() {
     server.join().unwrap();
 }
 
+#[test]
+fn udp_connector_ignores_datagrams_from_unconfigured_senders() {
+    let server_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let attacker_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = server_socket.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let mut buffer = [0u8; MAX_COMPACT_HANDSHAKE_FRAME_LEN];
+        let (_, peer) = server_socket.recv_from(&mut buffer).unwrap();
+        attacker_socket.send_to(b"OK 1 forged\n", peer).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        server_socket
+            .send_to(b"OK 1 configured-brainstem\n", peer)
+            .unwrap();
+    });
+
+    let mut connector = UdpCockpit::connect(address).unwrap();
+    let status = connector.get_status().unwrap();
+
+    assert_eq!(status.raw, "OK 1 configured-brainstem");
+    server.join().unwrap();
+}
+
 fn read_http_test_body(stream: &mut TcpStream) -> String {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))

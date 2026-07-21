@@ -322,7 +322,6 @@ impl Cockpit for WebSocketCockpit {
 
 pub struct UdpCockpit {
     socket: UdpSocket,
-    brainstem: SocketAddr,
     next_seq: u32,
     timeout: Duration,
     active_session_id: Option<String>,
@@ -332,11 +331,11 @@ impl UdpCockpit {
     pub fn connect(brainstem: SocketAddr) -> Result<Self> {
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         let timeout = Duration::from_millis(750);
+        socket.connect(brainstem)?;
         socket.set_read_timeout(Some(timeout))?;
         socket.set_write_timeout(Some(timeout))?;
         Ok(Self {
             socket,
-            brainstem,
             next_seq: 1,
             timeout,
             active_session_id: None,
@@ -351,9 +350,9 @@ impl UdpCockpit {
     }
 
     fn request(&mut self, line: String) -> Result<String> {
-        self.socket.send_to(line.as_bytes(), self.brainstem)?;
+        self.socket.send(line.as_bytes())?;
         let mut buf = [0u8; MAX_COMPACT_HANDSHAKE_FRAME_LEN];
-        let (len, _) = self.socket.recv_from(&mut buf)?;
+        let len = self.socket.recv(&mut buf)?;
         response_from_bytes(&buf[..len])
     }
 
