@@ -576,7 +576,7 @@ fn range_from_kinect_depth_with_config(
             .filter(|count| *count > 0)
             .unwrap_or(FALLBACK_BEAM_COUNT)
             .min(projection.width.max(1));
-        return range_from_depth_image(depth, projection, beam_count, transform);
+        return range_from_depth_image(kinect, projection, beam_count, transform);
     }
 
     if config.is_some() && depth.len() == transform.compact_depth_beam_count {
@@ -611,10 +611,6 @@ fn range_from_kinect_depth_with_config(
 struct RangeDepthProjection {
     width: usize,
     height: usize,
-    fx: f32,
-    fy: f32,
-    cx: f32,
-    cy: f32,
     min_depth_m: f32,
     max_depth_m: f32,
 }
@@ -629,10 +625,6 @@ impl RangeDepthProjection {
         Some(Self {
             width,
             height,
-            fx: positive_or(kinect.depth_fx, 594.0),
-            fy: positive_or(kinect.depth_fy, 591.0),
-            cx: positive_or(kinect.depth_cx, (width as f32 - 1.0) * 0.5),
-            cy: positive_or(kinect.depth_cy, (height as f32 - 1.0) * 0.5),
             min_depth_m,
             max_depth_m,
         })
@@ -640,11 +632,12 @@ impl RangeDepthProjection {
 }
 
 fn range_from_depth_image(
-    depth: &[f32],
+    kinect: &KinectSense,
     projection: RangeDepthProjection,
     beam_count: usize,
     transform: DepthRangeProjectionConfig,
 ) -> Option<RangeSense> {
+    let geometry = pete_now::DepthGeometry::from_kinect(kinect)?;
     let beam_count = beam_count.max(1);
     let row_start = projection.height / 3;
     let row_end = (projection.height * 2 / 3)
@@ -656,8 +649,16 @@ fn range_from_depth_image(
             let u = ((beam as f32 + 0.5) * projection.width as f32 / beam_count as f32)
                 .clamp(0.0, projection.width.saturating_sub(1) as f32);
             let v = (projection.height as f32 - 1.0) * 0.5;
-            let camera = depth_image_camera_point(u, v, 1.0, projection);
-            robot_angle_for_camera_point(camera, transform)
+            let raw_depth_m = if kinect.geometry_calibration.is_some() {
+                1.0
+            } else {
+                transform.depth_scale
+            };
+            let camera = geometry
+                .depth_pixel_to_camera(u, v, raw_depth_m)
+                .unwrap_or([0.0, 0.0, 1.0]);
+            let robot = range_camera_point_to_robot(kinect, geometry, camera, transform);
+            robot[1].atan2(robot[0])
         })
         .collect::<Vec<_>>();
     let mut saw_valid = false;
@@ -665,16 +666,21 @@ fn range_from_depth_image(
     for y in row_start..row_end {
         let row = y * projection.width;
         for x in 0..projection.width {
-            let depth_m = depth[row + x] * transform.depth_scale;
-            if !depth_m.is_finite()
-                || depth_m < projection.min_depth_m
-                || depth_m > projection.max_depth_m
-            {
+            let raw_depth_m = kinect.depth_m[row + x];
+            let input_depth_m = if kinect.geometry_calibration.is_some() {
+                raw_depth_m
+            } else {
+                raw_depth_m * transform.depth_scale
+            };
+            let Some(camera) = geometry.depth_pixel_to_camera(x as f32, y as f32, input_depth_m)
+            else {
+                continue;
+            };
+            if camera[2] < projection.min_depth_m || camera[2] > projection.max_depth_m {
                 continue;
             }
             let beam = (x * beam_count / projection.width).min(beam_count - 1);
-            let camera = depth_image_camera_point(x as f32, y as f32, depth_m, projection);
-            let robot = depth_camera_point_to_robot(camera, transform);
+            let robot = range_camera_point_to_robot(kinect, geometry, camera, transform);
             let planar_distance = robot[0].hypot(robot[1]);
             if planar_distance.is_finite() && planar_distance < beams[beam] {
                 beams[beam] = planar_distance;
@@ -690,7 +696,7 @@ fn range_from_depth_image(
     let nearest_m = beams.iter().copied().reduce(f32::min);
     Some(RangeSense {
         schema_version: 1,
-        captured_at_ms: 0,
+        captured_at_ms: kinect.captured_at_ms,
         beams,
         nearest_m,
         beam_angles_rad: angles,
@@ -755,22 +761,17 @@ fn range_from_compact_depth(
     })
 }
 
-fn depth_image_camera_point(
-    u: f32,
-    v: f32,
-    depth_m: f32,
-    projection: RangeDepthProjection,
+fn range_camera_point_to_robot(
+    kinect: &KinectSense,
+    geometry: pete_now::DepthGeometry,
+    camera: [f32; 3],
+    transform: DepthRangeProjectionConfig,
 ) -> [f32; 3] {
-    [
-        (u - projection.cx) * depth_m / projection.fx.max(f32::EPSILON),
-        (v - projection.cy) * depth_m / projection.fy.max(f32::EPSILON),
-        depth_m,
-    ]
-}
-
-fn robot_angle_for_camera_point(camera: [f32; 3], transform: DepthRangeProjectionConfig) -> f32 {
-    let robot = depth_camera_point_to_robot(camera, transform);
-    robot[1].atan2(robot[0])
+    if kinect.geometry_calibration.is_some() {
+        geometry.depth_point_to_base(camera)
+    } else {
+        depth_camera_point_to_robot(camera, transform)
+    }
 }
 
 fn depth_camera_point_to_robot(

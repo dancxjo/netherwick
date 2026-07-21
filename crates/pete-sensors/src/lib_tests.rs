@@ -250,6 +250,52 @@ fn frame_processor_injects_calibrated_range_angles_from_kinect_depth() {
 }
 
 #[test]
+fn kinect_range_projection_uses_shared_metric_and_six_dof_calibration() {
+    let mut builder = NowBuilder::new();
+    let now = builder
+        .build(
+            100,
+            BodySense::default(),
+            vec![SensePacket::Kinect(KinectSense {
+                schema_version: 1,
+                captured_at_ms: 90,
+                depth_m: vec![1.0],
+                depth_width: 1,
+                depth_height: 1,
+                depth_fx: 1.0,
+                depth_fy: 1.0,
+                min_depth_m: 0.1,
+                max_depth_m: 8.0,
+                geometry_calibration: Some(pete_now::DepthGeometryCalibration {
+                    depth: pete_now::CameraIntrinsics {
+                        width: 1,
+                        height: 1,
+                        fx: 1.0,
+                        fy: 1.0,
+                        ..pete_now::CameraIntrinsics::default()
+                    },
+                    depth_scale: 2.0,
+                    depth_to_base: pete_now::RigidTransform3 {
+                        translation_m: [0.0, 0.4, 0.0],
+                        rotation_rpy_rad: [
+                            -std::f32::consts::FRAC_PI_2,
+                            0.0,
+                            -std::f32::consts::FRAC_PI_2,
+                        ],
+                    },
+                    ..pete_now::DepthGeometryCalibration::default()
+                }),
+                ..KinectSense::default()
+            })],
+        )
+        .unwrap();
+
+    assert_eq!(now.range.captured_at_ms, 90);
+    assert!((now.range.beams[0] - 2.0_f32.hypot(0.4)).abs() < 0.001);
+    assert!((now.range.beam_angles_rad[0] - 0.4_f32.atan2(2.0)).abs() < 0.001);
+}
+
+#[test]
 fn now_builder_keeps_explicit_range_over_kinect_fallback() {
     let mut builder = NowBuilder::new();
     let now = builder
