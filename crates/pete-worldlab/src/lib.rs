@@ -108,6 +108,8 @@ pub struct CaptureFrameAssets {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perception: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub camera: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lidar: Option<String>,
@@ -126,6 +128,7 @@ impl CaptureFrameAssets {
             && self.audio.is_none()
             && self.pointcloud.is_none()
             && self.perception.is_none()
+            && self.vision.is_none()
             && self.camera.is_none()
             && self.lidar.is_none()
             && self.imu.is_none()
@@ -456,6 +459,7 @@ fn requested_asset_kinds(frame: &QueuedCaptureFrame) -> Vec<String> {
         "calibration".to_string(),
         "lidar".to_string(),
         "imu".to_string(),
+        "vision".to_string(),
     ];
     if frame.export_rgb {
         kinds.extend(["rgb".to_string(), "camera".to_string()]);
@@ -765,6 +769,7 @@ fn default_asset_layout() -> Value {
         "audio": "assets/audio/",
         "pointcloud": "assets/pointcloud/",
         "perception": "assets/perception/",
+        "vision": "assets/vision/",
         "camera": "assets/camera/",
         "lidar": "assets/lidar/",
         "imu": "assets/imu/",
@@ -776,6 +781,7 @@ fn default_asset_layout() -> Value {
         "audio_format": "WAV PCM16",
         "pointcloud_format": "PLY ASCII",
         "perception_format": "JSON PerceptionFrame",
+        "vision_format": "JSON ObjectSense detections and backend health",
         "camera_format": "PNG RGB8",
         "lidar_format": "JSON RangeSense",
         "imu_format": "JSON selected sample plus candidate diagnostics",
@@ -1144,6 +1150,37 @@ fn export_snapshot_assets_with_context(
         metadata.insert(
             "transcript".to_string(),
             unavailable_asset_metadata(capture_t_ms, "audio transcript unavailable"),
+        );
+    }
+
+    if !snapshot.objects.detections.is_empty() || snapshot.objects.vision_health.is_some() {
+        let rel = capture_asset_path("vision", index, "json");
+        write_json_asset(&root.join(&rel), &snapshot.objects)?;
+        assets.vision = Some(rel.clone());
+        metadata.insert(
+            "vision".to_string(),
+            written_asset_metadata(
+                root,
+                &rel,
+                capture_t_ms,
+                snapshot
+                    .objects
+                    .detections
+                    .first()
+                    .map(|detection| detection.producer_timestamp_ms),
+                serde_json::json!({
+                    "format": "object_sense_json",
+                    "detections": snapshot.objects.detections.len(),
+                    "backend": snapshot.objects.vision_health.as_ref().map(|health| &health.backend),
+                    "state": snapshot.objects.vision_health.as_ref().map(|health| &health.state),
+                    "calibration_epochs": snapshot.objects.detections.iter().filter_map(|detection| detection.calibration_epoch).collect::<Vec<_>>(),
+                }),
+            )?,
+        );
+    } else {
+        metadata.insert(
+            "vision".to_string(),
+            unavailable_asset_metadata(capture_t_ms, "vision detections and health unavailable"),
         );
     }
 

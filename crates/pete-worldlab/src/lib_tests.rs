@@ -212,6 +212,38 @@ fn asset_export_reports_partial_depth_and_lidar_inputs() {
     );
 }
 
+#[test]
+fn asset_export_preserves_vision_results_and_health() {
+    let dir = tempdir().unwrap();
+    let mut snapshot = WorldSnapshot::default();
+    snapshot.objects.detections.push(pete_now::VisionDetection {
+        source_frame_id: "rgbd-1".to_string(),
+        producer_timestamp_ms: 100,
+        labels: vec![pete_now::VisionLabelHypothesis {
+            label: "chair".to_string(),
+            confidence: 0.6,
+        }],
+        ..pete_now::VisionDetection::default()
+    });
+    snapshot.objects.vision_health = Some(pete_now::VisionPipelineHealth {
+        state: pete_now::VisionBackendState::Ready,
+        ..pete_now::VisionPipelineHealth::default()
+    });
+
+    let export = export_snapshot_assets(dir.path(), 3, &snapshot, false, false, false).unwrap();
+    let path = export.assets.vision.expect("vision asset path");
+    let decoded: pete_now::ObjectSense =
+        serde_json::from_slice(&std_fs::read(dir.path().join(path)).unwrap()).unwrap();
+
+    assert_eq!(export.metadata["vision"]["status"], "written");
+    assert_eq!(export.metadata["vision"]["detections"], 1);
+    assert_eq!(decoded.detections[0].labels[0].label, "chair");
+    assert_eq!(
+        decoded.vision_health.unwrap().state,
+        pete_now::VisionBackendState::Ready
+    );
+}
+
 #[tokio::test]
 async fn capture_writer_writes_manifest_and_frames() {
     let dir = tempdir().unwrap();

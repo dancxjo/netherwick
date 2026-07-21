@@ -311,6 +311,7 @@ impl VisionJob {
 #[derive(Clone, Debug)]
 struct VisionBatch {
     detections: Vec<VisionDetection>,
+    source_rgbd_frame_id: Option<String>,
     calibration_epoch: Option<u64>,
     deadline_ms: u64,
 }
@@ -513,6 +514,17 @@ impl VisionPipeline {
                     .stale_results += 1;
                 continue;
             }
+            if batch.source_rgbd_frame_id.is_some()
+                && current_kinect.and_then(|kinect| kinect.rgbd_frame_id.as_ref())
+                    != batch.source_rgbd_frame_id.as_ref()
+            {
+                self.state
+                    .stats
+                    .lock()
+                    .expect("vision stats mutex poisoned")
+                    .stale_results += 1;
+                continue;
+            }
             detections.extend(batch.detections);
         }
         let queue_depth = queues.pending.len();
@@ -643,7 +655,7 @@ fn vision_worker(weak: std::sync::Weak<VisionPipelineState>) {
                     .detect(&prepared, state.config.maximum_detections)
                     .map(|proposals| (prepared, proposals))
             });
-        let duration_ms = started.elapsed().as_millis() as u64;
+        let duration_ms = (started.elapsed().as_millis() as u64).max(1);
         let completed_at_ms = if job.enqueued_at_ms > 1_000_000_000_000 {
             vision_wall_time_ms()
         } else {
@@ -727,6 +739,7 @@ fn vision_worker(weak: std::sync::Weak<VisionPipelineState>) {
         }
         queues.completed.push_back(VisionBatch {
             detections,
+            source_rgbd_frame_id: job.frame.rgbd_frame_id.clone(),
             calibration_epoch: job.calibration_epoch,
             deadline_ms: job.deadline_ms,
         });

@@ -1229,9 +1229,9 @@ fn inspect_asset_streams(
     frames: &[pete_worldlab::CaptureFrameRecord],
     health: &pete_worldlab::CaptureWriterHealth,
 ) -> Vec<AssetStreamInspection> {
-    const KINDS: [&str; 10] = [
+    const KINDS: [&str; 11] = [
         "rgb", "camera", "depth", "lidar", "imu", "audio", "transcript",
-        "calibration", "pointcloud", "perception",
+        "calibration", "pointcloud", "perception", "vision",
     ];
     KINDS
         .into_iter()
@@ -1392,7 +1392,7 @@ fn asset_details(frames: &[pete_worldlab::CaptureFrameRecord]) -> Vec<String> {
 fn asset_counts(root: &Path) -> Vec<(String, usize)> {
     [
         "rgb", "camera", "depth", "lidar", "imu", "audio", "transcript",
-        "calibration", "pointcloud", "perception",
+        "calibration", "pointcloud", "perception", "vision",
     ]
         .into_iter()
         .map(|kind| {

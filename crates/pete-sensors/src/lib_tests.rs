@@ -614,6 +614,43 @@ fn bounded_vision_queue_replaces_stale_work_without_blocking_caller() {
 }
 
 #[test]
+fn frame_processor_drains_background_camera_detections_on_a_later_tick() {
+    let pipeline = VisionPipeline::spawn(
+        VisionPipelineConfig {
+            input_width: 16,
+            input_height: 12,
+            maximum_fps: 100_000.0,
+            inference_deadline_ms: 500,
+            ..VisionPipelineConfig::default()
+        },
+        Arc::new(ClassicalSaliencyBackend),
+    );
+    let mut processor = FrameProcessor::new().with_vision_pipeline(pipeline);
+    let mut frame = vision_test_frame(100, true);
+    frame.rgbd_frame_id = None;
+    frame.source = Some("optional_camera".to_string());
+    let mut first_tick = vec![SensePacket::EyeFrame(frame)];
+
+    let started = std::time::Instant::now();
+    processor.process_packets(100, &mut first_tick);
+    assert!(started.elapsed() < std::time::Duration::from_millis(20));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let mut later_tick = Vec::new();
+    processor.process_packets(120, &mut later_tick);
+
+    let objects = later_tick
+        .iter()
+        .find_map(|packet| match packet {
+            SensePacket::Objects(objects) => Some(objects),
+            _ => None,
+        })
+        .expect("background object packet");
+    assert_eq!(objects.detections.len(), 1);
+    assert_eq!(objects.detections[0].source_stream, "optional_camera");
+    assert_eq!(objects.vision_health.as_ref().unwrap().processed_frames, 1);
+}
+
+#[test]
 fn unavailable_vision_backend_degrades_explicitly() {
     let pipeline = VisionPipeline::spawn(
         VisionPipelineConfig {
@@ -634,6 +671,144 @@ fn unavailable_vision_backend_degrades_explicitly() {
         .as_deref()
         .unwrap()
         .contains("model not installed"));
+}
+
+#[test]
+fn vision_pipeline_rejects_expired_and_old_calibration_epoch_results() {
+    let pipeline = VisionPipeline::spawn(
+        VisionPipelineConfig::default(),
+        Arc::new(ClassicalSaliencyBackend),
+    );
+    let calibration = CalibrationStateMachine::new(
+        pete_now::RigidTransform3::default(),
+        0,
+        CalibrationStateConfig::default(),
+    );
+    let mut kinect = KinectSense::default();
+    kinect.rgbd_frame_id = Some("rgbd-current".to_string());
+    kinect.live_geometry_calibration = Some(calibration.estimate().clone());
+    let current_epoch = kinect.live_geometry_calibration.as_ref().unwrap().epoch.id;
+    {
+        let mut queues = pipeline.state.queues.lock().unwrap();
+        queues.completed.push_back(VisionBatch {
+            detections: vec![VisionDetection::default()],
+            source_rgbd_frame_id: None,
+            calibration_epoch: Some(current_epoch.saturating_add(1)),
+            deadline_ms: 1_000,
+        });
+        queues.completed.push_back(VisionBatch {
+            detections: vec![VisionDetection::default()],
+            source_rgbd_frame_id: None,
+            calibration_epoch: Some(current_epoch),
+            deadline_ms: 10,
+        });
+        queues.completed.push_back(VisionBatch {
+            detections: vec![VisionDetection::default()],
+            source_rgbd_frame_id: Some("rgbd-old".to_string()),
+            calibration_epoch: Some(current_epoch),
+            deadline_ms: 1_000,
+        });
+    }
+
+    let objects = pipeline.drain(20, Some(&kinect));
+    let health = objects.vision_health.unwrap();
+    assert!(objects.detections.is_empty());
+    assert_eq!(health.stale_results, 2);
+    assert_eq!(health.expired_frames, 1);
+}
+
+#[test]
+fn vision_depth_association_explains_missing_depth() {
+    let frame = vision_test_frame(100, true);
+    let job = VisionJob {
+        enqueued_at_ms: 100,
+        deadline_ms: 280,
+        source_frame_id: "rgbd-100".to_string(),
+        source_sensation_id: "vision-source-100".to_string(),
+        source_snapshot_id: "rgbd-100:epoch:none".to_string(),
+        source_stream: "kinect_rgb".to_string(),
+        calibration_epoch: None,
+        frame,
+        kinect: None,
+    };
+
+    let (position, reasons) = associate_depth(
+        &job,
+        VisionBoundingBox {
+            x: 5,
+            y: 3,
+            width: 7,
+            height: 6,
+        },
+    );
+    assert!(position.is_none());
+    assert_eq!(reasons, vec!["depth snapshot unavailable"]);
+}
+
+#[test]
+fn vision_depth_association_uses_only_matching_physically_validated_rgbd() {
+    let frame = vision_test_frame(100, true);
+    let mut kinect = KinectSense {
+        rgbd_frame_id: frame.rgbd_frame_id.clone(),
+        captured_at_ms: 100,
+        depth_width: 16,
+        depth_height: 12,
+        depth_m: vec![2.0; 16 * 12],
+        geometry_calibration: Some(pete_now::DepthGeometryCalibration {
+            calibrated: true,
+            depth: pete_now::CameraIntrinsics {
+                width: 16,
+                height: 12,
+                fx: 14.0,
+                fy: 14.0,
+                cx: 7.5,
+                cy: 5.5,
+                distortion: [0.0; 5],
+            },
+            depth_scale: 1.0,
+            validation: Some(pete_now::DepthCalibrationValidation {
+                distance_sample_count: 4,
+                min_test_distance_m: 0.4,
+                max_test_distance_m: 3.0,
+                max_plane_distance_error_m: 0.01,
+                rgb_depth_boundary_error_px: 2.0,
+            }),
+            ..pete_now::DepthGeometryCalibration::default()
+        }),
+        ..KinectSense::default()
+    };
+    let job = VisionJob {
+        enqueued_at_ms: 100,
+        deadline_ms: 280,
+        source_frame_id: "rgbd-100".to_string(),
+        source_sensation_id: "vision-source-100".to_string(),
+        source_snapshot_id: "rgbd-100:epoch:none".to_string(),
+        source_stream: "kinect_rgb".to_string(),
+        calibration_epoch: None,
+        frame,
+        kinect: Some(kinect.clone()),
+    };
+    let bbox = VisionBoundingBox {
+        x: 5,
+        y: 3,
+        width: 7,
+        height: 6,
+    };
+
+    let (position, reasons) = associate_depth(&job, bbox);
+    let position = position.expect("trusted matching depth position");
+    assert!((position.depth_m - 2.0).abs() < 0.001);
+    assert!(position.world_position_m.is_none());
+    assert_eq!(reasons, vec!["world pose alignment unavailable"]);
+
+    kinect.rgbd_frame_id = Some("rgbd-other".to_string());
+    let mismatched = VisionJob {
+        kinect: Some(kinect),
+        ..job
+    };
+    let (position, reasons) = associate_depth(&mismatched, bbox);
+    assert!(position.is_none());
+    assert_eq!(reasons, vec!["RGB and depth frame identities do not match"]);
 }
 
 #[test]
