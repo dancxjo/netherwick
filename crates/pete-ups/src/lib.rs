@@ -302,7 +302,7 @@ fn charging_trend(
 }
 
 fn create_state_is_charging(state: u8) -> bool {
-    matches!(state, 1..=5)
+    matches!(state, 1..=3)
 }
 
 fn evidence_fresh(now_ms: u64, observed_at_ms: u64, maximum_age_ms: u64) -> bool {
@@ -490,6 +490,27 @@ charging_enabled_on_start = true
         assert!(!assessment.battery_current_observable);
         assert_eq!(assessment.battery_current_a, None);
         assert_eq!(assessment.action, "proceed");
+    }
+
+    #[test]
+    fn create_waiting_and_fault_states_never_prove_charging() {
+        let now = 20_000;
+        for charging_state in [4, 5] {
+            let assessment = assess_consolidation_power(
+                now,
+                Some(&ups(now, true, true, 4.0, 80.0)),
+                None,
+                Some(&create(now, true, Some(charging_state))),
+                &PowerEvidencePolicy::default(),
+            );
+            assert_eq!(assessment.create_charging_state, Some(charging_state));
+            assert_eq!(assessment.create_charging, Some(false));
+            assert!(!assessment.consolidation_ready, "{assessment:?}");
+            assert!(assessment
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("Create OI charging")));
+        }
     }
 
     #[test]
