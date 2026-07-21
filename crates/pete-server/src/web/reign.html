@@ -1,0 +1,93 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Pete Reign</title>
+<style>
+body{font:16px system-ui;margin:2rem;max-width:780px}
+button,input,select{font:inherit;margin:.25rem;padding:.5rem}
+button.stop{background:#b00020;color:white}
+#latest{white-space:pre-wrap;background:#f5f5f5;padding:1rem}
+.chirps{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.35rem;margin:.75rem 0}
+.chirps button{text-align:left}
+.chirps small{display:block;color:#555;font-size:.75rem;line-height:1.2}
+</style>
+<h1>Reign Remote</h1>
+<select id="mode">
+  <option>Direct</option><option>Assist</option><option>Suggest</option><option>ObserveOnly</option>
+</select>
+<button class="stop" onclick="send({type:'Stop'},60000)">STOP</button>
+<button onclick="send({type:'Go',intensity:.4,duration_ms:700},12000)">Forward</button>
+<button onclick="send({type:'Reverse',intensity:.4,duration_ms:700},12000)">Reverse</button>
+<button onclick="send({type:'Turn',direction:'Left',intensity:.5,duration_ms:500},12000)">Turn Left</button>
+<button onclick="send({type:'Turn',direction:'Right',intensity:.5,duration_ms:500},12000)">Turn Right</button>
+<button onclick="send({type:'Dock'},60000)">Dock</button>
+<button onclick="send({type:'Explore',duration_ms:3000},60000)">Explore</button>
+<input id="say" placeholder="Speak text"><button onclick="speak()">Speak</button>
+<section>
+  <h2>Chirps</h2>
+  <div class="chirps" aria-label="chirp controls">
+    <button onclick="chirp('Confirm')" title="79,84,79; bright, decisive confirmation">Confirm<small>79,84,79; decisive</small></button>
+    <button onclick="chirp('Warning')" title="79,75; rejection, warning, or nope">Warning<small>79,75; nope</small></button>
+    <button onclick="chirp('Hello')" title="72,76,79; ascending greeting">Hello<small>72,76,79; greeting</small></button>
+    <button onclick="chirp('Goodbye')" title="79,76,72; descending farewell">Goodbye<small>79,76,72; farewell</small></button>
+    <button onclick="chirp('Curious')" title="72,76,74; unresolved question or interest">Curious<small>72,76,74; unresolved</small></button>
+    <button onclick="chirp('Idea')" title="76,81,84; rising idea or realization">Idea<small>76,81,84; climbing</small></button>
+    <button onclick="chirp('GoalAcquired')" title="72,79,84,91; little fanfare for finding a goal">Goal acquired<small>72,79,84,91; fanfare</small></button>
+    <button onclick="chirp('Searching')" title="72,74,76,74; gentle oscillation while looking">Searching<small>72,74,76,74; oscillation</small></button>
+    <button onclick="chirp('SawSomething')" title="84,91; quick widened-attention signal">Saw something<small>84,91; attention</small></button>
+    <button onclick="chirp('Surprise')" title="72,84; big leap for surprise">Surprise<small>72,84; leap</small></button>
+    <button onclick="chirp('Learned')" title="74,79,83; settled memory or learning">Learned<small>74,79,83; settled</small></button>
+    <button onclick="chirp('PersonRecognized')" title="76,79,84,79; warm arch for a recognized person">Person recognized<small>76,79,84,79; warm arch</small></button>
+    <button onclick="chirp('ObjectRecognized')" title="79,84,76; recognition motif for an object">Object recognized<small>79,84,76; motif</small></button>
+    <button onclick="chirp('PlaceRecognized')" title="79,84,72; recognition motif for a place">Place recognized<small>79,84,72; motif</small></button>
+    <button onclick="chirp('DidntUnderstand')" title="79,81,78; crooked ending for confusion">Did not understand<small>79,81,78; crooked</small></button>
+    <button onclick="chirp('Docking')" title="67,72,76,79; climbing toward home">Docking<small>67,72,76,79; homeward</small></button>
+    <button onclick="chirp('ChargingStarted')" title="60,67,72; solid foundation for charging contact">Charging started<small>60,67,72; foundation</small></button>
+    <button onclick="chirp('Sleep')" title="79,76,72,67; gentle descent into rest">Sleep<small>79,76,72,67; descent</small></button>
+    <button onclick="chirp('Wake')" title="67,72,79; upward stretch into activity">Wake<small>67,72,79; upward</small></button>
+  </div>
+</section>
+<pre id="latest">loading...</pre>
+<script>
+let reignSocket = null;
+function reignSocketUrl(){
+  return `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/reign/command/ws`;
+}
+function getReignSocket(){
+  if(reignSocket && (reignSocket.readyState === WebSocket.OPEN || reignSocket.readyState === WebSocket.CONNECTING)) return reignSocket;
+  reignSocket = new WebSocket(reignSocketUrl());
+  reignSocket.addEventListener('message', event => {
+    try{
+      const response = JSON.parse(event.data);
+      if(response.accepted) refresh();
+      else latest.textContent = response.error || 'reign websocket command failed';
+    }catch(_error){}
+  });
+  reignSocket.addEventListener('close', () => { reignSocket = null; });
+  reignSocket.addEventListener('error', () => { reignSocket?.close(); });
+  return reignSocket;
+}
+async function send(command, ttl_ms){
+  const body = JSON.stringify({mode:mode.value,priority:1,ttl_ms,command});
+  const socket = getReignSocket();
+  if(socket.readyState === WebSocket.OPEN){
+    socket.send(body);
+    return;
+  }
+  await fetch('/reign/command',{method:'POST',headers:{'content-type':'application/json'},body});
+  refresh();
+}
+function speak(){ const text = say.value.trim(); if(text) send({type:'Speak',text},120000); }
+function chirp(pattern){ send({type:'Chirp',pattern},60000); }
+async function refresh(){ latest.textContent = JSON.stringify(await (await fetch('/reign/state')).json(), null, 2); }
+addEventListener('keydown', e => {
+  if(e.repeat) return;
+  if(e.code === 'Space') send({type:'Stop'},60000);
+  if(e.key === 'w') send({type:'Go',intensity:.4,duration_ms:700},12000);
+  if(e.key === 'a') send({type:'Turn',direction:'Left',intensity:.5,duration_ms:500},12000);
+  if(e.key === 'd') send({type:'Turn',direction:'Right',intensity:.5,duration_ms:500},12000);
+  if(e.key === 's') send({type:'Stop'},60000);
+  if(e.key === 'c') send({type:'Dock'},60000);
+  if(e.key === 'e') send({type:'Explore',duration_ms:3000},60000);
+});
+refresh(); setInterval(refresh, 1000);
+</script>"#;

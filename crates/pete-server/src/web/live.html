@@ -1,0 +1,438 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pete Robot View</title>
+<style>
+:root{color-scheme:dark;background:#101214;color:#eef1f3;font:14px system-ui}
+body{margin:0;min-height:100vh;display:grid;grid-template-columns:minmax(0,1fr) minmax(360px,460px)}
+main{display:grid;place-items:center;background:#070809}
+canvas{width:min(100vw,calc((100vh - 28px)*1.333));height:auto;image-rendering:pixelated;background:#111;border:1px solid #34383c}
+aside{border-left:1px solid #2f3337;padding:16px;background:#171a1d;overflow:auto;max-height:100vh}
+h1{font-size:16px;margin:0 0 14px}
+h2{font-size:13px;margin:18px 0 8px;color:#c9d2da}
+a{color:#8bd3ff}
+dl{display:grid;grid-template-columns:auto 1fr;gap:8px 12px;margin:0 0 18px}
+dt{color:#9aa4ad}
+dd{margin:0;text-align:right;font-variant-numeric:tabular-nums}
+#status{color:#ffcf7a;margin-bottom:12px;min-height:20px}
+.beams{display:flex;align-items:end;gap:5px;height:96px;margin-top:8px}
+.beam{flex:1;background:#60d394;min-height:2px}
+.graph-controls{display:grid;grid-template-columns:1fr auto;gap:8px;margin:8px 0}
+.graph-controls input,.graph-controls select,.graph-controls button{min-width:0;background:#101316;color:#eef1f3;border:1px solid #394049;border-radius:6px;padding:7px}
+.graph-controls select{grid-column:1 / 3}
+.graph-summary{color:#9aa4ad;font-size:12px;margin:4px 0 8px}
+.graph-list{display:grid;gap:6px;margin:0}
+.graph-node,.graph-edge,.graph-memory{border:1px solid #30363d;border-radius:6px;background:#111519;padding:8px;overflow-wrap:anywhere}
+.graph-node[data-type="sensation"]{border-left:3px solid #60d394}
+.graph-node[data-type="impression"]{border-left:3px solid #8bd3ff}
+.graph-node[data-type="experience"]{border-left:3px solid #ffcf7a}
+.graph-node[data-type="prediction"]{border-left:3px solid #d7a8ff}
+.graph-node[data-type="memory_link"]{border-left:3px solid #f5a97f}
+.graph-title{font-weight:650;font-size:12px}
+.graph-meta{color:#9aa4ad;font-size:11px;margin-top:3px}
+.graph-detail{font-size:12px;margin-top:5px;line-height:1.35}
+.graph-edge{font-size:12px;color:#c9d2da}
+@media(max-width:760px){body{display:block}aside{border-left:0;border-top:1px solid #2f3337}canvas{width:100vw}}
+</style>
+<main><canvas id="eye" width="64" height="48"></canvas></main>
+<aside>
+  <h1>Robot View</h1>
+  <p><a href="/view/3d">Open 3D sensorium</a></p>
+  <div id="status">waiting for frames...</div>
+  <dl>
+    <dt>t</dt><dd id="t">-</dd>
+    <dt>x</dt><dd id="x">-</dd>
+    <dt>y</dt><dd id="y">-</dd>
+    <dt>heading</dt><dd id="heading">-</dd>
+    <dt>battery</dt><dd id="battery">-</dd>
+    <dt>stuck</dt><dd id="stuck">-</dd>
+    <dt>nearest</dt><dd id="nearest">-</dd>
+    <dt>gps lat</dt><dd id="gps_lat">-</dd>
+    <dt>gps lon</dt><dd id="gps_lon">-</dd>
+    <dt>gps alt</dt><dd id="gps_alt">-</dd>
+    <dt>eye format</dt><dd id="eye_format">-</dd>
+    <dt>eye age</dt><dd id="eye_age">-</dd>
+    <dt>ear age</dt><dd id="ear_age">-</dd>
+  </dl>
+  <div>Range</div>
+  <div class="beams" id="beams"></div>
+  <h2>Embodied lineage</h2>
+  <div class="graph-controls">
+    <input id="graph_query" placeholder="Search ids, text, model">
+    <button id="graph_refresh" type="button">Refresh</button>
+    <select id="graph_modality">
+      <option value="">All modalities</option>
+      <option value="vision">Vision</option>
+      <option value="audio">Audio</option>
+      <option value="depth">Depth</option>
+      <option value="lidar">Lidar</option>
+      <option value="touch">Touch</option>
+      <option value="odometry">Odometry</option>
+      <option value="memory">Memory</option>
+      <option value="language">Language</option>
+      <option value="other">Other</option>
+    </select>
+  </div>
+  <div class="graph-summary" id="graph_summary">waiting for embodied experience...</div>
+  <div class="graph-list" id="graph_nodes"></div>
+  <h2>Edges</h2>
+  <div class="graph-list" id="graph_edges"></div>
+  <h2>Recent memories</h2>
+  <div class="graph-list" id="graph_memories"></div>
+</aside>
+<script>
+const canvas = document.getElementById('eye');
+const ctx = canvas.getContext('2d');
+const fields = Object.fromEntries(['t','x','y','heading','battery','nearest','gps_lat','gps_lon','gps_alt','eye_format','eye_age','ear_age'].map(id => [id, document.getElementById(id)]));
+const status = document.getElementById('status');
+const beams = document.getElementById('beams');
+const graphQuery = document.getElementById('graph_query');
+const graphModality = document.getElementById('graph_modality');
+const graphSummary = document.getElementById('graph_summary');
+const graphNodes = document.getElementById('graph_nodes');
+const graphEdges = document.getElementById('graph_edges');
+const graphMemories = document.getElementById('graph_memories');
+let latestGraph = null;
+function fmt(value, digits = 2){
+  return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '-';
+}
+function drawEye(frame){
+  if(!frame) return;
+  const fmt = frame.format;
+  const isRgb = fmt === 'Rgb8' || (typeof fmt === 'object' && fmt.Rgb8 !== undefined);
+  const isBgr = fmt === 'Bgr8' || (typeof fmt === 'object' && fmt.Bgr8 !== undefined);
+  const isGray = fmt === 'Gray8' || (typeof fmt === 'object' && fmt.Gray8 !== undefined);
+  const isYuyv = fmt === 'Yuyv422' || (typeof fmt === 'object' && fmt.Yuyv422 !== undefined);
+  const isUyvy = fmt === 'Uyvy422' || (typeof fmt === 'object' && fmt.Uyvy422 !== undefined);
+  const isMjpg = fmt === 'Mjpeg' || (typeof fmt === 'object' && fmt.Mjpeg !== undefined) || (typeof fmt === 'object' && JSON.stringify(fmt).includes('MJPG'));
+  if(isRgb || isBgr || isGray || isYuyv || isUyvy){
+    if(canvas.width !== frame.width || canvas.height !== frame.height){
+      canvas.width = frame.width; canvas.height = frame.height;
+    }
+    const image = ctx.createImageData(frame.width, frame.height);
+    if(isGray){
+      for(let source = 0, target = 0; target < image.data.length && source < frame.bytes.length; source += 1, target += 4){
+        const value = frame.bytes[source];
+        image.data[target] = value;
+        image.data[target + 1] = value;
+        image.data[target + 2] = value;
+        image.data[target + 3] = 255;
+      }
+    }else if(isYuyv || isUyvy){
+      for(let source = 0, target = 0; target + 7 < image.data.length && source + 3 < frame.bytes.length; source += 4, target += 8){
+        const y0 = isUyvy ? frame.bytes[source + 1] : frame.bytes[source];
+        const u = isUyvy ? frame.bytes[source] : frame.bytes[source + 1];
+        const y1 = isUyvy ? frame.bytes[source + 3] : frame.bytes[source + 2];
+        const v = isUyvy ? frame.bytes[source + 2] : frame.bytes[source + 3];
+        writeYuvPixel(image.data, target, y0, u, v);
+        writeYuvPixel(image.data, target + 4, y1, u, v);
+      }
+    }else{
+      for(let source = 0, target = 0; target < image.data.length && source + 2 < frame.bytes.length; source += 3, target += 4){
+        image.data[target] = isBgr ? frame.bytes[source + 2] : frame.bytes[source];
+        image.data[target + 1] = frame.bytes[source + 1];
+        image.data[target + 2] = isBgr ? frame.bytes[source] : frame.bytes[source + 2];
+        image.data[target + 3] = 255;
+      }
+    }
+    ctx.putImageData(image, 0, 0);
+  } else if(isMjpg){
+    const blob = new Blob([new Uint8Array(frame.bytes)], {type: 'image/jpeg'});
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => {
+      if(canvas.width !== img.width || canvas.height !== img.height){
+        canvas.width = img.width; canvas.height = img.height;
+      }
+      ctx.drawImage(img, 0, 0);
+      URL.revokeObjectURL(url);
+    };
+    img.src = url;
+  }
+}
+function drawEyeDataUrl(dataUrl){
+  if(!dataUrl) return false;
+  const img = new Image();
+  img.onload = () => {
+    if(canvas.width !== img.width || canvas.height !== img.height){
+      canvas.width = img.width; canvas.height = img.height;
+    }
+    ctx.drawImage(img, 0, 0);
+  };
+  img.src = dataUrl;
+  return true;
+}
+function writeYuvPixel(data, target, y, u, v){
+  const c = y - 16, d = u - 128, e = v - 128;
+  data[target] = Math.max(0, Math.min(255, (298 * c + 409 * e + 128) >> 8));
+  data[target + 1] = Math.max(0, Math.min(255, (298 * c - 100 * d - 208 * e + 128) >> 8));
+  data[target + 2] = Math.max(0, Math.min(255, (298 * c + 516 * d + 128) >> 8));
+  data[target + 3] = 255;
+}
+function shouldGenerateEye(scenePacket){
+  const session = scenePacket?.session || {};
+  const mode = String(session.mode || '').toLowerCase();
+  const virtualMode =
+    session.source === 'sim' ||
+    mode.includes('virtual') ||
+    mode.includes('read-only') ||
+    mode.includes('readonly');
+  if(!virtualMode) return false;
+  if(scenePacket?.eye?.source === 'babylon-robot-eye') return false;
+  const eye = scenePacket?.eye;
+  return !eye || !eye.data_url || eye.mean_luma < .08 || eye.non_background_ratio < .01;
+}
+function colorForObject(item){
+  if(item.color_rgb) return `rgb(${item.color_rgb[0]},${item.color_rgb[1]},${item.color_rgb[2]})`;
+  return {charger:'#45d483', person:'#e8c08c', speaker:'#778cff', obstacle:'#d67666', landmark:'#b0b8c0'}[item.kind] || '#b0b8c0';
+}
+function drawGeneratedEye(scenePacket){
+  if(!scenePacket?.body) return false;
+  const width = 160, height = 120, horizon = 54;
+  if(canvas.width !== width || canvas.height !== height){
+    canvas.width = width; canvas.height = height;
+  }
+  const g = ctx.createLinearGradient(0, 0, 0, horizon);
+  g.addColorStop(0, '#253646');
+  g.addColorStop(1, '#55636d');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, width, horizon);
+  const floor = ctx.createLinearGradient(0, horizon, 0, height);
+  floor.addColorStop(0, '#555954');
+  floor.addColorStop(1, '#262b29');
+  ctx.fillStyle = floor;
+  ctx.fillRect(0, horizon, width, height - horizon);
+  ctx.strokeStyle = 'rgba(255,255,255,.16)';
+  ctx.lineWidth = 1;
+  for(let y = horizon + 10; y < height; y += Math.max(5, (y - horizon) * .22)){
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke();
+  }
+  const body = scenePacket.body;
+  const fov = Math.PI * .62;
+  const visible = (scenePacket.objects || []).map(item => {
+    const dx = item.x_m - body.x_m, dy = item.y_m - body.y_m;
+    const forward = dx * Math.cos(body.heading_rad) + dy * Math.sin(body.heading_rad);
+    const lateral = -dx * Math.sin(body.heading_rad) + dy * Math.cos(body.heading_rad);
+    const angle = Math.atan2(lateral, forward);
+    return {...item, forward, angle};
+  }).filter(item => item.forward > .05 && Math.abs(item.angle) < fov * .55)
+    .sort((a, b) => b.forward - a.forward);
+  for(const item of visible){
+    const cx = width * .5 + (item.angle / (fov * .5)) * width * .5;
+    const near = Math.max(.18, item.forward);
+    const radiusPx = Math.max(5, item.radius_m / near * 58);
+    const h = Math.max(8, radiusPx * ({person:4.2, speaker:2.0, charger:.9, landmark:2.4}[item.kind] || 2.2));
+    const y = horizon + Math.min(45, 28 / near);
+    ctx.fillStyle = colorForObject(item);
+    ctx.strokeStyle = 'rgba(0,0,0,.45)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    if(item.kind === 'person'){
+      ctx.ellipse(cx, y - h * .45, radiusPx * .8, h * .5, 0, 0, Math.PI * 2);
+    }else if(item.kind === 'speaker'){
+      ctx.moveTo(cx, y - h);
+      ctx.lineTo(cx + radiusPx * 1.3, y);
+      ctx.lineTo(cx - radiusPx * 1.3, y);
+      ctx.closePath();
+    }else{
+      ctx.rect(cx - radiusPx, y - h, radiusPx * 2, h);
+    }
+    ctx.fill();
+    ctx.stroke();
+  }
+  ctx.strokeStyle = 'rgba(255,207,102,.9)';
+  ctx.beginPath();
+  ctx.moveTo(width / 2 - 8, height / 2); ctx.lineTo(width / 2 + 8, height / 2);
+  ctx.moveTo(width / 2, height / 2 - 8); ctx.lineTo(width / 2, height / 2 + 8);
+  ctx.stroke();
+  return true;
+}
+function drawBeams(values){
+  beams.replaceChildren(...(values || []).map(value => {
+    const bar = document.createElement('div');
+    bar.className = 'beam';
+    bar.style.height = `${Math.max(4, value * 96)}px`;
+    bar.style.opacity = `${0.35 + (1 - value) * 0.65}`;
+    return bar;
+  }));
+}
+function graphMatches(node, query, modality){
+  if(modality && node.modality !== modality) return false;
+  if(!query) return true;
+  return JSON.stringify(node).toLowerCase().includes(query);
+}
+function escapeHtml(value){
+  return String(value).replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+}
+function renderGraph(){
+  if(!latestGraph){
+    graphSummary.textContent = 'waiting for embodied experience...';
+    graphNodes.replaceChildren();
+    graphEdges.replaceChildren();
+    graphMemories.replaceChildren();
+    return;
+  }
+  const query = graphQuery.value.trim().toLowerCase();
+  const modality = graphModality.value;
+  const vectorsByNode = new Map();
+  for(const vector of latestGraph.vector_metadata || []){
+    const list = vectorsByNode.get(vector.owner_node_id) || [];
+    list.push(vector);
+    vectorsByNode.set(vector.owner_node_id, list);
+  }
+  const visibleNodes = (latestGraph.nodes || []).filter(node => graphMatches(node, query, modality));
+  const visibleIds = new Set(visibleNodes.map(node => node.id));
+  graphSummary.textContent = `${visibleNodes.length}/${(latestGraph.nodes || []).length} nodes, ${(latestGraph.edges || []).length} edges | ${latestGraph.summary || 'no summary'}`;
+  graphNodes.replaceChildren(...visibleNodes.map(node => {
+    const item = document.createElement('div');
+    item.className = 'graph-node';
+    item.dataset.type = node.node_type;
+    const vectorText = (vectorsByNode.get(node.id) || [])
+      .map(vector => `${vector.model_id} dim=${vector.dim} source=${vector.source_sensation_id}`)
+      .join(' | ');
+    item.innerHTML = `
+      <div class="graph-title">${escapeHtml(node.label)} ${node.derived ? '<span class="graph-meta">(derived)</span>' : ''}</div>
+      <div class="graph-meta">${escapeHtml(node.node_type)} ${escapeHtml(node.modality || '')} ${escapeHtml(node.payload_kind || '')} | ${escapeHtml(node.entity_id)}</div>
+      ${node.detail ? `<div class="graph-detail">${escapeHtml(node.detail)}</div>` : ''}
+      ${vectorText ? `<div class="graph-meta">vector: ${escapeHtml(vectorText)}</div>` : ''}
+    `;
+    return item;
+  }));
+  const visibleEdges = (latestGraph.edges || []).filter(edge =>
+    visibleIds.has(edge.from) || visibleIds.has(edge.to) || (!query && !modality)
+  );
+  graphEdges.replaceChildren(...visibleEdges.slice(0, 80).map(edge => {
+    const item = document.createElement('div');
+    item.className = 'graph-edge';
+    item.textContent = `${edge.from} -> ${edge.to} (${edge.relation})`;
+    return item;
+  }));
+  const visibleMemories = (latestGraph.recent_memories || []).filter(memory =>
+    !query || JSON.stringify(memory).toLowerCase().includes(query)
+  );
+  graphMemories.replaceChildren(...visibleMemories.map(memory => {
+    const item = document.createElement('div');
+    item.className = 'graph-memory';
+    item.innerHTML = `<div class="graph-title">${escapeHtml(memory.relation)} ${fmt(memory.score, 2)}</div><div class="graph-meta">${escapeHtml(memory.target_id)}</div>${memory.text ? `<div class="graph-detail">${escapeHtml(memory.text)}</div>` : ''}`;
+    return item;
+  }));
+  if(!visibleMemories.length){
+    const item = document.createElement('div');
+    item.className = 'graph-meta';
+    item.textContent = 'none';
+    graphMemories.replaceChildren(item);
+  }
+}
+async function refreshGraph(){
+  try{
+    const response = await fetch('/api/experience/lineage', {cache:'no-store'});
+    if(!response.ok) throw new Error(await response.text());
+    latestGraph = await response.json();
+    renderGraph();
+  }catch(error){
+    graphSummary.textContent = error.message || String(error);
+  }
+}
+async function refresh(){
+  try{
+    const sceneResponse = await fetch('/view/scene', {cache:'no-store'});
+    if(sceneResponse.ok){
+      const scenePacket = await sceneResponse.json();
+      const body = scenePacket.body;
+      fields.t.textContent = `${scenePacket.t_ms} ms`;
+      fields.x.textContent = `${fmt(body.x_m)} m`;
+      fields.y.textContent = `${fmt(body.y_m)} m`;
+      fields.heading.textContent = `${fmt(body.heading_rad)} rad`;
+      fields.battery.textContent = `${fmt(body.battery_level * 100, 1)}%`;
+      fields.nearest.textContent = scenePacket.range?.nearest_m == null ? '-' : `${fmt(scenePacket.range.nearest_m)} m`;
+      fields.gps_lat.textContent = '-';
+      fields.gps_lon.textContent = '-';
+      fields.gps_alt.textContent = '-';
+      if(scenePacket.eye){
+        const eye = scenePacket.eye;
+        const isAuth = eye.authoritative ? " (auth)" : " (symbolic)";
+        const statusText = eye.retina_connected ? `connected, age ${eye.retina_last_frame_age_ms}ms` : "disconnected";
+        fields.eye_format.textContent = `${eye.width}x${eye.height} luma ${fmt(eye.mean_luma, 2)} | source: ${eye.source}${isAuth} | retina: ${statusText} | rx: ${eye.frames_received} tx: ${eye.frames_written_to_ledger}`;
+        fields.eye_format.style.color = '';
+        fields.eye_format.style.fontWeight = '';
+        fields.eye_age.textContent = '-';
+        drawEyeDataUrl(eye.data_url);
+      }else{
+        fields.eye_format.textContent = '-';
+        fields.eye_age.textContent = '-';
+      }
+      fields.ear_age.textContent = '-';
+      drawBeams((scenePacket.range?.beams || []).map(beam => beam.distance_m));
+      status.textContent = 'live';
+      refreshGraph();
+      return;
+    }
+    const response = await fetch('/view/snapshot', {cache:'no-store'});
+    if(!response.ok) throw new Error(await response.text());
+    const snapshot = await response.json();
+    const scenePacket = null;
+    const body = snapshot.body;
+    fields.t.textContent = `${snapshot.t_ms} ms`;
+    fields.x.textContent = `${fmt(body.odometry.x_m)} m`;
+    fields.y.textContent = `${fmt(body.odometry.y_m)} m`;
+    fields.heading.textContent = `${fmt(body.odometry.heading_rad)} rad`;
+    fields.battery.textContent = `${fmt(body.battery_level * 100, 1)}%`;
+    fields.nearest.textContent = snapshot.range.nearest_m == null ? '-' : `${fmt(snapshot.range.nearest_m)} m`;
+    const gps = snapshot.gps;
+    if(gps){
+      fields.gps_lat.textContent = fmt(gps.lat, 6);
+      fields.gps_lon.textContent = fmt(gps.lon, 6);
+      fields.gps_alt.textContent = gps.altitude_m != null ? `${fmt(gps.altitude_m, 1)} m` : '-';
+    }else{
+      fields.gps_lat.textContent = '-';
+      fields.gps_lon.textContent = '-';
+      fields.gps_alt.textContent = '-';
+    }
+    if(snapshot.eye_frame){
+      let fmt_str = typeof snapshot.eye_frame.format === 'string' ? snapshot.eye_frame.format : JSON.stringify(snapshot.eye_frame.format);
+      if(scenePacket && scenePacket.eye){
+        const eye = scenePacket.eye;
+        const isAuth = eye.authoritative ? " (auth)" : " (symbolic)";
+        const statusText = eye.retina_connected ? `connected, age ${eye.retina_last_frame_age_ms}ms` : "disconnected";
+        fields.eye_format.textContent = `${eye.width}x${eye.height} luma ${fmt(eye.mean_luma, 2)} | source: ${eye.source}${isAuth} | retina: ${statusText} | rx: ${eye.frames_received} tx: ${eye.frames_written_to_ledger}`;
+        if (eye.source === 'babylon-robot-eye' && !eye.retina_connected) {
+          fields.eye_format.style.color = '#ff4444';
+          fields.eye_format.style.fontWeight = 'bold';
+        } else {
+          fields.eye_format.style.color = '';
+          fields.eye_format.style.fontWeight = '';
+        }
+      } else {
+        const src = snapshot.eye_frame.source || 'none';
+        fields.eye_format.textContent = `${fmt_str} (src: ${src})`;
+        fields.eye_format.style.color = '';
+        fields.eye_format.style.fontWeight = '';
+      }
+      fields.eye_age.textContent = `${snapshot.t_ms - snapshot.eye_frame.captured_at_ms} ms`;
+    }else{
+      fields.eye_format.textContent = '-';
+      fields.eye_format.style.color = '';
+      fields.eye_format.style.fontWeight = '';
+      fields.eye_age.textContent = '-';
+    }
+    if(snapshot.ear_pcm){
+      fields.ear_age.textContent = `${snapshot.t_ms - snapshot.ear_pcm.captured_at_ms} ms`;
+    }else{
+      fields.ear_age.textContent = '-';
+    }
+    drawEye(snapshot.eye_frame);
+    const generated = shouldGenerateEye(scenePacket) && drawGeneratedEye(scenePacket);
+    drawBeams(snapshot.range.beams);
+    status.textContent = generated ? 'live generated eye' : 'live';
+    refreshGraph();
+  }catch(error){
+    status.textContent = 'waiting for frames...';
+  }finally{
+    setTimeout(refresh, 250);
+  }
+}
+graphQuery.addEventListener('input', renderGraph);
+graphModality.addEventListener('change', renderGraph);
+document.getElementById('graph_refresh').addEventListener('click', refreshGraph);
+refresh();
+</script>"#;
