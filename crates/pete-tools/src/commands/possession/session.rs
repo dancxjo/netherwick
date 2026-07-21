@@ -729,7 +729,12 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         Ok(report) => report,
         Err(readiness_error) if robot_mode == RobotMode::Slow => {
             return match run_possession_shutdown(cockpit.as_mut()) {
-                Ok(()) => Err(readiness_error),
+                Ok(()) => {
+                    eprintln!(
+                        "required sensor startup failed; STOP and exorcize acknowledged before exit"
+                    );
+                    Err(readiness_error)
+                }
                 Err(shutdown_error) => anyhow::bail!(
                     "sensor startup failed and possession shutdown also failed: readiness: {readiness_error:#}; shutdown: {shutdown_error:#}"
                 ),
