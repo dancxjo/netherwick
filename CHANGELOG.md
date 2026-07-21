@@ -42,6 +42,10 @@ All notable changes are grouped by date.
 - Add capture stream expansion to include optional `camera`, `lidar`, `imu`,
   `transcript`, and `calibration` assets plus `camera`/`calibration` provenance,
   while keeping `capture schema v2` compatibility through manifest and frame metadata.
+- Add capture startup diagnostics for physical possession, including optional stream
+  readiness gating via `--require-camera`, `--require-kinect`, and
+  `--require-llm` plus `--sensor-readiness-timeout-ms`/`PETE_SENSOR_READINESS_TIMEOUT_MS`
+  to fail fast when required streams are unavailable.
 
 ### Fixed
 
@@ -65,6 +69,12 @@ All notable changes are grouped by date.
 - Keep charging completion in docking dependent on VerifyCharging freshness and
   charging-state code, and return source/state metadata so consumers can
   distinguish create-derived evidence.
+- Ready: Keep live possession snapshots compact by stripping large sensor payload
+  blobs from JSON records, exporting raw assets with capture metadata, and
+  rehydrating stripped fields when opening capture records.
+- Ready: Harden capture durability checks by validating dropped-frame telemetry from
+  bounded background writer queues and ensuring dropped frames/assets are tracked
+  and surfaced in manifest writer health.
 - Timestamp physical capture frames with the canonical fused runtime-frame time
   while retaining body and sensor producer timestamps as provenance, preventing
   stale Create packets from collapsing asynchronous sensor evidence onto duplicate

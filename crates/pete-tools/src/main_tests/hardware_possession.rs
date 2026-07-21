@@ -237,7 +237,7 @@ async fn physical_capture_uses_runtime_time_and_writes_raw_sensor_assets() {
     tick.frame.now.t_ms = 250;
     tick.frame.now.body.last_update_ms = 100;
 
-    append_real_robot_snapshot(&mut writer, &snapshot, &tick)
+    append_real_robot_snapshot(&mut writer, snapshot, &tick)
         .await
         .unwrap();
     writer.finish().await.unwrap();

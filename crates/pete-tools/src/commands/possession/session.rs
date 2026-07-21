@@ -7,8 +7,110 @@ struct BrainstemMotionSafety {
     operator_acknowledged: bool,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct StartupStreamStatus {
+    name: String,
+    required: bool,
+    active: bool,
+    detail: String,
+    diagnostics: Value,
+}
+
+#[derive(Clone)]
+struct PendingSensorReadiness {
+    name: &'static str,
+    required: bool,
+    readiness: BackgroundSenseReadiness,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct SensorStartupReport {
+    timeout_ms: u64,
+    brainstem_polls: u64,
+    streams: Vec<StartupStreamStatus>,
+}
+
+impl SensorStartupReport {
+    fn active_names(&self) -> Vec<String> {
+        self.streams
+            .iter()
+            .filter(|stream| stream.active)
+            .map(|stream| stream.name.clone())
+            .collect()
+    }
+
+    fn missing_names(&self) -> Vec<String> {
+        self.streams
+            .iter()
+            .filter(|stream| !stream.active)
+            .map(|stream| stream.name.clone())
+            .collect()
+    }
+}
+
+fn startup_stream(
+    name: impl Into<String>,
+    required: bool,
+    active: bool,
+    detail: impl Into<String>,
+) -> StartupStreamStatus {
+    StartupStreamStatus {
+        name: name.into(),
+        required,
+        active,
+        detail: detail.into(),
+        diagnostics: Value::Null,
+    }
+}
+
+async fn llm_startup_status(config: &LlmConfig, required: bool) -> StartupStreamStatus {
+    if config.provider == LlmProvider::Disabled {
+        return startup_stream("llm", required, false, "disabled by configuration");
+    }
+    let endpoint = format!("{}/api/tags", config.endpoint.trim_end_matches('/'));
+    let timeout = Duration::from_millis(config.timeout_ms.clamp(1, 1_000));
+    let result = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|error| error.to_string());
+    let result = match result {
+        Ok(client) => client
+            .get(&endpoint)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(()) => startup_stream(
+            "llm",
+            required,
+            true,
+            format!(
+                "Ollama ready at {}; timeout={} ms, num_ctx={:?}, num_predict={:?}, num_thread={:?}, live_images={}",
+                config.endpoint,
+                config.timeout_ms,
+                config.num_ctx,
+                config.num_predict,
+                config.num_thread,
+                config.enrich_live_images,
+            ),
+        ),
+        Err(error) => startup_stream(
+            "llm",
+            required,
+            false,
+            format!("Ollama unavailable at {}: {error}", config.endpoint),
+        ),
+    }
+}
+
 async fn run_robot(args: RobotArgs) -> Result<()> {
     let env_report = collect_hardware_env_report().await;
+    let llm_config = configured_llm_config(&args.llm)?;
+    let llm_status = llm_startup_status(&llm_config, args.require_llm).await;
     let lidar_device = selected_lidar_device(
         args.lidar.as_deref(),
         args.cockpit == CockpitBackendArg::Sim,
@@ -155,6 +257,8 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     }
 
     let mut sensors: Vec<Box<dyn SenseProducer + Send>> = Vec::new();
+    let mut pending_sensor_readiness = Vec::new();
+    let mut startup_streams = vec![llm_status];
     let lidar_extrinsics = lidar_extrinsics(
         args.lidar_forward_m,
         args.lidar_left_m,
@@ -170,11 +274,17 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
                 "Kinect depth enabled; using libfreenect for Kinect RGB/depth and not opening {device} through V4L"
             );
         }
+        startup_streams.push(startup_stream(
+            "camera",
+            args.require_camera,
+            false,
+            "V4L camera disabled because Kinect RGB/depth is selected",
+        ));
     } else if let Some(device) = &args.camera {
         match CameraSenseProvider::new(device) {
             Ok(provider) => {
                 let live_state_for_camera = live_state.clone();
-                sensors.push(Box::new(BackgroundSenseProducer::spawn_with_callback(
+                let producer = BackgroundSenseProducer::spawn_with_callback(
                     "camera",
                     provider,
                     Duration::from_millis(33),
@@ -186,16 +296,30 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
                             publish_live_sensor_only_snapshot(live_state, packet);
                         }
                     },
-                )));
+                );
+                pending_sensor_readiness.push(PendingSensorReadiness {
+                    name: "camera",
+                    required: args.require_camera,
+                    readiness: producer.readiness(),
+                });
+                sensors.push(Box::new(producer));
             }
             Err(err) => {
-                if args.require_camera {
-                    anyhow::bail!("failed to initialize camera: {err}");
-                } else {
-                    println!("failed to initialize camera: {err}; continuing without it");
-                }
+                startup_streams.push(startup_stream(
+                    "camera",
+                    args.require_camera,
+                    false,
+                    format!("failed to initialize V4L camera {device}: {err}"),
+                ));
             }
         }
+    } else {
+        startup_streams.push(startup_stream(
+            "camera",
+            args.require_camera,
+            false,
+            "CAMERA_DEVICE/--camera not configured",
+        ));
     }
 
     if args.kinect_depth {
@@ -205,7 +329,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         {
             Ok(provider) => {
                 let live_state_for_kinect = live_state.clone();
-                sensors.push(Box::new(BackgroundSenseProducer::spawn_with_callback(
+                let producer = BackgroundSenseProducer::spawn_with_callback(
                     "kinect-depth",
                     provider,
                     Duration::from_millis(33),
@@ -219,16 +343,37 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
                             }
                         }
                     },
-                )));
+                );
+                pending_sensor_readiness.push(PendingSensorReadiness {
+                    name: "kinect-rgb-depth",
+                    required: args.require_kinect,
+                    readiness: producer.readiness(),
+                });
+                sensors.push(Box::new(producer));
             }
             Err(err) => {
-                println!("failed to initialize Kinect depth: {err}; continuing without it");
+                startup_streams.push(startup_stream(
+                    "kinect-rgb-depth",
+                    args.require_kinect,
+                    false,
+                    format!("failed to initialize Kinect RGB/depth: {err}"),
+                ));
             }
         }
         #[cfg(not(feature = "kinect-freenect"))]
-        println!(
-            "failed to initialize Kinect depth: rebuild with --features kinect-freenect; continuing without it"
-        );
+        startup_streams.push(startup_stream(
+            "kinect-rgb-depth",
+            args.require_kinect,
+            false,
+            "rebuild pete-tools with --features kinect-freenect",
+        ));
+    } else {
+        startup_streams.push(startup_stream(
+            "kinect-rgb-depth",
+            args.require_kinect,
+            false,
+            "PETE_KINECT_DEPTH=0/--kinect-depth not selected",
+        ));
     }
 
     if let Some(device) = &args.mic {
@@ -244,7 +389,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         match MicrophoneSenseProvider::with_asr_config(pref_name, asr_config) {
             Ok(provider) => {
                 let live_state_for_mic = live_state.clone();
-                sensors.push(Box::new(BackgroundSenseProducer::spawn_with_callback(
+                let producer = BackgroundSenseProducer::spawn_with_callback(
                     "microphone",
                     provider,
                     Duration::from_millis(25),
@@ -255,16 +400,30 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
                             }
                         }
                     },
-                )));
+                );
+                pending_sensor_readiness.push(PendingSensorReadiness {
+                    name: "microphone",
+                    required: args.require_mic,
+                    readiness: producer.readiness(),
+                });
+                sensors.push(Box::new(producer));
             }
             Err(err) => {
-                if args.require_mic {
-                    anyhow::bail!("failed to initialize mic: {err}");
-                } else {
-                    println!("failed to initialize mic: {err}; continuing without it");
-                }
+                startup_streams.push(startup_stream(
+                    "microphone",
+                    args.require_mic,
+                    false,
+                    format!("failed to initialize microphone {device}: {err}"),
+                ));
             }
         }
+    } else {
+        startup_streams.push(startup_stream(
+            "microphone",
+            args.require_mic,
+            false,
+            "MIC_DEVICE/--mic not configured",
+        ));
     }
 
     if let Some(device) = lidar_device.as_deref() {
@@ -279,7 +438,12 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             if args.require_lidar || args.lidar.is_some() {
                 anyhow::bail!(error);
             }
-            println!("{error}; continuing without lidar");
+            startup_streams.push(startup_stream(
+                "lidar",
+                args.require_lidar,
+                false,
+                error,
+            ));
         } else {
             match Lfcd2SenseProvider::with_extrinsics(device, lidar_extrinsics) {
                 Ok(provider) => {
@@ -293,23 +457,35 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
                         args.lidar_pitch_deg,
                         args.lidar_yaw_deg
                     );
-                    sensors.push(Box::new(provider));
+                    let producer = BackgroundSenseProducer::spawn(
+                        "lidar",
+                        provider,
+                        Duration::from_millis(25),
+                    );
+                    pending_sensor_readiness.push(PendingSensorReadiness {
+                        name: "lidar",
+                        required: args.require_lidar,
+                        readiness: producer.readiness(),
+                    });
+                    sensors.push(Box::new(producer));
                 }
                 Err(err) => {
-                    if args.require_lidar {
-                        anyhow::bail!("failed to initialize HLS-LFCD2 lidar: {err}");
-                    } else {
-                        println!(
-                            "failed to initialize HLS-LFCD2 lidar: {err}; continuing without it"
-                        );
-                    }
+                    startup_streams.push(startup_stream(
+                        "lidar",
+                        args.require_lidar,
+                        false,
+                        format!("failed to initialize HLS-LFCD2 lidar {device}: {err}"),
+                    ));
                 }
             }
         }
-    } else if args.require_lidar {
-        anyhow::bail!(
-            "--require-lidar was set but no HLS-LFCD2 device was detected; pass --lidar /dev/serial/by-id/DEVICE"
-        );
+    } else {
+        startup_streams.push(startup_stream(
+            "lidar",
+            args.require_lidar,
+            false,
+            "no HLS-LFCD2 device detected; configure LIDAR_SERIAL_PORT/--lidar",
+        ));
     }
 
     if let Some(device) = selected_gps_device(
@@ -319,15 +495,32 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         create_port.as_deref(),
     ) {
         match GpsSenseProvider::new(&device, 9600) {
-            Ok(provider) => sensors.push(Box::new(provider)),
+            Ok(provider) => {
+                let producer =
+                    BackgroundSenseProducer::spawn("gps", provider, Duration::from_millis(100));
+                pending_sensor_readiness.push(PendingSensorReadiness {
+                    name: "gps",
+                    required: args.require_gps,
+                    readiness: producer.readiness(),
+                });
+                sensors.push(Box::new(producer));
+            }
             Err(err) => {
-                if args.require_gps {
-                    anyhow::bail!("failed to initialize gps: {err}");
-                } else {
-                    println!("failed to initialize gps: {err}; continuing without it");
-                }
+                startup_streams.push(startup_stream(
+                    "gps",
+                    args.require_gps,
+                    false,
+                    format!("failed to initialize GPS {device}: {err}"),
+                ));
             }
         }
+    } else {
+        startup_streams.push(startup_stream(
+            "gps",
+            args.require_gps,
+            false,
+            "no GPS device configured or detected",
+        ));
     }
 
     if let Some(device) = local_imu_provider_allowed(&args)
@@ -337,7 +530,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         match ImuSenseProvider::new(device) {
             Ok(provider) => {
                 let live_state_for_imu = live_state.clone();
-                sensors.push(Box::new(BackgroundSenseProducer::spawn_with_callback(
+                let producer = BackgroundSenseProducer::spawn_with_callback(
                     "imu",
                     provider,
                     Duration::from_millis(25),
@@ -348,16 +541,30 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
                             }
                         }
                     },
-                )));
+                );
+                pending_sensor_readiness.push(PendingSensorReadiness {
+                    name: "local-imu",
+                    required: args.require_imu && args.imu_source == ImuSourceArg::LocalI2c,
+                    readiness: producer.readiness(),
+                });
+                sensors.push(Box::new(producer));
             }
             Err(err) => {
-                if args.require_imu {
-                    anyhow::bail!("failed to initialize imu: {err}");
-                } else {
-                    println!("failed to initialize imu: {err}; continuing without it");
-                }
+                startup_streams.push(startup_stream(
+                    "local-imu",
+                    args.require_imu && args.imu_source == ImuSourceArg::LocalI2c,
+                    false,
+                    format!("failed to initialize local diagnostic IMU {device}: {err}"),
+                ));
             }
         }
+    } else {
+        startup_streams.push(startup_stream(
+            "local-imu",
+            args.require_imu && args.imu_source == ImuSourceArg::LocalI2c,
+            false,
+            "no supported local diagnostic IMU selected or discovered",
+        ));
     }
 
     let mut mouth = match QueuedPiperCpalMouth::from_env() {
@@ -570,10 +777,10 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
                 live_state.update_with_runtime_map(snapshot.clone(), runtime_map.as_ref());
                 live_state.update_embodied_context(tick.frame.embodied_context());
             }
-            if let Some(writer) = capture.as_mut() {
-                append_real_robot_snapshot(writer, &snapshot, &tick).await?;
-            }
             let motion_note = slow_motion_note(&snapshot);
+            if let Some(writer) = capture.as_mut() {
+                append_real_robot_snapshot(writer, snapshot, &tick).await?;
+            }
             println!(
                 "robot {:?} tick {}: battery {:.2}, chosen {:?}{}",
                 robot_mode,
@@ -812,13 +1019,13 @@ fn combine_robot_exit_results(
 
 async fn append_real_robot_snapshot(
     writer: &mut CaptureWriter,
-    snapshot: &WorldSnapshot,
+    snapshot: WorldSnapshot,
     tick: &RuntimeTick,
 ) -> Result<()> {
     writer
         .append_snapshot_with_exported_assets_and_context(
             tick.frame.now.t_ms,
-            snapshot.clone(),
+            snapshot,
             Vec::new(),
             true,
             true,

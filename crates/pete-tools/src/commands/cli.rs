@@ -615,6 +615,8 @@ struct RobotArgs {
     #[arg(long)]
     require_camera: bool,
     #[arg(long)]
+    require_kinect: bool,
+    #[arg(long)]
     require_mic: bool,
     #[arg(long)]
     require_imu: bool,
@@ -622,6 +624,15 @@ struct RobotArgs {
     require_gps: bool,
     #[arg(long)]
     require_lidar: bool,
+    #[arg(long)]
+    require_llm: bool,
+    /// Time allowed for configured sensors to emit their first usable packet.
+    #[arg(
+        long,
+        default_value_t = 3_000,
+        env = "PETE_SENSOR_READINESS_TIMEOUT_MS"
+    )]
+    sensor_readiness_timeout_ms: u64,
     #[command(flatten)]
     llm: LlmArgs,
 }

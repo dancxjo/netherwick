@@ -179,6 +179,8 @@ pub struct CaptureWriter {
     frame_count: u64,
     background: Option<BackgroundCaptureWriter>,
     writer_health: CaptureWriterHealth,
+    #[cfg(test)]
+    background_write_delay: std::time::Duration,
 }
 
 impl CaptureWriter {
@@ -243,6 +245,8 @@ impl CaptureWriter {
                 queue_capacity: CAPTURE_QUEUE_CAPACITY,
                 ..CaptureWriterHealth::default()
             },
+            #[cfg(test)]
+            background_write_delay: std::time::Duration::ZERO,
         })
     }
 
@@ -368,6 +372,8 @@ impl CaptureWriter {
             .context("capture frame file is unavailable")?;
         let mut frames = frames.into_std().await;
         let root = self.root.clone();
+        #[cfg(test)]
+        let background_write_delay = self.background_write_delay;
         let (sender, receiver) = mpsc::sync_channel(CAPTURE_QUEUE_CAPACITY);
         let worker = std::thread::Builder::new()
             .name("pete-capture-writer".to_string())
@@ -379,6 +385,8 @@ impl CaptureWriter {
                 while let Ok(command) = receiver.recv() {
                     match command {
                         BackgroundCommand::Frame(frame) => {
+                            #[cfg(test)]
+                            std::thread::sleep(background_write_delay);
                             match write_queued_capture_frame(&root, &mut frames, frame) {
                                 Ok(()) => {
                                     health.written_frames = health.written_frames.saturating_add(1)
@@ -436,6 +444,11 @@ impl CaptureWriter {
     pub fn root(&self) -> &Path {
         &self.root
     }
+
+    #[cfg(test)]
+    fn set_background_write_delay(&mut self, delay: std::time::Duration) {
+        self.background_write_delay = delay;
+    }
 }
 
 fn requested_asset_kinds(frame: &QueuedCaptureFrame) -> Vec<String> {
@@ -476,10 +489,12 @@ fn write_queued_capture_frame(
         .as_object()
         .is_some_and(|metadata| !metadata.is_empty())
         .then_some(export.metadata);
+    let mut snapshot = frame.snapshot;
+    strip_exported_payloads(&mut snapshot, &export.assets);
     let record = CaptureFrameRecord {
         index: frame.index,
         t_ms: frame.t_ms,
-        snapshot: frame.snapshot,
+        snapshot,
         events: frame.events,
         assets: export.assets,
         stream_metadata: metadata,
@@ -487,6 +502,146 @@ fn write_queued_capture_frame(
     serde_json::to_writer(&mut *frames, &record)?;
     frames.write_all(b"\n")?;
     Ok(())
+}
+
+fn strip_exported_payloads(snapshot: &mut WorldSnapshot, assets: &CaptureFrameAssets) {
+    if assets.camera.is_some() || assets.rgb.is_some() {
+        if let Some(frame) = snapshot.eye_frame.as_mut() {
+            frame.bytes.clear();
+        }
+        if let Some(frame) = snapshot.kinect.color_frame.as_mut() {
+            frame.bytes.clear();
+        }
+    }
+    if assets.depth.is_some() {
+        snapshot.kinect.depth_m.clear();
+    }
+    if assets.audio.is_some() {
+        if let Some(audio) = snapshot.ear_pcm.as_mut() {
+            audio.samples.clear();
+        }
+    }
+    if assets.lidar.is_some() {
+        snapshot.range.beams.clear();
+        snapshot.range.beam_angles_rad.clear();
+        snapshot.range.beam_time_offsets_ms.clear();
+        snapshot.range.beam_poses.clear();
+    }
+}
+
+/// Restore losslessly externalized sensor payloads for replay and offline
+/// derivation. Compact frame JSON remains useful on its own, while readers get
+/// the same raw arrays that were present at capture time.
+pub fn hydrate_frame_assets(root: &Path, frame: &mut CaptureFrameRecord) -> Result<()> {
+    if let Some(rel) = frame.assets.depth.as_deref() {
+        let path = root.join(rel);
+        if path.exists() {
+            let image = image::open(&path)
+                .with_context(|| format!("reading depth asset {}", path.display()))?
+                .to_luma16();
+            frame.snapshot.kinect.depth_width = image.width();
+            frame.snapshot.kinect.depth_height = image.height();
+            frame.snapshot.kinect.depth_m = image
+                .into_raw()
+                .into_iter()
+                .map(|millimeters| millimeters as f32 * 0.001)
+                .collect();
+        }
+    }
+    if let Some(rel) = frame.assets.camera.clone() {
+        hydrate_rgb_asset(root, &rel, frame, false)?;
+    } else if let Some(rel) = frame.assets.rgb.clone() {
+        hydrate_rgb_asset(root, &rel, frame, false)?;
+    }
+    if let Some(rel) = frame.assets.rgb.clone() {
+        if frame.snapshot.kinect.color_frame.is_some() {
+            hydrate_rgb_asset(root, &rel, frame, true)?;
+        }
+    }
+    if let Some(rel) = frame.assets.audio.as_deref() {
+        let path = root.join(rel);
+        if path.exists() {
+            let mut reader = hound::WavReader::open(&path)
+                .with_context(|| format!("reading audio asset {}", path.display()))?;
+            let spec = reader.spec();
+            let samples = reader.samples::<i16>().collect::<std::result::Result<Vec<_>, _>>()?;
+            let captured_at_ms = asset_producer_time(frame, "audio").unwrap_or(frame.t_ms);
+            frame.snapshot.ear_pcm = Some(PcmAudioFrame {
+                captured_at_ms,
+                sample_rate_hz: spec.sample_rate,
+                channels: spec.channels,
+                samples,
+            });
+        }
+    }
+    if let Some(rel) = frame.assets.lidar.as_deref() {
+        let path = root.join(rel);
+        if path.exists() {
+            frame.snapshot.range = serde_json::from_slice(&std_fs::read(&path)?)
+                .with_context(|| format!("reading lidar asset {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn hydrate_rgb_asset(
+    root: &Path,
+    rel: &str,
+    frame: &mut CaptureFrameRecord,
+    kinect: bool,
+) -> Result<()> {
+    let path = root.join(rel);
+    if !path.exists() {
+        return Ok(());
+    }
+    let image = image::open(&path)
+        .with_context(|| format!("reading RGB asset {}", path.display()))?
+        .to_rgb8();
+    let metadata_kind = if kinect { "rgb" } else { "camera" };
+    let metadata = frame
+        .stream_metadata
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get(metadata_kind))
+        .and_then(Value::as_object);
+    let hydrated = pete_now::EyeFrame {
+        captured_at_ms: metadata
+            .and_then(|value| value.get("producer_t_ms"))
+            .and_then(Value::as_u64)
+            .unwrap_or(frame.t_ms),
+        rgbd_frame_id: metadata
+            .and_then(|value| value.get("rgbd_frame_id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        device_timestamp_ms: metadata
+            .and_then(|value| value.get("device_timestamp_ms"))
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok()),
+        width: image.width(),
+        height: image.height(),
+        format: EyeFrameFormat::Rgb8,
+        bytes: image.into_raw(),
+        source: metadata
+            .and_then(|value| value.get("source"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    };
+    if kinect {
+        frame.snapshot.kinect.color_frame = Some(hydrated);
+    } else {
+        frame.snapshot.eye_frame = Some(hydrated);
+    }
+    Ok(())
+}
+
+fn asset_producer_time(frame: &CaptureFrameRecord, kind: &str) -> Option<u64> {
+    frame
+        .stream_metadata
+        .as_ref()?
+        .as_object()?
+        .get(kind)?
+        .get("producer_t_ms")?
+        .as_u64()
 }
 
 #[derive(Clone, Debug)]
@@ -522,7 +677,9 @@ impl CaptureReader {
             if line.trim().is_empty() {
                 continue;
             }
-            frames.push(serde_json::from_str(&line)?);
+            let mut frame: CaptureFrameRecord = serde_json::from_str(&line)?;
+            hydrate_frame_assets(&self.root, &mut frame)?;
+            frames.push(frame);
         }
         Ok(frames)
     }
@@ -802,6 +959,8 @@ fn export_snapshot_assets_with_context(
                     written_asset_metadata(root, &rel, capture_t_ms, producer_t_ms, serde_json::json!({
                         "width": width, "height": height, "format": "rgb8_png",
                         "source": snapshot.eye_frame.as_ref().and_then(|frame| frame.source.as_deref()).unwrap_or("compact_eye_features"),
+                        "rgbd_frame_id": snapshot.eye_frame.as_ref().and_then(|frame| frame.rgbd_frame_id.as_deref()),
+                        "device_timestamp_ms": snapshot.eye_frame.as_ref().and_then(|frame| frame.device_timestamp_ms),
                     }))?,
                 );
             }
@@ -1065,6 +1224,10 @@ fn written_asset_metadata(
         "producer_t_ms".to_string(),
         producer_t_ms.map(Value::from).unwrap_or(Value::Null),
     );
+    value.insert(
+        "captured_at_ms".to_string(),
+        producer_t_ms.map(Value::from).unwrap_or(Value::Null),
+    );
     value.insert("timing".to_string(), Value::String(timing.to_string()));
     value.insert("bytes".to_string(), Value::from(bytes));
     value.insert("sha256".to_string(), Value::String(sha256_file(&path)?));
@@ -1168,7 +1331,16 @@ pub fn export_pointcloud_for_frame(
         return Ok(None);
     };
     let rel = capture_asset_path("pointcloud", frame.index, "ply");
-    let intrinsics = CameraIntrinsics::approximate_for(depth.width, depth.height);
+    let recorded_calibration = frame.snapshot.kinect.geometry_calibration;
+    let intrinsics = recorded_calibration.map_or_else(
+        || CameraIntrinsics::approximate_for(depth.width, depth.height),
+        |calibration| CameraIntrinsics {
+            fx: calibration.depth.fx,
+            fy: calibration.depth.fy,
+            cx: calibration.depth.cx,
+            cy: calibration.depth.cy,
+        },
+    );
     let vertices = write_pointcloud_ply(&root.join(&rel), &depth, intrinsics, max_depth_m, stride)?;
     frame.assets.pointcloud = Some(rel);
     let mut metadata = frame
@@ -1189,7 +1361,10 @@ pub fn export_pointcloud_for_frame(
                 "cx": intrinsics.cx,
                 "cy": intrinsics.cy
             },
-            "calibration": "uncalibrated"
+            "calibration": if recorded_calibration.is_some() { "recorded" } else { "uncalibrated" },
+            "calibration_identity": recorded_calibration
+                .and_then(|calibration| serde_json::to_vec(&calibration).ok())
+                .map(|bytes| sha256_bytes(&bytes)),
         }),
     );
     let metadata = Value::Object(metadata);

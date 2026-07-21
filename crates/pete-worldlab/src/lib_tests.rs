@@ -269,6 +269,18 @@ async fn background_writer_exports_timestamped_checksummed_raw_streams() {
         .await
         .unwrap();
     let manifest = writer.finish().await.unwrap();
+    let raw_record: Value = serde_json::from_str(
+        std_fs::read_to_string(dir.path().join(FRAMES_FILE))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(raw_record["snapshot"]["eye_frame"]["bytes"], serde_json::json!([]));
+    assert_eq!(raw_record["snapshot"]["kinect"]["depth_m"], serde_json::json!([]));
+    assert_eq!(raw_record["snapshot"]["ear_pcm"]["samples"], serde_json::json!([]));
+    assert_eq!(raw_record["snapshot"]["range"]["beams"], serde_json::json!([]));
     let reader = CaptureReader::open(dir.path()).await.unwrap();
     let frames = reader.read_frames().await.unwrap();
     let frame = &frames[0];
@@ -311,6 +323,63 @@ async fn background_writer_exports_timestamped_checksummed_raw_streams() {
         .pointcloud
         .as_ref()
         .is_some_and(|path| dir.path().join(path).exists()));
+    assert_eq!(frame.snapshot.kinect.depth_m, vec![1.0, 2.0]);
+    assert_eq!(frame.snapshot.ear_pcm.as_ref().unwrap().samples, vec![1, -1, 2, -2]);
+    assert_eq!(frame.snapshot.range.beams, vec![0.5, 0.75]);
+
+    let expected_pointcloud_sha = frame.stream_metadata.as_ref().unwrap()["pointcloud"]["sha256"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut regenerated = frame.clone();
+    export_pointcloud_for_frame(dir.path(), &mut regenerated, 8.0, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        sha256_file(dir.path().join(regenerated.assets.pointcloud.unwrap()).as_path()).unwrap(),
+        expected_pointcloud_sha
+    );
+}
+
+#[tokio::test]
+async fn background_writer_drops_when_bounded_queue_is_full() {
+    let dir = tempdir().unwrap();
+    let mut writer = CaptureWriter::create(dir.path(), CaptureSource::RealRobot, Some(10))
+        .await
+        .unwrap();
+    writer.set_background_write_delay(std::time::Duration::from_millis(50));
+
+    let submitted = CAPTURE_QUEUE_CAPACITY as u64 + 12;
+    for index in 0..submitted {
+        writer
+            .append_snapshot_with_exported_assets(
+                index * 10,
+                WorldSnapshot::default(),
+                Vec::new(),
+                true,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+    }
+    let manifest = writer.finish().await.unwrap();
+
+    assert_eq!(manifest.writer_health.submitted_frames, submitted);
+    assert!(manifest.writer_health.dropped_frames > 0);
+    assert_eq!(
+        manifest.writer_health.written_frames + manifest.writer_health.dropped_frames,
+        submitted
+    );
+    assert!(manifest
+        .writer_health
+        .dropped_assets
+        .get("depth")
+        .is_some_and(|count| *count > 0));
+    assert!(manifest
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("writer queue dropped")));
 }
 
 #[tokio::test]
