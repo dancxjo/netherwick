@@ -70,8 +70,10 @@ cargo run -q -p pete-tools -- shadow-flight \
 
 `--clock recorded` follows input deltas, `--clock accelerated --speed N` scales
 them, and `--clock step` waits for operator input before each frame. `--pause-at`
-accepts comma-separated frame indexes. Runs are always bounded by `--ticks`; a
-360,000-tick run covers ten simulated hours at the simulator's 100 ms cadence.
+accepts comma-separated frame indexes. Runs are always bounded by `--ticks` and
+the manifest records `--tick-ms`; for example, 3,600 ticks at a declared 10 s
+validation cadence cover ten simulated hours. The normal 100 ms cadence remains
+the default when cadence fidelity is part of the test.
 
 Seeded simulations accept repeatable `--fault tick:kind` injections. Supported
 kinds are `battery_depleted`, `wheel_drop`, `cliff`, and `charging`. The normal

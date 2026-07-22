@@ -38,6 +38,7 @@ fn run_shadow_score(args: ShadowScoreArgs) -> Result<()> {
             "seed": manifest.seed,
             "clock_mode": manifest.clock_mode,
             "higher_brain_mode": manifest.higher_brain_mode,
+            "tick_ms": manifest.tick_ms,
             "production_components": manifest.production_components,
             "substitutions": manifest.substitutions,
             "ledger_retained_frames": manifest.ledger_retained_frames,

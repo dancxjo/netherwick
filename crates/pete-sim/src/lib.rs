@@ -118,6 +118,7 @@ struct VirtualWorldState {
     objects: Vec<SimObject>,
     retina_frame: Option<EyeFrame>,
     last_motion_sent: Option<MotionCommand>,
+    clock_step_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -148,6 +149,7 @@ impl VirtualWorld {
             objects: Vec::new(),
             retina_frame: None,
             last_motion_sent: None,
+            clock_step_ms: 100,
         }));
         (
             Self {
@@ -216,11 +218,23 @@ impl VirtualWorld {
             .clone()
     }
 
+    /// Selects how much canonical simulation time passes for each decision.
+    ///
+    /// Physics deliberately remains on the fixed, stable simulation step. This
+    /// permits accelerated long-horizon runs without treating a coarse clock
+    /// interval as one enormous actuator integration step.
+    pub fn set_clock_step_ms(&mut self, clock_step_ms: u64) {
+        self.state
+            .lock()
+            .expect("virtual world mutex poisoned")
+            .clock_step_ms = clock_step_ms.max(1);
+    }
+
     pub fn reset_body_to_spawn(&mut self) -> BodySense {
         let mut guard = self.state.lock().expect("virtual world mutex poisoned");
         let previous_update_ms = guard.snapshot.body.last_update_ms;
         let mut body = BodySense::default();
-        body.last_update_ms = previous_update_ms.saturating_add(100);
+        body.last_update_ms = previous_update_ms.saturating_add(guard.clock_step_ms);
         body.odometry.x_m = guard.arena.width_m * 0.5;
         body.odometry.y_m = guard.arena.height_m * 0.5;
         guard.snapshot.body = body.clone();
@@ -335,6 +349,7 @@ impl SimCockpit {
         guard.last_motion_sent = Some(command.clone());
         let objects = guard.objects.clone();
         let arena = guard.arena;
+        let clock_step_ms = guard.clock_step_ms;
         let body = &mut guard.snapshot.body;
         body.velocity.forward_m_s = motor.forward;
         body.velocity.turn_rad_s = motor.turn;
@@ -370,7 +385,7 @@ impl SimCockpit {
             body.battery_level = (body.battery_level + charge_rate * SIM_DT_S).clamp(0.0, 1.0);
         }
         apply_cliff_projection(body, arena);
-        body.last_update_ms = body.last_update_ms.saturating_add(100);
+        body.last_update_ms = body.last_update_ms.saturating_add(clock_step_ms);
         Ok(body.clone())
     }
 }

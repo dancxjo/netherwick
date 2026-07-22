@@ -408,6 +408,7 @@ where
     where
         F: FnMut(&WorldSnapshot, &RuntimeTick),
     {
+        self.world.set_clock_step_ms(self.tick_ms);
         for _ in 0..steps {
             let mut snapshot = self.world.snapshot().await?;
             self.stuck.annotate_snapshot(&mut snapshot, self.tick_ms);

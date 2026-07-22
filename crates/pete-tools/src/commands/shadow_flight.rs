@@ -128,6 +128,8 @@ struct ShadowFlightArgs {
     seed: u64,
     #[arg(long, default_value_t = 1_000)]
     ticks: usize,
+    #[arg(long, default_value_t = 100)]
+    tick_ms: u64,
     /// Rolling production-ledger replay window. Long runs retain their most
     /// recent failure context without unbounded filesystem growth.
     #[arg(long, default_value_t = 64)]
@@ -180,6 +182,7 @@ struct ShadowEventRecord {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 struct ShadowFlightSummary {
     ticks_completed: u64,
+    simulated_elapsed_ms: u64,
     canonical_events: u64,
     event_type_counts: BTreeMap<String, u64>,
     full_causal_chain_observed: bool,
@@ -205,6 +208,7 @@ struct ShadowFlightManifest {
     higher_brain_mode: ShadowHigherBrainMode,
     speed: f64,
     requested_ticks: usize,
+    tick_ms: u64,
     completed_ticks: u64,
     production_components: Vec<String>,
     substitutions: Vec<String>,
@@ -239,6 +243,8 @@ type ShadowRuntime = MinimalRuntime<
 
 struct ShadowRunAggregate {
     ticks_completed: u64,
+    first_t_ms: Option<u64>,
+    last_t_ms: Option<u64>,
     canonical_events: u64,
     event_type_counts: BTreeMap<String, u64>,
     outcome_feedback_frames: u64,
@@ -253,6 +259,8 @@ impl Default for ShadowRunAggregate {
     fn default() -> Self {
         Self {
             ticks_completed: 0,
+            first_t_ms: None,
+            last_t_ms: None,
             canonical_events: 0,
             event_type_counts: BTreeMap::new(),
             outcome_feedback_frames: 0,
@@ -267,6 +275,8 @@ impl Default for ShadowRunAggregate {
 
 impl ShadowRunAggregate {
     fn observe_input(&mut self, input: &ShadowInputFrameProvenance) {
+        self.first_t_ms.get_or_insert(input.t_ms);
+        self.last_t_ms = Some(input.t_ms);
         self.ticks_completed += 1;
         self.outcome_feedback_frames +=
             u64::from(!input.outcome_feedback_event_ids.is_empty());
@@ -547,6 +557,9 @@ async fn run_shadow_flight_inner(
     if args.ledger_retained_frames == 0 || args.ledger_retained_transitions == 0 {
         anyhow::bail!("rolling ledger retention counts must be greater than zero");
     }
+    if args.tick_ms == 0 {
+        anyhow::bail!("--tick-ms must be greater than zero");
+    }
     if args.retained_events == 0 || args.retained_input_frames == 0 {
         anyhow::bail!("rolling event and input retention counts must be greater than zero");
     }
@@ -590,6 +603,7 @@ async fn run_shadow_flight_inner(
             );
             let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::MixedRoom, effective_seed));
             let mut runner = SimRunner::new(runtime, scenario.world, scenario.motors);
+            runner.tick_ms = args.tick_ms;
             for index in 0..args.ticks {
                 let faults = shadow_faults_at(&args.faults, index as u64)?;
                 apply_shadow_faults(&mut runner.world, &faults).await?;
@@ -760,6 +774,10 @@ async fn run_shadow_flight_inner(
     let chain = ["evidence", "interpretation", "belief_update", "proposal", "gate_decision", "command", "outcome"];
     let summary = ShadowFlightSummary {
         ticks_completed: aggregate.ticks_completed,
+        simulated_elapsed_ms: aggregate
+            .last_t_ms
+            .unwrap_or_default()
+            .saturating_sub(aggregate.first_t_ms.unwrap_or_default()),
         canonical_events: aggregate.canonical_events,
         full_causal_chain_observed: chain.iter().all(|kind| event_type_counts.contains_key(*kind)),
         simulated_outcomes: *event_type_counts.get("outcome").unwrap_or(&0),
@@ -805,6 +823,7 @@ async fn run_shadow_flight_inner(
         higher_brain_mode: args.higher_brain,
         speed: args.speed,
         requested_ticks: args.ticks,
+        tick_ms: args.tick_ms,
         completed_ticks: summary.ticks_completed,
         production_components: vec!["pete_runtime::MinimalRuntime".into(), "pete_conductor::SimpleConductor".into(), "pete_autonomic::SimpleSafety".into(), "pete_runtime::SimRunner".into(), "pete_server::LiveViewState::runtime_tick_brain_events".into(), "pete_ledger::RollingLedger".into(), "pete_memory::DurableExperienceStore".into()],
         substitutions: match args.higher_brain {

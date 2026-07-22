@@ -4,6 +4,7 @@ fn shadow_test_args(output: PathBuf) -> ShadowFlightArgs {
         input: None,
         seed: 7,
         ticks: 2,
+        tick_ms: 100,
         ledger_retained_frames: 64,
         ledger_retained_transitions: 64,
         retained_events: 100_000,
@@ -142,6 +143,7 @@ async fn sustained_artifacts_use_declared_rolling_replay_windows() {
     let root = std::env::temp_dir().join(format!("pete-shadow-rolling-{}", Uuid::new_v4()));
     let args = ShadowFlightArgs {
         ticks: 3,
+        tick_ms: 3_600_000,
         ledger_retained_frames: 1,
         ledger_retained_transitions: 1,
         retained_events: 10,
@@ -152,6 +154,7 @@ async fn sustained_artifacts_use_declared_rolling_replay_windows() {
     };
     let (manifest, summary) = run_shadow_flight(&args).await.unwrap();
     assert_eq!(summary.ticks_completed, 3);
+    assert!(summary.simulated_elapsed_ms >= 2 * 60 * 60 * 1_000);
     assert_eq!(manifest.retained_event_records, 10);
     assert!(manifest.dropped_event_records > 0);
     assert_eq!(manifest.retained_input_frames, 1);
