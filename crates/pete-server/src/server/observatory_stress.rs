@@ -73,8 +73,10 @@ pub struct ObservatoryStressMetrics {
     pub injected_writer_failures: u64,
     pub publish_deadline_misses: u64,
     pub durable_bytes: u64,
-    pub baseline: ObservatoryLatencySummary,
-    pub enabled: ObservatoryLatencySummary,
+    #[serde(alias = "baseline")]
+    pub construct_only: ObservatoryLatencySummary,
+    #[serde(alias = "enabled")]
+    pub construct_and_publish: ObservatoryLatencySummary,
     pub added_publish_p99_us: f64,
     pub rss_before_bytes: Option<u64>,
     pub rss_after_bytes: Option<u64>,
@@ -245,8 +247,8 @@ pub async fn run_observatory_stress(
         std::hint::black_box(stress_event(id, critical, config.telemetry_keys));
         let baseline_ns = baseline_started.elapsed().as_nanos() as u64;
 
-        let event = stress_event(id, critical, config.telemetry_keys);
         let enabled_started = std::time::Instant::now();
+        let event = stress_event(id, critical, config.telemetry_keys);
         match hub.publish(event) {
             Ok(PublishOutcome::Queued) if critical => {
                 metrics.queued_critical_events = metrics.queued_critical_events.saturating_add(1);
@@ -364,10 +366,11 @@ pub async fn run_observatory_stress(
     });
     metrics.stalled_client_lagged = stalled_client_lagged;
     metrics.reconnect_received_live_event = reconnect_received_live_event;
-    metrics.baseline = stress_latency_summary(&mut baseline_samples);
-    metrics.enabled = stress_latency_summary(&mut enabled_samples);
-    metrics.added_publish_p99_us =
-        (metrics.enabled.p99_us - metrics.baseline.p99_us).max(0.0);
+    metrics.construct_only = stress_latency_summary(&mut baseline_samples);
+    metrics.construct_and_publish = stress_latency_summary(&mut enabled_samples);
+    metrics.added_publish_p99_us = (metrics.construct_and_publish.p99_us
+        - metrics.construct_only.p99_us)
+        .max(0.0);
     metrics.rss_after_bytes = stress_rss_bytes();
     metrics.rss_growth_bytes = metrics
         .rss_before_bytes
@@ -449,7 +452,7 @@ pub async fn run_observatory_stress(
     );
     let passed = checks.values().all(|passed| *passed);
     Ok(ObservatoryStressReport {
-        schema_version: 1,
+        schema_version: 2,
         generated_at_ms: wall_now_ms(),
         host_arch: std::env::consts::ARCH.into(),
         config,
@@ -466,7 +469,7 @@ pub async fn run_observatory_stress(
             "durable restart replay and serialization".into(),
             "sensor clock epoch reset without causal reordering".into(),
             "writer failure injection outside ingestion".into(),
-            "enabled versus disabled publisher latency".into(),
+            "equivalent event construction versus construction plus publication latency".into(),
             "bounded ingress history durable queue and RSS".into(),
         ],
     })
