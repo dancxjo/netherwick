@@ -12,3 +12,4 @@ include!("lib_tests/observatory_spatial.rs");
 include!("lib_tests/observatory_health.rs");
 include!("lib_tests/observatory_diagnostics.rs");
 include!("lib_tests/observatory_security.rs");
+include!("lib_tests/observatory_stress.rs");

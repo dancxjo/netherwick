@@ -275,6 +275,39 @@ async fn diagnostic_export_query_merges_live_and_durable_history_without_duplica
 }
 
 #[tokio::test]
+async fn durable_restart_omits_coalescible_projections_but_keeps_critical_events() {
+    let (directory, durability) = durable_test_config("critical-only");
+    let hub = BrainEventHub::new_with_durability(Default::default(), durability.clone()).unwrap();
+    assert!(hub.start());
+    hub.publish(observatory_event(
+        1,
+        BrainEventType::Evidence,
+        LossPolicy::Coalescible {
+            key: "projection.only".into(),
+        },
+    ))
+    .unwrap();
+    let critical = observatory_event(2, BrainEventType::Command, LossPolicy::LossIntolerant);
+    hub.publish(critical.clone()).unwrap();
+    wait_for_durable_sequence(&hub, 2).await;
+    hub.shutdown().await;
+
+    let replay = BrainEventHub::new_with_durability(Default::default(), durability).unwrap();
+    let events = replay.query(&BrainEventQuery::default()).unwrap();
+    let recovered = events
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            BrainEventStreamRecord::Event { envelope } => Some(&envelope.event),
+            BrainEventStreamRecord::Gap { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(recovered, vec![&critical]);
+    replay.shutdown().await;
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
 async fn observatory_assigns_monotonic_sequences_and_reconnects_exactly() {
     let hub = BrainEventHub::new(BrainEventHubConfig {
         ingress_capacity: 16,

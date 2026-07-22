@@ -170,6 +170,7 @@ pub struct BrainEventTransportHealth {
     pub closed: bool,
     pub ingress_capacity: usize,
     pub ingress_depth: usize,
+    pub ingress_inflight: usize,
     pub history_capacity: usize,
     pub history_depth: usize,
     pub oldest_sequence: Option<u64>,
@@ -332,6 +333,7 @@ struct HistoryState {
 #[derive(Default)]
 struct ObservatoryCounters {
     next_sequence: AtomicU64,
+    ingress_inflight: AtomicUsize,
     ingress_coalesced: AtomicU64,
     ingress_dropped_telemetry: AtomicU64,
     ingress_rejected_critical: AtomicU64,
@@ -628,6 +630,11 @@ impl BrainEventHub {
             closed: self.shared.closed.load(Ordering::Acquire),
             ingress_capacity: self.shared.config.ingress_capacity,
             ingress_depth,
+            ingress_inflight: self
+                .shared
+                .counters
+                .ingress_inflight
+                .load(Ordering::Acquire),
             history_capacity: self.shared.config.history_capacity,
             history_depth,
             oldest_sequence,
@@ -733,13 +740,22 @@ impl BrainEventHub {
 
 async fn run_observatory_worker(shared: Arc<ObservatoryShared>) {
     loop {
-        let event = shared
-            .ingress
-            .lock()
-            .ok()
-            .and_then(|mut ingress| ingress.queue.pop_front());
+        let event = shared.ingress.lock().ok().and_then(|mut ingress| {
+            let event = ingress.queue.pop_front();
+            if event.is_some() {
+                shared
+                    .counters
+                    .ingress_inflight
+                    .fetch_add(1, Ordering::Release);
+            }
+            event
+        });
         if let Some(event) = event {
             retain_brain_event(&shared, event);
+            shared
+                .counters
+                .ingress_inflight
+                .fetch_sub(1, Ordering::Release);
             continue;
         }
         if shared.closed.load(Ordering::Acquire) {
@@ -759,8 +775,12 @@ fn retain_brain_event(shared: &ObservatoryShared, event: BrainEvent) {
         .fetch_add(1, Ordering::Relaxed)
         .saturating_add(1);
     let envelope = SequencedBrainEvent { sequence, event };
-    if let Some(durable) = &shared.durable {
-        durable.enqueue(envelope.clone());
+    if envelope.event.requires_loss_intolerant_delivery()
+        || matches!(envelope.event.loss_policy, LossPolicy::LossIntolerant)
+    {
+        if let Some(durable) = &shared.durable {
+            durable.enqueue(envelope.clone());
+        }
     }
     if let Ok(mut history) = shared.history.lock() {
         if let LossPolicy::Coalescible { key } = &envelope.event.loss_policy {

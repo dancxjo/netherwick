@@ -254,7 +254,6 @@ fn run_durable_writer(
 ) {
     let mut successful_records = 0_u64;
     while let Ok(command) = receiver.recv() {
-        stats.backlog.fetch_sub(1, Ordering::Relaxed);
         let DurableWriterCommand::Append(envelope) = command;
         let injected_failure = config
             .injected_failure_after_records
@@ -276,6 +275,7 @@ fn run_durable_writer(
                 stats.gaps.fetch_add(1, Ordering::Relaxed);
             }
         }
+        stats.backlog.fetch_sub(1, Ordering::Release);
     }
 }
 

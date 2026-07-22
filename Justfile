@@ -82,6 +82,8 @@ live-server:
     cargo run -q -p xtask -- live-server
 observatory-replay bundle addr="127.0.0.1:8788":
     cargo run -q -p pete-tools -- observatory-replay --bundle "{{bundle}}" --addr "{{addr}}"
+observatory-stress profile="ci" events="20000" output="data/reports/observatory-stress/software.json":
+    cargo run -q -p pete-server --example observatory_stress -- --profile "{{profile}}" --events "{{events}}" --output "{{output}}"
 server-logs service="pete-live":
     cargo run -q -p xtask -- server-logs "{{service}}"
 stop-servers:

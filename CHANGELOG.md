@@ -6,6 +6,12 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Software-ready; Pi 5 physical soak pending: Add a reproducible Observatory
+  stress harness and JSON report for sustained coalescible/critical load,
+  stalled/reconnected clients, old cursors, durable restart replay, clock-epoch
+  reset, serialization, writer-failure injection, bounded queue/history/RSS,
+  and enabled-versus-disabled publish latency with explicit CI and Pi budgets.
+
 - Ready: Fail Observatory network exposure closed: dashboard/replay binds remain
   loopback-trusted by default, non-loopback binds require TLS (or an explicit
   trusted TLS proxy) plus bearer authentication, read and control credentials
