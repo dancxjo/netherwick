@@ -23,6 +23,8 @@ where
         futures: &[FuturePrediction],
         recall_summary: &str,
         notes: &mut Vec<String>,
+        brain_events: &mut Vec<BrainEvent>,
+        frame_id: Uuid,
     ) -> Option<AcceptedLlmCognition> {
         if now.t_ms > self.cognition.last_sense_valid_until_ms {
             self.cognition.last_sense = pete_now::LlmSense::default();
@@ -38,6 +40,14 @@ where
             pending.task.abort();
             self.cognition.next_request_at_ms = now.t_ms.saturating_add(COGNITION_COOLDOWN_MS);
             self.cognition.last_outcome = Some(CognitionOutcome::Expired);
+            brain_events.push(higher_brain_response_event(
+                &pending.request_event_id,
+                &pending.snapshot_ref,
+                pending.requested_at_ms,
+                now.t_ms,
+                EventDisposition::Expired,
+                serde_json::json!({"reason": "deadline expired"}),
+            ));
         }
         if self
             .cognition
@@ -47,7 +57,14 @@ where
         {
             let pending = self.cognition.pending.take().expect("finished task");
             self.cognition.next_request_at_ms = now.t_ms.saturating_add(COGNITION_COOLDOWN_MS);
-            match pending.task.await {
+            let PendingLlmCognition {
+                request_event_id,
+                snapshot_ref,
+                requested_at_ms,
+                deadline_ms,
+                task,
+            } = pending;
+            match task.await {
                 Err(error) => {
                     let outcome = if error.is_cancelled() {
                         CognitionOutcome::Cancelled
@@ -55,23 +72,65 @@ where
                         CognitionOutcome::Failed(error.to_string())
                     };
                     self.cognition.last_outcome = Some(outcome);
+                    brain_events.push(higher_brain_response_event(
+                        &request_event_id,
+                        &snapshot_ref,
+                        requested_at_ms,
+                        now.t_ms,
+                        if error.is_cancelled() {
+                            EventDisposition::Rejected
+                        } else {
+                            EventDisposition::Unavailable
+                        },
+                        serde_json::json!({"error": error.to_string()}),
+                    ));
                 }
                 Ok(Err(error)) => {
                     self.cognition.last_outcome = Some(CognitionOutcome::Failed(error.to_string()));
+                    brain_events.push(higher_brain_response_event(
+                        &request_event_id,
+                        &snapshot_ref,
+                        requested_at_ms,
+                        now.t_ms,
+                        EventDisposition::Unavailable,
+                        serde_json::json!({"error": error.to_string()}),
+                    ));
                 }
-                Ok(Ok((_reflection, _result))) if now.t_ms > pending.deadline_ms => {
+                Ok(Ok((_reflection, _result))) if now.t_ms > deadline_ms => {
                     self.cognition.last_outcome = Some(CognitionOutcome::Expired);
+                    brain_events.push(higher_brain_response_event(
+                        &request_event_id,
+                        &snapshot_ref,
+                        requested_at_ms,
+                        now.t_ms,
+                        EventDisposition::Expired,
+                        serde_json::json!({"reason": "response arrived after deadline"}),
+                    ));
                 }
                 Ok(Ok((reflection, result))) => {
                     self.cognition.last_sense = result.sense.clone();
                     self.cognition.last_sense_valid_until_ms =
                         now.t_ms.saturating_add(COGNITION_DEADLINE_MS);
                     self.cognition.last_outcome = Some(CognitionOutcome::Accepted);
+                    let response_event = higher_brain_response_event(
+                        &request_event_id,
+                        &snapshot_ref,
+                        requested_at_ms,
+                        now.t_ms,
+                        EventDisposition::Accepted,
+                        serde_json::json!({
+                            "sense": result.sense,
+                            "decision": result.decision,
+                            "conscious_command": result.conscious_command,
+                            "combobulation": reflection,
+                        }),
+                    );
+                    brain_events.push(response_event);
                     accepted = Some(AcceptedLlmCognition {
                         reflection,
                         tick: result,
-                        snapshot_ref: pending.snapshot_ref,
-                        requested_at_ms: pending.requested_at_ms,
+                        snapshot_ref,
+                        requested_at_ms,
                         observed_at_ms: now.t_ms,
                     });
                 }
@@ -114,17 +173,28 @@ where
                     .await?;
                 Ok((reflection, tick))
             });
-            self.cognition.pending = Some(PendingLlmCognition {
-                snapshot_ref: now
+            let snapshot_ref = now
                     .extensions
                     .get("frame_id")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("unknown-frame")
-                    .to_string(),
+                    .to_string();
+            let request_event = higher_brain_request_event(frame_id, &snapshot_ref, now.t_ms);
+            let request_event_id = request_event.event_id.clone();
+            brain_events.push(request_event);
+            self.cognition.pending = Some(PendingLlmCognition {
+                request_event_id,
+                snapshot_ref,
                 requested_at_ms: now.t_ms,
                 deadline_ms: now.t_ms.saturating_add(COGNITION_DEADLINE_MS),
                 task,
             });
+        } else if !self.cognition.provider_declared_available && self.cognition.pending.is_none() {
+            brain_events.push(higher_brain_unavailable_event(
+                frame_id,
+                now.t_ms,
+                self.cognition.provider_unavailable_reason.as_deref(),
+            ));
         }
         if let Some(outcome) = self.cognition.last_outcome.as_ref() {
             notes.push(match outcome {

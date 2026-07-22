@@ -470,6 +470,22 @@ async fn sim_runner_go_and_explore_send_non_stop_motion_and_change_pose() {
                     snapshot.final_selected_action,
                     Some(expected_selected_action.clone())
                 );
+                let outcome = tick
+                    .brain_events
+                    .iter()
+                    .find(|event| event.kind == "actuator.outcome")
+                    .expect("simulator records the result only after applying motion");
+                assert_eq!(outcome.producer.brain, Brain::Simulator);
+                assert_eq!(outcome.disposition, EventDisposition::Accepted);
+                assert!(tick.brain_events.iter().any(|event| {
+                    event.event_id == outcome.links.parents[0].event_id
+                        && event.event_type == BrainEventType::Command
+                }));
+                assert_eq!(
+                    outcome.payload,
+                    BrainEventPayload::inline(snapshot.action_debug.clone().unwrap())
+                );
+                assert_unique_locally_ordered_brain_events(&tick.brain_events);
             })
             .await
             .unwrap();

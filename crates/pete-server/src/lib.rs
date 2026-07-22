@@ -24,8 +24,8 @@ use pete_cockpit::{MotionCommand, MotorCommand};
 use pete_core::TimeMs;
 use pete_events::{
     ArtifactIdentity, ArtifactKind, AuthoritySignificance, Brain, BrainEvent, BrainEventId,
-    BrainEventPayload, BrainEventType, EventDisposition, EventTimes, LossPolicy, PayloadReference,
-    ProducerIdentity, TrustState, TypedEventRef, BRAIN_EVENT_SCHEMA_VERSION,
+    BrainEventPayload, BrainEventRecordKind, BrainEventType, EventDisposition, EventTimes,
+    LossPolicy, PayloadReference, ProducerIdentity, TrustState, BRAIN_EVENT_SCHEMA_VERSION,
 };
 use pete_experience::EmbodiedContext;
 use pete_map::{

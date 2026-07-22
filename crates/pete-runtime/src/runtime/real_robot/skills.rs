@@ -8,6 +8,10 @@ pub struct RuntimeTick {
     pub llm: LlmTickResult,
     pub combobulation: Option<Combobulation>,
     pub inline_learning: InlineLearningTickStatus,
+    /// Canonical observability records created at production execution
+    /// boundaries. Consumers may attach transport-local snapshot references,
+    /// but must not reconstruct causal events from this tick's aggregate state.
+    pub brain_events: Vec<BrainEvent>,
 }
 
 #[async_trait::async_trait]

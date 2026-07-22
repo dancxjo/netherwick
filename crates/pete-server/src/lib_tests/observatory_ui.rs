@@ -179,6 +179,14 @@ fn observable_runtime_tick() -> (WorldSnapshot, RuntimeTick) {
         counterfactuals: Vec::new(),
         notes: Vec::new(),
     };
+    let mut runtime_boundary_event = BrainEvent::historical(
+        BrainEventId::from_domain("runtime-boundary", frame.id),
+        BrainEventType::BeliefUpdate,
+        ProducerIdentity::new(Brain::Motherbrain, "runtime.test_boundary"),
+        EventTimes::observed(t_ms, t_ms),
+    );
+    runtime_boundary_event.kind = "runtime.boundary.sentinel".into();
+    runtime_boundary_event.references.frame_id = Some(frame.id.to_string());
     let tick = RuntimeTick {
         frame,
         experience,
@@ -189,25 +197,22 @@ fn observable_runtime_tick() -> (WorldSnapshot, RuntimeTick) {
         llm: pete_llm::LlmTickResult::default(),
         combobulation: None,
         inline_learning: pete_runtime::InlineLearningTickStatus::default(),
+        brain_events: vec![runtime_boundary_event],
     };
     (snapshot, tick)
 }
 
 #[tokio::test]
-async fn production_runtime_tick_publishes_the_complete_available_causal_chain() {
+async fn server_forwards_runtime_boundary_events_without_reconstructing_causality() {
     let (snapshot, tick) = observable_runtime_tick();
     let events = LiveViewState::runtime_tick_brain_events(&snapshot, &tick);
     for event in &events {
         event.validate().unwrap();
     }
+    assert!(events
+        .iter()
+        .any(|event| event.kind == "runtime.boundary.sentinel"));
     for event_type in [
-        BrainEventType::Evidence,
-        BrainEventType::Interpretation,
-        BrainEventType::BeliefUpdate,
-        BrainEventType::Proposal,
-        BrainEventType::GateDecision,
-        BrainEventType::Command,
-        BrainEventType::Outcome,
         BrainEventType::ProviderState,
         BrainEventType::JobState,
         BrainEventType::QueueState,
@@ -215,33 +220,25 @@ async fn production_runtime_tick_publishes_the_complete_available_causal_chain()
     ] {
         assert!(events.iter().any(|event| event.event_type == event_type));
     }
-    assert!(events.iter().any(|event| {
-        event.producer.brain == Brain::Forebrain && event.kind == "brain.exchange.fore_to_mother"
-    }));
-    assert!(events.iter().any(|event| {
-        event.producer.brain == Brain::HigherBrain
-            && event.kind == "brain.exchange.higher_to_mother"
-    }));
-    let proposal = events
+    assert!(events
         .iter()
-        .find(|event| event.kind == "conductor.proposal")
-        .unwrap();
-    let safety = events
-        .iter()
-        .find(|event| event.kind == "safety.decision")
-        .unwrap();
-    let command = events
-        .iter()
-        .find(|event| event.kind == "actuator.command.accepted")
-        .unwrap();
-    let outcome = events
-        .iter()
-        .find(|event| event.kind == "actuator.outcome")
-        .unwrap();
-    assert_eq!(outcome.producer.brain, Brain::Simulator);
-    assert_eq!(safety.links.parents[0].event_id, proposal.event_id);
-    assert_eq!(command.links.parents[0].event_id, safety.event_id);
-    assert_eq!(outcome.links.parents[0].event_id, command.event_id);
+        .filter(|event| {
+            matches!(
+                event.event_type,
+                BrainEventType::ProviderState
+                    | BrainEventType::JobState
+                    | BrainEventType::QueueState
+                    | BrainEventType::ResourceState
+            )
+        })
+        .all(|event| event.record_kind == BrainEventRecordKind::StateProjection));
+    assert!(!events.iter().any(|event| matches!(
+        event.kind.as_str(),
+        "conductor.proposal"
+            | "safety.decision"
+            | "actuator.command.accepted_by_runtime"
+            | "actuator.outcome"
+    )));
 
     let state = LiveViewState::new();
     assert!(state.observatory().start());

@@ -286,13 +286,24 @@ where
         self.possessor_skills.annotate_now(&mut now);
         enrich_now_latest_image(&mut self.live_image_cognition, &mut now).await;
 
-        let tick = self
+        let mut tick = self
             .runtime
             .tick(now, ExperienceLatent::default(), Vec::new())
             .await?;
         let mut snapshot = self.now_builder.snapshot();
         snapshot.eye = tick.frame.now.eye.clone();
         annotate_snapshot_from_tick(&mut snapshot, &tick);
+        append_actuator_outcome(
+            &mut tick,
+            Brain::Brainstem,
+            "cockpit.read_only",
+            snapshot.body.last_update_ms,
+            serde_json::json!({
+                "motor_applied": false,
+                "why_not_moving": "read-only mode",
+            }),
+            EventDisposition::Unavailable,
+        );
         self.tick_count = self.tick_count.saturating_add(1);
         Ok((snapshot, tick))
     }
@@ -331,7 +342,7 @@ where
                 now.reign.human_override_pressure = input.priority.clamp(0.0, 1.0);
                 now.reign.last_command_age_ms =
                     Some(pre_body_t_ms.saturating_sub(input.issued_at_ms));
-                let tick = synthetic_slow_manual_tick(
+                let mut tick = synthetic_slow_manual_tick(
                     now,
                     input,
                     MotorCommand::stop(),
@@ -342,6 +353,7 @@ where
                 let mut snapshot = self.now_builder.snapshot();
                 snapshot.eye = tick.frame.now.eye.clone();
                 annotate_snapshot_from_tick(&mut snapshot, &tick);
+                append_real_robot_outcome(&mut tick, &snapshot, EventDisposition::Accepted);
                 self.tick_count = self.tick_count.saturating_add(1);
                 return Ok((snapshot, tick));
             }
@@ -390,7 +402,7 @@ where
         now.reign = self.runtime.reign_sense(t_ms)?;
         if let Some(input) = now.reign.latest.clone() {
             if reign_input_outputs_real_slow_directly(&input) {
-                let tick = synthetic_slow_manual_tick(
+                let mut tick = synthetic_slow_manual_tick(
                     now,
                     input,
                     MotorCommand::stop(),
@@ -401,6 +413,7 @@ where
                 let mut snapshot = self.now_builder.snapshot();
                 snapshot.eye = tick.frame.now.eye.clone();
                 annotate_snapshot_from_tick(&mut snapshot, &tick);
+                append_real_robot_outcome(&mut tick, &snapshot, EventDisposition::Accepted);
                 self.tick_count = self.tick_count.saturating_add(1);
                 return Ok((snapshot, tick));
             }
@@ -436,7 +449,12 @@ where
                         self.motion_rejection = MotionRejectionState::default();
                     }
                 }
-                let tick = synthetic_slow_manual_tick(
+                let outcome_disposition = if block_reason.is_some() {
+                    EventDisposition::Rejected
+                } else {
+                    EventDisposition::Accepted
+                };
+                let mut tick = synthetic_slow_manual_tick(
                     now,
                     input,
                     desired_motor,
@@ -447,6 +465,7 @@ where
                 let mut snapshot = self.now_builder.snapshot();
                 snapshot.eye = tick.frame.now.eye.clone();
                 annotate_snapshot_from_tick(&mut snapshot, &tick);
+                append_real_robot_outcome(&mut tick, &snapshot, outcome_disposition);
                 self.tick_count = self.tick_count.saturating_add(1);
                 return Ok((snapshot, tick));
             }
@@ -677,6 +696,15 @@ where
             );
         }
         snapshot.action_debug = Some(action_debug);
+        append_real_robot_outcome(
+            &mut tick,
+            &snapshot,
+            if block_reason.is_some() {
+                EventDisposition::Rejected
+            } else {
+                EventDisposition::Accepted
+            },
+        );
         self.tick_count = self.tick_count.saturating_add(1);
         Ok((snapshot, tick))
     }

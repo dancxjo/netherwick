@@ -14,10 +14,13 @@ where
         mut futures: Vec<FuturePrediction>,
     ) -> Result<RuntimeTick> {
         let frame_id = Uuid::new_v4();
+        let mut exchange_events = Vec::new();
+        let mut authority_events = Vec::new();
         now.extensions.insert(
             "frame_id".to_string(),
             serde_json::Value::String(frame_id.to_string()),
         );
+        exchange_events.push(forebrain_ingress_event(&now, frame_id));
         apply_create_ir_charger_cue(&mut now);
         {
             let mut reign_queue = self
@@ -28,6 +31,12 @@ where
             now.reign = reign_queue.sense(now.t_ms);
         }
         let reign_input = now.reign.latest.clone();
+        let reign_input_event_id = reign_input.as_ref().map(|input| {
+            let event = reign_input_boundary_event(input, frame_id, now.t_ms);
+            let event_id = event.event_id.clone();
+            authority_events.push(event);
+            event_id
+        });
         let reign_action = reign_input
             .as_ref()
             .and_then(|input| input.command.to_action());
@@ -311,6 +320,8 @@ where
                 &futures,
                 &recall.first_person_summary,
                 &mut notes,
+                &mut exchange_events,
+                frame_id,
             )
             .await;
         now.llm = self.cognition.last_sense.clone();
@@ -1012,6 +1023,14 @@ where
         .then(|| goal_cycle.selection.selected_goal.as_ref())
         .flatten()
         .map(|goal| goal.as_str());
+        authority_events.push(conductor_proposal_event(
+            frame_id,
+            now.t_ms,
+            &chosen_action,
+            now.self_sense.active_goal.as_deref(),
+            Some(embodied_experience.id),
+            reign_input_event_id.as_ref(),
+        ));
         let desired_motor = action_to_motor_command(Some(&chosen_action));
         let safety = self.safety.filter_action(
             &now,
@@ -1019,6 +1038,37 @@ where
             &chosen_action,
             desired_motor,
         );
+        authority_events.push(safety_boundary_event(frame_id, now.t_ms, &safety));
+        let reign_outcome = reign_input.as_ref().map(|input| {
+            let accepted_by_conductor = reign_action
+                .as_ref()
+                .map(|action| action == &chosen_action)
+                .unwrap_or(false);
+            ReignOutcome {
+                input_id: input.id,
+                accepted_by_conductor,
+                vetoed_by_safety: safety.vetoed,
+                final_action: Some(chosen_action.clone()),
+                reason: if safety.vetoed {
+                    Some(describe_safety_reason(safety.reason.clone()).to_string())
+                } else if accepted_by_conductor {
+                    None
+                } else {
+                    Some("conductor chose another action".to_string())
+                },
+            }
+        });
+        if let (Some(input), Some(outcome)) = (reign_input.as_ref(), reign_outcome.as_ref()) {
+            authority_events.push(reign_outcome_boundary_event(
+                input, outcome, frame_id, now.t_ms,
+            ));
+        }
+        authority_events.push(accepted_runtime_command_event(
+            frame_id,
+            now.t_ms,
+            &chosen_action,
+            &safety,
+        ));
         let control_provenance = if safety.vetoed {
             ControlProvenance::SafetyVeto
         } else if safety.reason == Some(SafetyReason::Contact) {
@@ -1226,26 +1276,6 @@ where
         );
         experiences.push(embodied_experience);
 
-        let reign_outcome = reign_input.as_ref().map(|input| {
-            let accepted_by_conductor = reign_action
-                .as_ref()
-                .map(|action| action == &chosen_action)
-                .unwrap_or(false);
-            ReignOutcome {
-                input_id: input.id,
-                accepted_by_conductor,
-                vetoed_by_safety: safety.vetoed,
-                final_action: Some(chosen_action.clone()),
-                reason: if safety.vetoed {
-                    Some(describe_safety_reason(safety.reason.clone()).to_string())
-                } else if accepted_by_conductor {
-                    None
-                } else {
-                    Some("conductor chose another action".to_string())
-                },
-            }
-        });
-
         if experiences.is_empty() {
             experiences.push(Experience::new(
                 "realtime.state",
@@ -1332,6 +1362,10 @@ where
 
         self.semantic_outcomes
             .remember(&now.world, executed_goal_behavior);
+        let mut brain_events = frame_domain_brain_events(&frame);
+        brain_events.extend(exchange_events);
+        brain_events.extend(authority_events);
+        debug_assert!(no_higher_brain_motion_authority(&brain_events));
         Ok(RuntimeTick {
             frame,
             experience: experiences.last().cloned().unwrap_or_else(|| {
@@ -1355,6 +1389,7 @@ where
             llm: llm_tick,
             combobulation,
             inline_learning,
+            brain_events,
         })
     }
 

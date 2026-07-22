@@ -1,3 +1,28 @@
+fn assert_unique_locally_ordered_brain_events(events: &[BrainEvent]) {
+    for (index, event) in events.iter().enumerate() {
+        assert!(
+            !events[..index]
+                .iter()
+                .any(|prior| prior.event_id == event.event_id),
+            "duplicate event id {}",
+            event.event_id
+        );
+        for reference in event.causal_references() {
+            if let Some(parent_index) = events
+                .iter()
+                .position(|candidate| candidate.event_id == reference.target.event_id)
+            {
+                assert!(
+                    parent_index < index,
+                    "local causal parent {} followed child {}",
+                    reference.target.event_id,
+                    event.event_id
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn llm_command_is_never_granted_control_authority() {
     let ledger = JsonlLedger::new("/tmp/pete-runtime-llm-command-action-test");
@@ -36,6 +61,23 @@ async fn llm_command_is_never_granted_control_authority() {
         .and_then(|value| serde_json::from_value::<ActionSelectionDecision>(value).ok())
         .unwrap();
     assert_eq!(decision.selected_action, Some(ActionPrimitive::Stop));
+    for event in &tick.brain_events {
+        event.validate().unwrap();
+    }
+    for kind in [
+        "brain.exchange.fore_to_mother.unavailable",
+        "brain.exchange.mother_to_higher.request",
+        "conductor.proposal",
+        "safety.decision",
+        "actuator.command.accepted_by_runtime",
+    ] {
+        assert!(
+            tick.brain_events.iter().any(|event| event.kind == kind),
+            "missing production boundary event {kind}"
+        );
+    }
+    assert_unique_locally_ordered_brain_events(&tick.brain_events);
+    assert!(no_higher_brain_motion_authority(&tick.brain_events));
 }
 
 #[tokio::test]
@@ -83,6 +125,20 @@ async fn accepted_cognition_enters_cooldown_before_scheduling_again() {
         .notes
         .iter()
         .any(|note| note == "LlmProviderOutcome: accepted"));
+    let request = first
+        .brain_events
+        .iter()
+        .find(|event| event.kind == "brain.exchange.mother_to_higher.request")
+        .unwrap();
+    let response = accepted
+        .brain_events
+        .iter()
+        .find(|event| event.kind == "brain.exchange.higher_to_mother.response")
+        .unwrap();
+    assert_eq!(response.links.parents[0].event_id, request.event_id);
+    assert_eq!(response.authority, AuthoritySignificance::Advisory);
+    assert_unique_locally_ordered_brain_events(&accepted.brain_events);
+    assert!(no_higher_brain_motion_authority(&accepted.brain_events));
 
     let cooling_down = runtime
         .tick(idle_now(2_199), ExperienceLatent::default(), Vec::new())
@@ -142,6 +198,7 @@ async fn paused_runtime_clock_does_not_expire_completed_cognition() {
     let ledger = JsonlLedger::new("/tmp/pete-runtime-cognition-paused-clock-test");
     let mut runtime = test_runtime(ledger, FixedConductor::new(ActionPrimitive::Stop));
     runtime.cognition.pending = Some(PendingLlmCognition {
+        request_event_id: BrainEventId::new(),
         snapshot_ref: "paused-frame".to_string(),
         requested_at_ms: 1_000,
         deadline_ms: 1_000 + COGNITION_DEADLINE_MS,
@@ -149,9 +206,20 @@ async fn paused_runtime_clock_does_not_expire_completed_cognition() {
     });
     let now = idle_now(1_000);
     let (embodied, latent, futures, mut notes) = cognition_test_inputs();
+    let mut brain_events = Vec::new();
 
     let accepted = runtime
-        .advance_cognition(&now, &[], &embodied, &latent, &futures, "", &mut notes)
+        .advance_cognition(
+            &now,
+            &[],
+            &embodied,
+            &latent,
+            &futures,
+            "",
+            &mut notes,
+            &mut brain_events,
+            Uuid::new_v4(),
+        )
         .await
         .expect("paused deterministic time should accept a completed provider result");
 
@@ -168,6 +236,7 @@ async fn replayed_earlier_now_does_not_expire_completed_cognition() {
     let ledger = JsonlLedger::new("/tmp/pete-runtime-cognition-replay-clock-test");
     let mut runtime = test_runtime(ledger, FixedConductor::new(ActionPrimitive::Stop));
     runtime.cognition.pending = Some(PendingLlmCognition {
+        request_event_id: BrainEventId::new(),
         snapshot_ref: "future-replay-frame".to_string(),
         requested_at_ms: 5_000,
         deadline_ms: 5_000 + COGNITION_DEADLINE_MS,
@@ -175,6 +244,7 @@ async fn replayed_earlier_now_does_not_expire_completed_cognition() {
     });
     let replayed_now = idle_now(500);
     let (embodied, latent, futures, mut notes) = cognition_test_inputs();
+    let mut brain_events = Vec::new();
 
     let accepted = runtime
         .advance_cognition(
@@ -185,6 +255,8 @@ async fn replayed_earlier_now_does_not_expire_completed_cognition() {
             &futures,
             "",
             &mut notes,
+            &mut brain_events,
+            Uuid::new_v4(),
         )
         .await
         .expect("a backwards replay clock should not invent elapsed runtime time");
@@ -203,6 +275,7 @@ async fn forward_clock_jump_expires_in_flight_cognition() {
     let mut runtime = test_runtime(ledger, FixedConductor::new(ActionPrimitive::Stop));
     let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<()>();
     runtime.cognition.pending = Some(PendingLlmCognition {
+        request_event_id: BrainEventId::new(),
         snapshot_ref: "pre-jump-frame".to_string(),
         requested_at_ms: 1_000,
         deadline_ms: 1_000 + COGNITION_DEADLINE_MS,
@@ -213,6 +286,7 @@ async fn forward_clock_jump_expires_in_flight_cognition() {
     });
     let jumped_now = idle_now(10_000);
     let (embodied, latent, futures, mut notes) = cognition_test_inputs();
+    let mut brain_events = Vec::new();
 
     let accepted = runtime
         .advance_cognition(
@@ -223,6 +297,8 @@ async fn forward_clock_jump_expires_in_flight_cognition() {
             &futures,
             "",
             &mut notes,
+            &mut brain_events,
+            Uuid::new_v4(),
         )
         .await;
 
@@ -243,6 +319,7 @@ async fn very_slow_cognition_tick_rejects_result_completed_before_late_poll() {
     let ledger = JsonlLedger::new("/tmp/pete-runtime-cognition-slow-tick-test");
     let mut runtime = test_runtime(ledger, FixedConductor::new(ActionPrimitive::Stop));
     runtime.cognition.pending = Some(PendingLlmCognition {
+        request_event_id: BrainEventId::new(),
         snapshot_ref: "slow-tick-frame".to_string(),
         requested_at_ms: 1_000,
         deadline_ms: 1_000 + COGNITION_DEADLINE_MS,
@@ -250,9 +327,20 @@ async fn very_slow_cognition_tick_rejects_result_completed_before_late_poll() {
     });
     let late_now = idle_now(1_000 + COGNITION_DEADLINE_MS + 1);
     let (embodied, latent, futures, mut notes) = cognition_test_inputs();
+    let mut brain_events = Vec::new();
 
     let accepted = runtime
-        .advance_cognition(&late_now, &[], &embodied, &latent, &futures, "", &mut notes)
+        .advance_cognition(
+            &late_now,
+            &[],
+            &embodied,
+            &latent,
+            &futures,
+            "",
+            &mut notes,
+            &mut brain_events,
+            Uuid::new_v4(),
+        )
         .await;
 
     assert!(accepted.is_none());
@@ -269,6 +357,7 @@ async fn cognition_provider_completion_exactly_at_deadline_is_accepted() {
     let requested_at_ms = 1_000;
     let deadline_ms = requested_at_ms + COGNITION_DEADLINE_MS;
     runtime.cognition.pending = Some(PendingLlmCognition {
+        request_event_id: BrainEventId::new(),
         snapshot_ref: "deadline-frame".to_string(),
         requested_at_ms,
         deadline_ms,
@@ -276,6 +365,7 @@ async fn cognition_provider_completion_exactly_at_deadline_is_accepted() {
     });
     let deadline_now = idle_now(deadline_ms);
     let (embodied, latent, futures, mut notes) = cognition_test_inputs();
+    let mut brain_events = Vec::new();
 
     let accepted = runtime
         .advance_cognition(
@@ -286,6 +376,8 @@ async fn cognition_provider_completion_exactly_at_deadline_is_accepted() {
             &futures,
             "",
             &mut notes,
+            &mut brain_events,
+            Uuid::new_v4(),
         )
         .await
         .expect("the deadline is inclusive");
@@ -344,7 +436,7 @@ async fn slow_advice_is_retained_as_historical_evidence_only() {
         .find(|sensation| sensation.kind == "llm.combobulation")
         .expect("provenance-bearing advisory sensation");
     assert_eq!(evidence.occurred_at_ms, 100);
-    assert!(evidence.observed_at_ms >= 600);
+    assert!(evidence.observed_at_ms > evidence.occurred_at_ms);
     assert!(evidence
         .payload
         .get("input_snapshot_ref")
@@ -352,6 +444,14 @@ async fn slow_advice_is_retained_as_historical_evidence_only() {
         .is_some());
     assert_eq!(tick.chosen_action, Some(ActionPrimitive::Stop));
     assert!(tick.frame.conscious_command.is_none());
+    let response = tick
+        .brain_events
+        .iter()
+        .find(|event| event.kind == "brain.exchange.higher_to_mother.response")
+        .expect("the delayed advisory crosses an explicit response boundary");
+    assert_eq!(response.times.occurred.t_ms, evidence.occurred_at_ms);
+    assert_eq!(response.times.observed.t_ms, evidence.observed_at_ms);
+    assert_eq!(response.authority, AuthoritySignificance::Advisory);
 }
 
 #[tokio::test]

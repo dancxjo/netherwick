@@ -927,6 +927,9 @@ fn synthetic_slow_manual_tick(
     block_reason: Option<String>,
     body_before: &pete_body::BodySense,
 ) -> Result<RuntimeTick> {
+    let frame_id = Uuid::new_v4();
+    let input_for_events = input.clone();
+    let block_reason_for_events = block_reason.clone();
     let action = input.command.to_action();
     let motor_applied = !is_near_zero_motor(final_motor);
     now.extensions.insert(
@@ -954,30 +957,90 @@ fn synthetic_slow_manual_tick(
         now.t_ms,
         now.t_ms,
     );
+    let frame = ExperienceFrame {
+        id: frame_id,
+        t_ms: now.t_ms,
+        now,
+        sensations: Vec::new(),
+        impressions: Vec::new(),
+        experiences: vec![experience.clone()],
+        z: Some(ExperienceLatent::default()),
+        chosen_action: action.clone(),
+        conscious_command: None,
+        reign_input: Some(input),
+        reign_outcome: None,
+        predicted_futures: Vec::new(),
+        behavior_runs: Vec::new(),
+        actual_next: None,
+        reward: Reward::default(),
+        surprise: SurpriseSense::default(),
+        memory_recall: Vec::new(),
+        recollections: Vec::new(),
+        llm_teaching: Vec::new(),
+        counterfactuals: Vec::new(),
+        notes: vec!["RealSlowManualRuntimeBypass: direct hardware command".to_string()],
+    };
+    let mut brain_events = frame_domain_brain_events(&frame);
+    brain_events.push(reign_input_boundary_event(
+        &input_for_events,
+        frame_id,
+        frame.t_ms,
+    ));
+    let gate_id = BrainEventId::from_domain("safety-decision", frame_id);
+    let mut gate = BrainEvent::historical(
+        gate_id.clone(),
+        BrainEventType::GateDecision,
+        ProducerIdentity::new(Brain::Motherbrain, "cockpit.manual_gate"),
+        EventTimes::observed(frame.t_ms, frame.t_ms),
+    );
+    gate.kind = "safety.decision".to_string();
+    gate.references.frame_id = Some(frame_id.to_string());
+    gate.references.command_ids.push(frame_id.to_string());
+    gate.links.parents.push(TypedEventRef::new(
+        BrainEventId::from_domain(
+            "reign-input-considered",
+            format!("{}:{frame_id}", input_for_events.id),
+        ),
+        BrainEventType::Proposal,
+    ));
+    gate.disposition = if block_reason_for_events.is_some() {
+        EventDisposition::Vetoed
+    } else {
+        EventDisposition::Accepted
+    };
+    gate.payload = BrainEventPayload::inline(serde_json::json!({
+        "manual_hardware_gate": true,
+        "desired_motor": desired_motor,
+        "final_motor": final_motor,
+        "reason": block_reason_for_events,
+    }));
+    gate.authority = AuthoritySignificance::Gate;
+    brain_events.push(gate);
+    if let Some(action) = action.as_ref() {
+        let mut command = BrainEvent::historical(
+            BrainEventId::from_domain("actuator-command", frame_id),
+            BrainEventType::Command,
+            ProducerIdentity::new(Brain::Motherbrain, "cockpit.manual_command"),
+            EventTimes::observed(frame.t_ms, frame.t_ms),
+        );
+        command.kind = "actuator.command.accepted_by_runtime".to_string();
+        command.references.frame_id = Some(frame_id.to_string());
+        command.references.command_ids.push(frame_id.to_string());
+        command
+            .links
+            .parents
+            .push(TypedEventRef::new(gate_id, BrainEventType::GateDecision));
+        command.disposition = EventDisposition::Accepted;
+        command.payload = BrainEventPayload::inline(serde_json::json!({
+            "action": action,
+            "final_motor": final_motor,
+            "manual_hardware_gate": true,
+        }));
+        command.authority = AuthoritySignificance::Command;
+        brain_events.push(command);
+    }
     Ok(RuntimeTick {
-        frame: ExperienceFrame {
-            id: Uuid::new_v4(),
-            t_ms: now.t_ms,
-            now,
-            sensations: Vec::new(),
-            impressions: Vec::new(),
-            experiences: vec![experience.clone()],
-            z: Some(ExperienceLatent::default()),
-            chosen_action: action.clone(),
-            conscious_command: None,
-            reign_input: Some(input),
-            reign_outcome: None,
-            predicted_futures: Vec::new(),
-            behavior_runs: Vec::new(),
-            actual_next: None,
-            reward: Reward::default(),
-            surprise: SurpriseSense::default(),
-            memory_recall: Vec::new(),
-            recollections: Vec::new(),
-            llm_teaching: Vec::new(),
-            counterfactuals: Vec::new(),
-            notes: vec!["RealSlowManualRuntimeBypass: direct hardware command".to_string()],
-        },
+        frame,
         experience,
         chosen_action: action,
         skill_request: None,
@@ -986,6 +1049,7 @@ fn synthetic_slow_manual_tick(
         llm: LlmTickResult::default(),
         combobulation: None,
         inline_learning: InlineLearningTickStatus::default(),
+        brain_events,
     })
 }
 

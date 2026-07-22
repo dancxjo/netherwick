@@ -68,6 +68,7 @@ impl RuntimeLoop for StubRuntime {
             llm: LlmTickResult::default(),
             combobulation: None,
             inline_learning: InlineLearningTickStatus::default(),
+            brain_events: Vec::new(),
         })
     }
 }
@@ -120,6 +121,7 @@ impl RuntimeLoop for SlowRuntime {
             llm: LlmTickResult::default(),
             combobulation: None,
             inline_learning: InlineLearningTickStatus::default(),
+            brain_events: Vec::new(),
         })
     }
 }

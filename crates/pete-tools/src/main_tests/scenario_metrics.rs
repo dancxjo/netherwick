@@ -39,6 +39,7 @@ fn tick_with_action(action: ActionPrimitive) -> RuntimeTick {
         llm: Default::default(),
         combobulation: None,
         inline_learning: Default::default(),
+        brain_events: Vec::new(),
     }
 }
 

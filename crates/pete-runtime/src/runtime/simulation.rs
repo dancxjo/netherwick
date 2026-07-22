@@ -515,6 +515,21 @@ where
                 );
             }
             after_snapshot.action_debug = Some(action_debug);
+            append_actuator_outcome(
+                &mut tick,
+                Brain::Simulator,
+                "sim.cockpit",
+                after_snapshot.body.last_update_ms,
+                after_snapshot
+                    .action_debug
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({"outcome": "not reported"})),
+                if reset_or_dead {
+                    EventDisposition::Rejected
+                } else {
+                    EventDisposition::Accepted
+                },
+            );
             after_snapshot
                 .extensions
                 .retain(|extension| extension.name != "sim.stuck");
@@ -527,4 +542,3 @@ where
         Ok(())
     }
 }
-

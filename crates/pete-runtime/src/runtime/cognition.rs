@@ -74,6 +74,7 @@ impl RuntimeCognition {
 }
 
 struct PendingLlmCognition {
+    request_event_id: BrainEventId,
     snapshot_ref: String,
     requested_at_ms: u64,
     deadline_ms: u64,
@@ -422,4 +423,3 @@ impl ChirpEventState {
         Ok(())
     }
 }
-

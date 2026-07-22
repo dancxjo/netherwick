@@ -4,7 +4,7 @@ mod social_exam;
 pub use sleep::*;
 pub use social_exam::*;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -30,7 +30,12 @@ use pete_conductor::{
     SkillOutcome, SkillPhase, SkillRequest, SkillStatus,
 };
 use pete_core::{Pose2, Provenance, Reward, TimeMs};
-use pete_events::{default_event_bus, DriveName, EventBus, EventContext, EventExtractor, Response};
+use pete_events::{
+    default_event_bus, AuthoritySignificance, Brain, BrainEvent, BrainEventId, BrainEventPayload,
+    BrainEventRecordKind, BrainEventType, DriveName, EventBus, EventContext, EventDisposition,
+    EventExtractor, EventTimes, LossPolicy, ProducerIdentity, Response, TypedEventRef,
+    MAX_INLINE_BRAIN_EVENT_PAYLOAD_BYTES,
+};
 use pete_experience::{
     action_features, action_value_input_from_transition_like,
     action_value_target_from_reward_surprise, charge_input_from_transition_like,
@@ -71,8 +76,8 @@ use pete_now::{
     EntityId, EvidenceRef, ExtensionSense, EyePrediction, Freshness, ImuMotionContext, ImuSense,
     MemorySense, Now, ObjectClass, ObjectObservation, ObjectObservationSource, ReignSense,
     SafetySense, SemanticBehaviorId, SemanticEvidenceObservation, SemanticGroundingKind,
-    SemanticNodeRef, SemanticOutcomeId, SemanticPredicate, SurpriseSense, WorldModelSnapshot,
-    WorldModelUpdater,
+    SemanticNodeRef, SemanticOutcomeId, SemanticPredicate, SurpriseSense, VisionBackendState,
+    WorldModelSnapshot, WorldModelUpdater,
 };
 use pete_sensors::{
     anticipate_surfaces, FrameProcessor, ImuArbiter, ImuCandidateMetadata, ImuSelection,
@@ -95,6 +100,7 @@ use uuid::Uuid;
 
 // Runtime domains share one namespace so this split does not change the public API.
 include!("runtime/cognition.rs");
+include!("runtime/observability.rs");
 include!("runtime/policy.rs");
 include!("runtime/models.rs");
 include!("runtime/core.rs");

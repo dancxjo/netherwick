@@ -21,6 +21,13 @@ async fn real_robot_read_only_runner_never_applies_motor() {
     ));
     assert_eq!(motor_attempts.load(Ordering::SeqCst), 0);
     assert!(motors.lock().unwrap().is_empty());
+    let outcome = tick
+        .brain_events
+        .iter()
+        .find(|event| event.kind == "actuator.outcome")
+        .expect("read-only boundary is explicitly observable");
+    assert_eq!(outcome.producer.brain, Brain::Brainstem);
+    assert_eq!(outcome.disposition, EventDisposition::Unavailable);
     assert_eq!(
         tick.frame
             .now
@@ -1243,6 +1250,7 @@ impl RuntimeLoop for ManualRuntime {
             llm: LlmTickResult::default(),
             combobulation: None,
             inline_learning: InlineLearningTickStatus::default(),
+            brain_events: Vec::new(),
         })
     }
 }
