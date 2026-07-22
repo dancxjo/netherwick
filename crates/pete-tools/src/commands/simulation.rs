@@ -150,9 +150,11 @@ async fn run_sim(args: SimArgs) -> Result<()> {
                 runner.world.set_retina_frame(None);
             }
             let mut live_snapshot = None;
+            let mut runtime_events = Vec::new();
             runner
                 .run_steps_observing_ticks(1, |snapshot, tick| {
                     live_snapshot = Some(snapshot.clone());
+                    runtime_events = LiveViewState::runtime_tick_brain_events(snapshot, tick);
                     live_state.update_embodied_context(tick.frame.embodied_context());
                 })
                 .await?;
@@ -162,6 +164,7 @@ async fn run_sim(args: SimArgs) -> Result<()> {
                 live_snapshot.unwrap_or(runner.world.snapshot().await?),
                 runtime_map.as_ref(),
             );
+            live_state.publish_brain_events(runtime_events);
             live_state.update_prod_state(runner.runtime.nudge_status());
             live_state.update_training_status(pete_server::LiveTrainingStatus {
                 training_mode: current_inline_learning.training_mode_label().to_string(),

@@ -26,6 +26,16 @@ history. Selecting an event uses its `snapshot_id`; events without an explicit
 snapshot reference use the nearest retained snapshot at or before their
 occurred time. That fallback is labeled and never reads future state.
 
+Dashboard-enabled simulation and physical possession also publish each actual
+`RuntimeTick` through this same snapshot boundary. The publication expands the
+tick's recorded sensations, impressions, and experiences, then records the
+available higher-brain and forebrain exchanges, conductor proposal, safety
+gate, accepted actuator command, observed actuator outcome, and provider/job/
+queue/resource projections. These events retain frame, snapshot, goal,
+command, and causal parent IDs. Scene calibration metadata publishes a
+loss-intolerant epoch transition only when its checksum changes. Observatory
+publication remains asynchronous and cannot grant or alter control authority.
+
 The inspector recursively flattens the selected `Now` and virtualizes its
 field rows. Metadata is inherited only from an enclosing field `meta` object,
 so the interface reports source, age, confidence, uncertainty, freshness,

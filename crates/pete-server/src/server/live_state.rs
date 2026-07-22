@@ -21,6 +21,7 @@ pub struct LiveViewState {
     observatory: BrainEventHub,
     observatory_now: Arc<Mutex<VecDeque<ObservatoryNowSnapshot>>>,
     observatory_snapshot_sequence: Arc<AtomicU64>,
+    observatory_calibration_epoch: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -58,6 +59,7 @@ impl Default for LiveViewState {
             observatory: BrainEventHub::new(BrainEventHubConfig::default()),
             observatory_now: Arc::new(Mutex::new(VecDeque::new())),
             observatory_snapshot_sequence: Arc::new(AtomicU64::new(0)),
+            observatory_calibration_epoch: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -76,6 +78,34 @@ impl LiveViewState {
         event: BrainEvent,
     ) -> Result<PublishOutcome, BrainEventPublishError> {
         self.observatory.publish(event)
+    }
+
+    pub fn runtime_tick_brain_events(
+        snapshot: &WorldSnapshot,
+        tick: &RuntimeTick,
+    ) -> Vec<BrainEvent> {
+        runtime_tick_brain_events(snapshot, tick)
+    }
+
+    pub fn publish_brain_events(&self, events: Vec<BrainEvent>) -> usize {
+        let snapshot_id = self
+            .observatory_now
+            .lock()
+            .ok()
+            .and_then(|history| history.back().map(|snapshot| snapshot.snapshot_id.clone()));
+        events
+            .into_iter()
+            .filter_map(|mut event| {
+                if event.references.snapshot_id.is_none() {
+                    event.references.snapshot_id.clone_from(&snapshot_id);
+                }
+                self.publish_brain_event(event).ok()
+            })
+            .count()
+    }
+
+    pub fn publish_runtime_tick(&self, snapshot: &WorldSnapshot, tick: &RuntimeTick) -> usize {
+        self.publish_brain_events(runtime_tick_brain_events(snapshot, tick))
     }
 
     pub fn with_real_slow_hardware_control(self) -> Self {
@@ -314,6 +344,43 @@ impl LiveViewState {
     }
 
     pub fn update_scene_metadata(&self, metadata: LiveSceneMetadata) {
+        if let Some(calibration) = metadata.sensor_calibration {
+            let payload = serde_json::to_value(calibration).unwrap_or(serde_json::Value::Null);
+            let encoded = serde_json::to_vec(&payload).unwrap_or_default();
+            let checksum = format!("sha256:{:x}", Sha256::digest(&encoded));
+            let epoch = format!("scene-depth:{checksum}");
+            let changed = self
+                .observatory_calibration_epoch
+                .lock()
+                .map(|mut prior| {
+                    if prior.as_deref() == Some(epoch.as_str()) {
+                        false
+                    } else {
+                        *prior = Some(epoch.clone());
+                        true
+                    }
+                })
+                .unwrap_or(false);
+            if changed {
+                let t_ms = wall_now_ms();
+                let mut event = BrainEvent::historical(
+                    BrainEventId::from_domain("calibration-transition", format!("{epoch}:{t_ms}")),
+                    BrainEventType::CalibrationTransition,
+                    ProducerIdentity::new(Brain::Motherbrain, "scene.calibration"),
+                    EventTimes::observed(t_ms, t_ms),
+                );
+                event.kind = "calibration.scene_depth".into();
+                event.calibration_epochs.push(epoch.clone());
+                event.artifacts.push(ArtifactIdentity {
+                    kind: ArtifactKind::Calibration,
+                    id: epoch,
+                    version: None,
+                    checksum: Some(checksum),
+                });
+                event.payload = BrainEventPayload::inline(payload);
+                let _ = self.publish_brain_event(event);
+            }
+        }
         *self
             .scene_metadata
             .lock()
@@ -560,6 +627,358 @@ impl LiveViewState {
                         .unwrap_or(true));
         Some(node.clone())
     }
+}
+
+fn runtime_tick_brain_events(snapshot: &WorldSnapshot, tick: &RuntimeTick) -> Vec<BrainEvent> {
+    let frame = &tick.frame;
+    let t_ms = frame.t_ms;
+    let frame_id = frame.id.to_string();
+    let mut events = Vec::new();
+    events.extend(frame.sensations.iter().map(BrainEvent::from));
+    events.extend(frame.impressions.iter().map(BrainEvent::from));
+    events.extend(frame.experiences.iter().map(BrainEvent::from));
+
+    if let Some(input) = &frame.reign_input {
+        events.push(BrainEvent::from_reign_input(input, t_ms));
+    }
+    if let Some(outcome) = &frame.reign_outcome {
+        events.push(BrainEvent::from_reign_outcome(
+            BrainEventId::from_domain("reign-outcome", outcome.input_id),
+            outcome,
+            t_ms,
+        ));
+    }
+
+    let exchange_id = BrainEventId::from_domain("higher-brain-exchange", frame.id);
+    let mut exchange = BrainEvent::historical(
+        exchange_id.clone(),
+        BrainEventType::Interpretation,
+        ProducerIdentity::new(Brain::HigherBrain, "llm.tick"),
+        EventTimes::observed(t_ms, t_ms),
+    );
+    exchange.kind = "brain.exchange.higher_to_mother".into();
+    exchange.references.frame_id = Some(frame_id.clone());
+    exchange.quality.confidence = Some(tick.llm.sense.confidence);
+    exchange.payload = BrainEventPayload::inline(serde_json::json!({
+        "sense": tick.llm.sense,
+        "decision": tick.llm.decision,
+        "conscious_command": tick.llm.conscious_command,
+        "combobulation": tick.combobulation,
+    }));
+    events.push(exchange);
+
+    let proposal_id = BrainEventId::from_domain("conductor-proposal", frame.id);
+    if let Some(action) = tick.chosen_action.as_ref() {
+        let mut proposal = BrainEvent::historical(
+            proposal_id.clone(),
+            BrainEventType::Proposal,
+            ProducerIdentity::new(Brain::Motherbrain, "conductor.selection"),
+            EventTimes::observed(t_ms, t_ms),
+        );
+        proposal.kind = "conductor.proposal".into();
+        proposal.references.frame_id = Some(frame_id.clone());
+        proposal.references.command_ids.push(frame_id.clone());
+        if let Some(goal_id) = frame.now.self_sense.active_goal.clone() {
+            proposal.references.goal_ids.push(goal_id);
+        }
+        if let Some(experience) = frame.experiences.last() {
+            proposal.links.parents.push(TypedEventRef::new(
+                BrainEventId::experience(experience.id),
+                BrainEventType::BeliefUpdate,
+            ));
+        }
+        proposal.links.supports.push(TypedEventRef::new(
+            exchange_id,
+            BrainEventType::Interpretation,
+        ));
+        proposal.payload = BrainEventPayload::inline(serde_json::json!({
+            "chosen_action": action,
+            "action_selector": frame.now.extensions.get("action_selector"),
+            "goal_system": frame.now.extensions.get("goal_system.outcome"),
+        }));
+        proposal.authority = AuthoritySignificance::Proposal;
+        events.push(proposal);
+
+        let safety_id = BrainEventId::from_domain("safety-decision", frame.id);
+        let motor_gate = frame.now.extensions.get("motor_gate").cloned();
+        let vetoed = motor_gate
+            .as_ref()
+            .and_then(|gate| gate.get("vetoed"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let mut safety = BrainEvent::historical(
+            safety_id.clone(),
+            BrainEventType::GateDecision,
+            ProducerIdentity::new(Brain::Motherbrain, "autonomic.safety"),
+            EventTimes::observed(t_ms, t_ms),
+        );
+        safety.kind = "safety.decision".into();
+        safety.references.frame_id = Some(frame_id.clone());
+        safety.references.command_ids.push(frame_id.clone());
+        safety.links.parents.push(TypedEventRef::new(
+            proposal_id,
+            BrainEventType::Proposal,
+        ));
+        safety.disposition = if vetoed {
+            EventDisposition::Vetoed
+        } else {
+            EventDisposition::Accepted
+        };
+        safety.payload = BrainEventPayload::inline(motor_gate.unwrap_or_else(|| {
+            serde_json::json!({"vetoed": null, "reason": "motor gate not recorded"})
+        }));
+        safety.authority = AuthoritySignificance::SafetyTransition;
+        events.push(safety);
+
+        let command_id = BrainEventId::from_domain("actuator-command", frame.id);
+        let mut command = BrainEvent::historical(
+            command_id.clone(),
+            BrainEventType::Command,
+            ProducerIdentity::new(Brain::Motherbrain, "actuator.command"),
+            EventTimes::observed(t_ms, t_ms),
+        );
+        command.kind = "actuator.command.accepted".into();
+        command.references.frame_id = Some(frame_id.clone());
+        command.references.command_ids.push(frame_id.clone());
+        command.links.parents.push(TypedEventRef::new(
+            safety_id,
+            BrainEventType::GateDecision,
+        ));
+        command.disposition = EventDisposition::Accepted;
+        command.payload = BrainEventPayload::inline(serde_json::json!({
+            "action": action,
+            "motor_gate": frame.now.extensions.get("motor_gate"),
+        }));
+        command.authority = AuthoritySignificance::Command;
+        events.push(command);
+
+        let physical = frame
+            .now
+            .extensions
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|source| source.contains("real_robot"));
+        let mut outcome = BrainEvent::historical(
+            BrainEventId::from_domain("actuator-outcome", frame.id),
+            BrainEventType::Outcome,
+            ProducerIdentity::new(
+                if physical {
+                    Brain::Brainstem
+                } else {
+                    Brain::Simulator
+                },
+                "actuator.outcome",
+            ),
+            EventTimes::observed(t_ms, wall_now_ms()),
+        );
+        outcome.kind = "actuator.outcome".into();
+        outcome.references.frame_id = Some(frame_id.clone());
+        outcome.references.command_ids.push(frame_id.clone());
+        outcome.links.parents.push(TypedEventRef::new(
+            command_id,
+            BrainEventType::Command,
+        ));
+        outcome.disposition = EventDisposition::Accepted;
+        outcome.payload = BrainEventPayload::inline(
+            snapshot
+                .action_debug
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({"outcome": "not reported"})),
+        );
+        outcome.authority = AuthoritySignificance::Outcome;
+        events.push(outcome);
+    }
+
+    events.extend(runtime_state_events(tick));
+    events
+}
+
+fn runtime_state_events(tick: &RuntimeTick) -> Vec<BrainEvent> {
+    let frame = &tick.frame;
+    let t_ms = frame.t_ms;
+    let frame_id = frame.id.to_string();
+    let sensor_details = frame.now.extensions.get("sensor.health");
+    let sensor_entries = sensor_details.and_then(serde_json::Value::as_array);
+    let sensor_unavailable = sensor_entries.is_some_and(|entries| {
+        !entries.is_empty()
+            && entries.iter().all(|entry| {
+                entry
+                    .get("available")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false)
+            })
+    });
+    let sensor_degraded = sensor_entries.is_some_and(|entries| {
+        entries.iter().any(|entry| {
+            entry
+                .get("available")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+                || entry
+                    .get("consecutive_failures")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|failures| failures > 0)
+        })
+    });
+    let cognition = frame
+        .now
+        .world
+        .self_model
+        .service_state
+        .services
+        .get("rich_language");
+    let cognition_available = cognition.is_none_or(|service| service.available);
+    let cognition_busy = cognition.is_some_and(|service| service.busy);
+    let definitions = [
+        (
+            BrainEventType::ProviderState,
+            Brain::Motherbrain,
+            "sensors",
+            "provider.sensors",
+            serde_json::json!({
+                "component_id": "sensors",
+                "availability": if sensor_unavailable { "unavailable" } else { "available" },
+                "health": if sensor_unavailable { "failed" } else if sensor_degraded { "degraded" } else { "healthy" },
+                "details": sensor_details,
+            }),
+        ),
+        (
+            BrainEventType::ProviderState,
+            Brain::HigherBrain,
+            "higher_brain.providers",
+            "provider.higher_brain",
+            serde_json::json!({
+                "component_id": "higher_brain.providers",
+                "availability": if cognition_available { "available" } else { "unavailable" },
+                "health": if cognition_available { "healthy" } else { "failed" },
+                "occupancy": if cognition_busy { "busy" } else { "idle" },
+                "confidence": tick.llm.sense.confidence,
+                "latest_error": cognition.and_then(|service| service.unavailable_reason.as_deref()),
+            }),
+        ),
+        (
+            BrainEventType::JobState,
+            Brain::Motherbrain,
+            "inline_learning",
+            "job.inline_learning",
+            serde_json::json!({
+                "component_id": "inline_learning",
+                "availability": "available",
+                "health": "healthy",
+                "occupancy": if tick.inline_learning.enabled { "busy" } else { "idle" },
+                "status": tick.inline_learning,
+            }),
+        ),
+        (
+            BrainEventType::QueueState,
+            Brain::Motherbrain,
+            "reign.queue",
+            "queue.reign",
+            serde_json::json!({
+                "component_id": "reign.queue",
+                "availability": "available",
+                "health": "healthy",
+                "occupancy": if frame.now.reign.active { "busy" } else { "idle" },
+                "active": frame.now.reign.active,
+                "latest": frame.now.reign.latest,
+            }),
+        ),
+        (
+            BrainEventType::ResourceState,
+            Brain::Motherbrain,
+            "motherbrain.runtime",
+            "resource.motherbrain_runtime",
+            serde_json::json!({
+                "component_id": "motherbrain.runtime",
+                "availability": "available",
+                "health": "healthy",
+                "occupancy": "busy",
+                "mode": frame.now.self_sense.mode,
+                "frame_id": frame_id,
+            }),
+        ),
+    ];
+    let mut events: Vec<_> = definitions
+        .into_iter()
+        .map(|(event_type, brain, component, kind, payload)| {
+            let mut event = BrainEvent::historical(
+                BrainEventId::from_domain(kind, frame.id),
+                event_type,
+                ProducerIdentity::new(brain, component),
+                EventTimes::observed(t_ms, t_ms),
+            );
+            event.kind = kind.into();
+            event.references.frame_id = Some(frame.id.to_string());
+            event.payload = BrainEventPayload::inline(payload);
+            event.loss_policy = LossPolicy::Coalescible { key: kind.into() };
+            event
+        })
+        .collect();
+    if let Some(vision) = frame.now.objects.vision_health.as_ref() {
+        let state = format!("{:?}", vision.state).to_lowercase();
+        let mut provider = BrainEvent::historical(
+            BrainEventId::from_domain("provider.vision", frame.id),
+            BrainEventType::ProviderState,
+            ProducerIdentity::new(Brain::Forebrain, "vision.pipeline"),
+            EventTimes::observed(t_ms, t_ms),
+        );
+        provider.kind = "provider.vision".into();
+        provider.references.frame_id = Some(frame_id.clone());
+        provider.payload = BrainEventPayload::inline(serde_json::json!({
+            "component_id": "vision.pipeline",
+            "availability": if state == "missing" { "missing" } else { "available" },
+            "health": match state.as_str() {
+                "ready" => "healthy",
+                "failed" => "failed",
+                _ => "degraded",
+            },
+            "queue_depth": vision.queue_depth,
+            "queue_capacity": vision.queue_capacity,
+            "dropped": vision.dropped_frames,
+            "replaced": vision.replaced_frames,
+            "deadline_expired": vision.expired_frames,
+            "inference_p50_ms": vision.p50_inference_ms,
+            "inference_p95_ms": vision.p95_inference_ms,
+            "latest_error": vision.latest_error,
+            "model": vision.backend,
+        }));
+        provider.loss_policy = LossPolicy::Coalescible {
+            key: "provider.vision".into(),
+        };
+        events.push(provider);
+    }
+    let mut forebrain = BrainEvent::historical(
+        BrainEventId::from_domain("forebrain-exchange", frame.id),
+        BrainEventType::Interpretation,
+        ProducerIdentity::new(Brain::Forebrain, "vision.exchange"),
+        EventTimes::observed(t_ms, t_ms),
+    );
+    forebrain.kind = "brain.exchange.fore_to_mother".into();
+    forebrain.references.frame_id = Some(frame_id);
+    forebrain.calibration_epochs = frame
+        .now
+        .objects
+        .detections
+        .iter()
+        .filter_map(|detection| {
+            detection
+                .calibration_epoch
+                .map(|epoch| format!("vision:{epoch}"))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    forebrain.payload = BrainEventPayload::inline(serde_json::json!({
+        "observations": frame.now.objects.observations.len(),
+        "detections": frame.now.objects.detections.len(),
+        "vectors": frame.now.objects.vectors.len(),
+        "vision_health": frame.now.objects.vision_health,
+    }));
+    forebrain.loss_policy = LossPolicy::Coalescible {
+        key: "brain.exchange.fore_to_mother".into(),
+    };
+    events.push(forebrain);
+    events
 }
 
 fn apply_live_point_cloud_calibration(

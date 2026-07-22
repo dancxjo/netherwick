@@ -108,3 +108,193 @@ async fn snapshot_seek_returns_previous_tick_without_leaking_future_state() {
     assert_eq!(selected.selected.now.t_ms, 200);
     assert_eq!(selected.previous.unwrap().now.t_ms, 100);
 }
+
+fn observable_runtime_tick() -> (WorldSnapshot, RuntimeTick) {
+    let t_ms = 500;
+    let mut snapshot = WorldSnapshot::default();
+    snapshot.body.last_update_ms = t_ms;
+    snapshot.action_debug = Some(serde_json::json!({
+        "motor_applied": true,
+        "motion_sent_to_sim": {"forward": 0.2, "turn": 0.0},
+        "movement_delta": 0.02,
+    }));
+    let sensation = pete_experience::Sensation::new(
+        "range.obstacle",
+        "range.front",
+        t_ms,
+        t_ms,
+        serde_json::json!({"range_m": 0.4}),
+    );
+    let impression = pete_experience::Impression::new(
+        "obstacle.near",
+        "obstacle is near",
+        vec![sensation.id],
+        t_ms,
+        t_ms,
+    );
+    let experience = pete_experience::Experience::new(
+        "world.obstacle",
+        "near obstacle belief",
+        vec![impression.id],
+        vec![sensation.id],
+        t_ms,
+        t_ms,
+    );
+    let action = ActionPrimitive::Stop;
+    let mut now = snapshot.to_now(t_ms);
+    now.self_sense.active_goal = Some("goal-safe".into());
+    now.extensions.insert(
+        "motor_gate".into(),
+        serde_json::json!({
+            "desired_motor": {"forward": 0.0, "turn": 0.0},
+            "final_motor": {"forward": 0.0, "turn": 0.0},
+            "motor_applied": false,
+            "vetoed": false,
+            "safety_reason": null,
+        }),
+    );
+    let frame = pete_ledger::ExperienceFrame {
+        id: Uuid::new_v4(),
+        t_ms,
+        now,
+        sensations: vec![sensation],
+        impressions: vec![impression],
+        experiences: vec![experience.clone()],
+        z: Some(pete_experience::ExperienceLatent::default()),
+        chosen_action: Some(action.clone()),
+        conscious_command: None,
+        reign_input: None,
+        reign_outcome: None,
+        predicted_futures: Vec::new(),
+        behavior_runs: Vec::new(),
+        actual_next: None,
+        reward: pete_core::Reward::default(),
+        surprise: pete_now::SurpriseSense::default(),
+        memory_recall: Vec::new(),
+        recollections: Vec::new(),
+        llm_teaching: Vec::new(),
+        counterfactuals: Vec::new(),
+        notes: Vec::new(),
+    };
+    let tick = RuntimeTick {
+        frame,
+        experience,
+        chosen_action: Some(action),
+        skill_request: None,
+        skill_status: None,
+        recall: pete_memory::RecallBundle::default(),
+        llm: pete_llm::LlmTickResult::default(),
+        combobulation: None,
+        inline_learning: pete_runtime::InlineLearningTickStatus::default(),
+    };
+    (snapshot, tick)
+}
+
+#[tokio::test]
+async fn production_runtime_tick_publishes_the_complete_available_causal_chain() {
+    let (snapshot, tick) = observable_runtime_tick();
+    let events = LiveViewState::runtime_tick_brain_events(&snapshot, &tick);
+    for event in &events {
+        event.validate().unwrap();
+    }
+    for event_type in [
+        BrainEventType::Evidence,
+        BrainEventType::Interpretation,
+        BrainEventType::BeliefUpdate,
+        BrainEventType::Proposal,
+        BrainEventType::GateDecision,
+        BrainEventType::Command,
+        BrainEventType::Outcome,
+        BrainEventType::ProviderState,
+        BrainEventType::JobState,
+        BrainEventType::QueueState,
+        BrainEventType::ResourceState,
+    ] {
+        assert!(events.iter().any(|event| event.event_type == event_type));
+    }
+    assert!(events.iter().any(|event| {
+        event.producer.brain == Brain::Forebrain && event.kind == "brain.exchange.fore_to_mother"
+    }));
+    assert!(events.iter().any(|event| {
+        event.producer.brain == Brain::HigherBrain
+            && event.kind == "brain.exchange.higher_to_mother"
+    }));
+    let proposal = events
+        .iter()
+        .find(|event| event.kind == "conductor.proposal")
+        .unwrap();
+    let safety = events
+        .iter()
+        .find(|event| event.kind == "safety.decision")
+        .unwrap();
+    let command = events
+        .iter()
+        .find(|event| event.kind == "actuator.command.accepted")
+        .unwrap();
+    let outcome = events
+        .iter()
+        .find(|event| event.kind == "actuator.outcome")
+        .unwrap();
+    assert_eq!(outcome.producer.brain, Brain::Simulator);
+    assert_eq!(safety.links.parents[0].event_id, proposal.event_id);
+    assert_eq!(command.links.parents[0].event_id, safety.event_id);
+    assert_eq!(outcome.links.parents[0].event_id, command.event_id);
+
+    let state = LiveViewState::new();
+    assert!(state.observatory().start());
+    state.update(snapshot.clone());
+    let published = state.publish_runtime_tick(&snapshot, &tick);
+    wait_for_observatory_sequence(&state.observatory(), published as u64 + 1).await;
+    let response = state
+        .observatory()
+        .query(&BrainEventQuery {
+            limit: Some(100),
+            ..BrainEventQuery::default()
+        })
+        .unwrap();
+    let snapshot_ids = response
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            BrainEventStreamRecord::Event { envelope }
+                if envelope.event.event_type != BrainEventType::Snapshot =>
+            {
+                envelope.event.references.snapshot_id.as_deref()
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(snapshot_ids.len(), 1);
+    state.observatory().shutdown().await;
+}
+
+#[tokio::test]
+async fn scene_calibration_updates_publish_first_class_epoch_transitions() {
+    let state = LiveViewState::new();
+    assert!(state.observatory().start());
+    state.update_scene_metadata(LiveSceneMetadata {
+        sensor_calibration: Some(SceneSensorCalibration::sim_default()),
+        ..LiveSceneMetadata::default()
+    });
+    wait_for_observatory_sequence(&state.observatory(), 1).await;
+
+    let response = state
+        .observatory()
+        .query(&BrainEventQuery::default())
+        .unwrap();
+    let event = response
+        .records
+        .iter()
+        .find_map(|record| match record {
+            BrainEventStreamRecord::Event { envelope }
+                if envelope.event.event_type == BrainEventType::CalibrationTransition =>
+            {
+                Some(&envelope.event)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(event.calibration_epochs.len(), 1);
+    assert_eq!(event.artifacts[0].kind, ArtifactKind::Calibration);
+    state.observatory().shutdown().await;
+}

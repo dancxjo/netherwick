@@ -25,7 +25,7 @@ use pete_core::TimeMs;
 use pete_events::{
     ArtifactIdentity, ArtifactKind, AuthoritySignificance, Brain, BrainEvent, BrainEventId,
     BrainEventPayload, BrainEventType, EventDisposition, EventTimes, LossPolicy, PayloadReference,
-    ProducerIdentity, TrustState, BRAIN_EVENT_SCHEMA_VERSION,
+    ProducerIdentity, TrustState, TypedEventRef, BRAIN_EVENT_SCHEMA_VERSION,
 };
 use pete_experience::EmbodiedContext;
 use pete_map::{
@@ -41,7 +41,7 @@ use pete_memory::{
 use pete_now::{KinectSense, KinectSkeletonSense, ObjectSense, ReignSense};
 use pete_runtime::{
     nudge_action_block_reason_for_snapshot, InlineLearningConfig, InlineLearningMode, NudgePolicy,
-    NudgeStatus, ReignQueue, RuntimeModelStack,
+    NudgeStatus, ReignQueue, RuntimeModelStack, RuntimeTick,
 };
 use pete_sensors::{
     ClusterObservation, EyeFrame, EyeFrameFormat, OccupancyGrid, PlaneObservation,

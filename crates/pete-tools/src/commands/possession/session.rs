@@ -956,6 +956,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             if let Some(live_state) = &live_state {
                 let runtime_map = runner.runtime.canonical_map();
                 live_state.update_with_runtime_map(snapshot.clone(), runtime_map.as_ref());
+                live_state.publish_runtime_tick(&snapshot, &tick);
                 live_state.update_embodied_context(tick.frame.embodied_context());
             }
             let motion_note = slow_motion_note(&snapshot);
