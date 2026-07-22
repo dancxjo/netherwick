@@ -13,7 +13,7 @@ where
         _latent: ExperienceLatent,
         mut futures: Vec<FuturePrediction>,
     ) -> Result<RuntimeTick> {
-        let frame_id = Uuid::new_v4();
+        let frame_id = self.next_frame_id.take().unwrap_or_else(Uuid::new_v4);
         let mut exchange_events = Vec::new();
         let mut authority_events = Vec::new();
         now.extensions.insert(

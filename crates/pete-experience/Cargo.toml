@@ -12,6 +12,7 @@ base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+tokio.workspace = true
 uuid.workspace = true
 pete-actions = { path = "../pete-actions" }
 pete-body = { path = "../pete-body" }

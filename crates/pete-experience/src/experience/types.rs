@@ -31,7 +31,7 @@ impl Sensation {
         payload: Value,
     ) -> Self {
         Self {
-            id: Uuid::new_v4(),
+            id: new_experience_uuid(),
             parent_id: None,
             modality: Modality::Other,
             payload_kind: SensationPayloadKind::Structured,
@@ -142,7 +142,7 @@ impl Impression {
         observed_at_ms: TimeMs,
     ) -> Self {
         Self {
-            id: Uuid::new_v4(),
+            id: new_experience_uuid(),
             kind: kind.into(),
             text: text.into(),
             sensation_id: about.first().copied(),
@@ -213,7 +213,7 @@ impl Experience {
         observed_at_ms: TimeMs,
     ) -> Self {
         Self {
-            id: Uuid::new_v4(),
+            id: new_experience_uuid(),
             kind: kind.into(),
             text: text.into(),
             impression_ids,

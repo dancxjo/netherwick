@@ -47,6 +47,7 @@ where
             semantic_outcomes: SemanticOutcomeTracker::default(),
             last_active_control: None,
             cognition,
+            next_frame_id: None,
         }
     }
 
@@ -91,6 +92,7 @@ where
             semantic_outcomes: SemanticOutcomeTracker::default(),
             last_active_control: None,
             cognition,
+            next_frame_id: None,
         }
     }
 
@@ -123,6 +125,13 @@ where
     pub fn with_nudge_policy(mut self, policy: NudgePolicy) -> Self {
         self.nudge_policy = policy;
         self
+    }
+
+    /// Bind the next production tick to an immutable input-frame identity.
+    /// Live operation leaves this unset and continues to allocate random IDs;
+    /// replay and shadow-flight callers set it once immediately before a tick.
+    pub fn set_next_frame_id(&mut self, frame_id: Uuid) {
+        self.next_frame_id = Some(frame_id);
     }
 
     pub fn with_local_map(mut self, local_map: LocalMap) -> Self {

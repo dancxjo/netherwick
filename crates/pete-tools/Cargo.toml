@@ -38,6 +38,7 @@ pete-cockpit = { path = "../pete-cockpit" }
 pete-conductor = { path = "../pete-conductor" }
 pete-core = { path = "../pete-core" }
 pete-experience = { path = "../pete-experience" }
+pete-events = { path = "../pete-events" }
 pete-ledger = { path = "../pete-ledger" }
 pete-llm = { path = "../pete-llm" }
 pete-map = { path = "../pete-map" }

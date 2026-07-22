@@ -280,7 +280,7 @@ impl ExperienceFuser {
             .iter()
             .map(|impression| impression.id)
             .collect::<Vec<_>>();
-        let experience_id = Uuid::new_v4();
+        let experience_id = new_experience_uuid();
         let summary = self.impressions.generate_for_experience(
             experience_id,
             window_start_ms,

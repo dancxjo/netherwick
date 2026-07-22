@@ -6222,6 +6222,7 @@ dependencies = [
  "pete-cockpit",
  "pete-conductor",
  "pete-core",
+ "pete-events",
  "pete-experience",
  "pete-ledger",
  "pete-llm",

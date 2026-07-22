@@ -40,6 +40,7 @@ where
     semantic_outcomes: SemanticOutcomeTracker,
     last_active_control: Option<ActiveControlSummary>,
     cognition: RuntimeCognition,
+    next_frame_id: Option<Uuid>,
 }
 
 const COGNITION_DEADLINE_MS: u64 = 2_000;

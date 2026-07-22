@@ -84,6 +84,8 @@ observatory-replay bundle addr="127.0.0.1:8788":
     cargo run -q -p pete-tools -- observatory-replay --bundle "{{bundle}}" --addr "{{addr}}"
 observatory-stress profile="ci" events="20000" output="data/reports/observatory-stress/software.json":
     cargo run -q -p pete-server --example observatory_stress -- --profile "{{profile}}" --events "{{events}}" --output "{{output}}"
+shadow-flight ticks="1000" seed="7" output="data/reports/shadow-flight/latest":
+    ulimit -s 32768 && cargo run -q -p pete-tools -- shadow-flight --source fixture --ticks "{{ticks}}" --seed "{{seed}}" --clock accelerated --output "{{output}}"
 server-logs service="pete-live":
     cargo run -q -p xtask -- server-logs "{{service}}"
 stop-servers:
