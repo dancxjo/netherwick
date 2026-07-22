@@ -6,6 +6,13 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Ready: Bind diagnostic bundle v2 checksums to a session identity manifest
+  covering robot/hardware, host and brainstem boots, session, software/build,
+  firmware, active-configuration digest, clock epochs, sensor/providers,
+  model/calibration artifacts, source, schemas, and requested/exported times;
+  retain safe correlation hashes for redacted identities, warn on cross-session
+  comparison differences, and load v1 bundles only with explicit legacy status.
+
 - Ready: Persist loss-intolerant Observatory events in an append-only,
   checksummed, rotating critical-event log outside the runtime tick, recover
   valid records after restart or a truncated tail, deduplicate stable event

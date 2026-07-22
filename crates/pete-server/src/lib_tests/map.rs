@@ -142,6 +142,8 @@ async fn live_scene_returns_body_pose_and_range_beams() {
         safety_class: None,
         independent_watchdog: None,
         motion_surface: None,
+        brainstem_boot_id: None,
+        brainstem_firmware_identity: None,
     });
     state.update_training_status(LiveTrainingStatus {
         training_mode: "collecting".to_string(),

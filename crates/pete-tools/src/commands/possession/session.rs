@@ -295,6 +295,10 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     let brainstem_capabilities = cockpit
         .get_capabilities()
         .context("failed to read the brainstem capability contract")?;
+    let observed_brainstem_boot_id = cockpit
+        .possession_snapshot()
+        .map(|snapshot| snapshot.brainstem_boot_id);
+    let observed_brainstem_firmware_identity = brainstem_firmware_identity(cockpit.as_mut());
     let motion_safety = brainstem_motion_safety(
         &brainstem_capabilities,
         args.cockpit,
@@ -368,6 +372,10 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             safety_class: Some(motion_safety.safety_class.to_string()),
             independent_watchdog: Some(motion_safety.independent_watchdog),
             motion_surface: Some(motion_safety.motion_surface.to_string()),
+            brainstem_boot_id: observed_brainstem_boot_id
+                .clone()
+                .or_else(|| args.brainstem_boot_id.clone()),
+            brainstem_firmware_identity: observed_brainstem_firmware_identity.clone(),
         });
         live_state.update_scene_metadata(LiveSceneMetadata {
             arena: None,
@@ -813,8 +821,7 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         Some(path) => {
             let mut writer =
                 CaptureWriter::create(path, CaptureSource::RealRobot, Some(args.tick_ms)).await?;
-            writer.manifest_mut().firmware_identity =
-                brainstem_firmware_identity(runner.cockpit.client_mut().as_mut());
+            writer.manifest_mut().firmware_identity = observed_brainstem_firmware_identity.clone();
             writer.manifest_mut().brainstem_safety =
                 Some(brainstem_motion_safety_metadata(&motion_safety));
             writer.manifest_mut().device_availability = serde_json::to_value(&sensor_startup)?;

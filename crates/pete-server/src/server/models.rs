@@ -175,6 +175,10 @@ pub struct SceneSession {
     pub independent_watchdog: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub motion_surface: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brainstem_boot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brainstem_firmware_identity: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

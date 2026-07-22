@@ -32,7 +32,130 @@ fn test_diagnostic_bundle(
         to_ms: 300,
         policy,
         partial: false,
+        session: None,
+        session_uuid: "session:test",
+        session_created_at_ms: 50,
+        identity_override: None,
     })
+}
+
+fn test_session_identity() -> DiagnosticSessionIdentity {
+    test_diagnostic_bundle(Vec::new(), Vec::new(), Vec::new(), Default::default())
+        .session_identity
+        .unwrap()
+}
+
+#[test]
+fn v2_bundle_binds_session_identity_to_content_and_redacts_sensitive_values() {
+    let claim = DiagnosticIdentityClaim::sensitive(
+        Some("robot-secret-7".into()),
+        DiagnosticAssetPolicy::RedactSensitive,
+        "missing",
+    );
+    assert_eq!(claim.availability, DiagnosticIdentityAvailability::Redacted);
+    assert_eq!(claim.value, None);
+    assert!(claim
+        .correlation_id
+        .as_deref()
+        .is_some_and(|value| value.starts_with("sha256:")));
+
+    let event = diagnostic_envelope(
+        1,
+        graph_event("identity-clock", BrainEventType::Evidence, 100),
+    );
+    let mut bundle = test_diagnostic_bundle(
+        vec![event],
+        vec![diagnostic_snapshot("snapshot-1", 100)],
+        Vec::new(),
+        DiagnosticAssetPolicy::RedactSensitive,
+    );
+    let verification = verify_diagnostic_bundle(&bundle);
+    assert!(verification.identity_valid);
+    assert!(!verification.legacy_identity);
+    assert_eq!(bundle.manifest.schema_version, 2);
+    assert_eq!(
+        bundle
+            .session_identity
+            .as_ref()
+            .unwrap()
+            .session_identity
+            .value
+            .as_deref(),
+        Some("session:test")
+    );
+
+    let identity = bundle.session_identity.as_mut().unwrap();
+    identity.clock_epochs.push("observed:forged-epoch".into());
+    identity.identity_sha256 = diagnostic_identity_checksum(identity);
+    bundle.manifest.bundle_sha256 = diagnostic_bundle_checksum(&bundle);
+    let verification = verify_diagnostic_bundle(&bundle);
+    assert!(!verification.identity_valid);
+    assert!(!verification.replayable);
+    assert!(verification
+        .structural_errors
+        .iter()
+        .any(|error| error.contains("clock epochs")));
+}
+
+#[test]
+fn identity_comparison_warns_across_robot_boot_hardware_software_and_configuration() {
+    let left = test_session_identity();
+    let mut right = left.clone();
+    right.robot_identity = DiagnosticIdentityClaim::available("robot-b");
+    right.hardware_revision = DiagnosticIdentityClaim::available("rev-b");
+    right.boot_identity = DiagnosticIdentityClaim::available("boot-b");
+    right.session_identity = DiagnosticIdentityClaim::available("session-b");
+    right.software_revision = DiagnosticIdentityClaim::available("git-b");
+    right.build_identity = DiagnosticIdentityClaim::available("build-b");
+    right.brainstem_firmware_identity = DiagnosticIdentityClaim::available("firmware-b");
+    right.configuration_sha256 = diagnostic_sha256(b"config-b");
+    right.schemas.insert("brain_event".into(), "v999".into());
+
+    let warnings = compare_diagnostic_session_identities(&left, &right);
+    for expected in [
+        "robot identity differs",
+        "hardware revision identity differs",
+        "boot identity differs",
+        "session identity differs",
+        "software revision identity differs",
+        "build identity differs",
+        "brainstem firmware identity differs",
+        "configuration digest differs",
+        "schema versions differ",
+    ] {
+        assert!(warnings.iter().any(|warning| warning == expected));
+    }
+}
+
+#[test]
+fn legacy_v1_bundle_is_replayable_but_explicitly_unbound() {
+    let mut bundle = test_diagnostic_bundle(
+        vec![diagnostic_envelope(
+            1,
+            graph_event("legacy", BrainEventType::Evidence, 100),
+        )],
+        vec![diagnostic_snapshot("snapshot-1", 100)],
+        Vec::new(),
+        DiagnosticAssetPolicy::ManifestOnly,
+    );
+    bundle.manifest.schema_version = 1;
+    bundle
+        .manifest
+        .schemas
+        .insert("diagnostic_bundle".into(), "v1".into());
+    bundle.manifest.schemas.remove("diagnostic_identity");
+    bundle.session_identity = None;
+    bundle.manifest.bundle_sha256 = diagnostic_bundle_checksum(&bundle);
+
+    let verification = verify_diagnostic_bundle(&bundle);
+    assert!(verification.replayable);
+    assert!(verification.legacy_identity);
+    assert!(verification.identity_valid);
+    assert!(verification
+        .identity_warnings
+        .iter()
+        .any(|warning| warning.contains("legacy v1")));
+    assert!(LiveViewState::from_diagnostic_bundle(bundle).is_ok());
 }
 
 #[test]
@@ -383,7 +506,14 @@ fn comparison_separates_value_from_trust_and_epoch_changes() {
     new_epoch.calibration_epochs.push("mount-epoch-2".into());
 
     let comparison =
-        build_diagnostic_comparison(&left, &right, &[old_epoch, new_epoch], false, vec![]);
+        build_diagnostic_comparison(
+            &left,
+            &right,
+            &[old_epoch, new_epoch],
+            false,
+            vec![],
+            test_session_identity(),
+        );
 
     assert!(comparison.fields.iter().any(|change| {
         change.path.ends_with("belief.value") && change.kind == DiagnosticChangeKind::Value
@@ -424,7 +554,14 @@ fn candidate_and_reprocessed_outputs_remain_distinct_from_baseline() {
     });
 
     let comparison =
-        build_diagnostic_comparison(&left, &right, &[baseline, candidate], false, vec![]);
+        build_diagnostic_comparison(
+            &left,
+            &right,
+            &[baseline, candidate],
+            false,
+            vec![],
+            test_session_identity(),
+        );
 
     assert!(comparison
         .model_artifacts

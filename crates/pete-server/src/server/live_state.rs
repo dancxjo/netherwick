@@ -21,6 +21,9 @@ pub struct LiveViewState {
     observatory: BrainEventHub,
     observatory_now: Arc<Mutex<VecDeque<ObservatoryNowSnapshot>>>,
     observatory_snapshot_sequence: Arc<AtomicU64>,
+    diagnostic_session_uuid: Arc<String>,
+    diagnostic_session_created_at_ms: u64,
+    diagnostic_replay_identity: Arc<Mutex<Option<DiagnosticSessionIdentity>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -58,6 +61,9 @@ impl Default for LiveViewState {
             observatory: BrainEventHub::new(BrainEventHubConfig::default()),
             observatory_now: Arc::new(Mutex::new(VecDeque::new())),
             observatory_snapshot_sequence: Arc::new(AtomicU64::new(0)),
+            diagnostic_session_uuid: Arc::new(format!("session:{}", Uuid::new_v4())),
+            diagnostic_session_created_at_ms: wall_now_ms(),
+            diagnostic_replay_identity: Arc::new(Mutex::new(None)),
         }
     }
 }

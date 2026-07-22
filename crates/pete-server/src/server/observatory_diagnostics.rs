@@ -1,4 +1,5 @@
-const DIAGNOSTIC_BUNDLE_SCHEMA_VERSION: u32 = 1;
+const DIAGNOSTIC_BUNDLE_SCHEMA_VERSION: u32 = 2;
+const DIAGNOSTIC_IDENTITY_SCHEMA_VERSION: u32 = 1;
 const MAX_DIAGNOSTIC_EVENTS: usize = 50_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +44,52 @@ pub struct DiagnosticDropMetadata {
     pub transport: BrainEventTransportHealth,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticIdentityAvailability {
+    Available,
+    Unavailable,
+    Redacted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticIdentityClaim {
+    pub availability: DiagnosticIdentityAvailability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DiagnosticSessionIdentity {
+    pub schema_version: u32,
+    pub robot_identity: DiagnosticIdentityClaim,
+    pub hardware_revision: DiagnosticIdentityClaim,
+    pub boot_identity: DiagnosticIdentityClaim,
+    pub session_identity: DiagnosticIdentityClaim,
+    pub software_revision: DiagnosticIdentityClaim,
+    pub build_identity: DiagnosticIdentityClaim,
+    pub brainstem_firmware_identity: DiagnosticIdentityClaim,
+    pub brainstem_boot_identity: DiagnosticIdentityClaim,
+    pub configuration_sha256: String,
+    pub clock_epochs: Vec<String>,
+    pub sensor_providers: Vec<String>,
+    pub artifacts: Vec<ArtifactIdentity>,
+    pub source_kind: String,
+    pub source_identity: DiagnosticIdentityClaim,
+    pub created_at_ms: u64,
+    pub requested_from_ms: u64,
+    pub requested_to_ms: u64,
+    pub exported_from_ms: u64,
+    pub exported_to_ms: u64,
+    pub schemas: BTreeMap<String, String>,
+    pub unavailable_fields: Vec<String>,
+    pub identity_sha256: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DiagnosticBundle {
     pub manifest: DiagnosticBundleManifest,
@@ -52,6 +99,8 @@ pub struct DiagnosticBundle {
     pub assets: Vec<DiagnosticAssetEntry>,
     pub component_health: ComponentHealthResponse,
     pub drops: DiagnosticDropMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_identity: Option<DiagnosticSessionIdentity>,
 }
 
 struct DiagnosticBundleBuild<'a> {
@@ -64,6 +113,10 @@ struct DiagnosticBundleBuild<'a> {
     to_ms: u64,
     policy: DiagnosticAssetPolicy,
     partial: bool,
+    session: Option<&'a SceneSession>,
+    session_uuid: &'a str,
+    session_created_at_ms: u64,
+    identity_override: Option<DiagnosticSessionIdentity>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -78,6 +131,11 @@ pub struct DiagnosticVerificationReport {
     pub replayable: bool,
     pub evidence_complete: bool,
     pub structural_errors: Vec<String>,
+    pub identity_valid: bool,
+    pub legacy_identity: bool,
+    pub identity_warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_identity: Option<DiagnosticSessionIdentity>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -135,10 +193,238 @@ pub struct DiagnosticComparisonResponse {
     pub raw_corrected_pose_paths: Vec<String>,
     pub partial: bool,
     pub warnings: Vec<String>,
+    pub session_identity: DiagnosticSessionIdentity,
 }
 
 fn diagnostic_sha256(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+impl DiagnosticIdentityClaim {
+    fn available(value: impl Into<String>) -> Self {
+        let value = value.into();
+        Self {
+            availability: DiagnosticIdentityAvailability::Available,
+            correlation_id: Some(diagnostic_sha256(value.as_bytes())),
+            value: Some(value),
+            reason: None,
+        }
+    }
+
+    fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            availability: DiagnosticIdentityAvailability::Unavailable,
+            value: None,
+            correlation_id: None,
+            reason: Some(reason.into()),
+        }
+    }
+
+    fn sensitive(value: Option<String>, policy: DiagnosticAssetPolicy, reason: &str) -> Self {
+        let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+            return Self::unavailable(reason);
+        };
+        if policy == DiagnosticAssetPolicy::RedactSensitive {
+            Self {
+                availability: DiagnosticIdentityAvailability::Redacted,
+                correlation_id: Some(diagnostic_sha256(value.as_bytes())),
+                value: None,
+                reason: Some("value redacted; correlation hash retained".into()),
+            }
+        } else {
+            Self::available(value)
+        }
+    }
+
+    fn comparison_key(&self) -> Option<&str> {
+        self.correlation_id.as_deref().or(self.value.as_deref())
+    }
+}
+
+fn diagnostic_identity_checksum(identity: &DiagnosticSessionIdentity) -> String {
+    let mut content = identity.clone();
+    content.identity_sha256.clear();
+    let value = serde_json::to_value(content).expect("diagnostic identity serializes");
+    let mut canonical = String::new();
+    diagnostic_canonical_json(&value, &mut canonical);
+    diagnostic_sha256(canonical.as_bytes())
+}
+
+fn diagnostic_event_clock_epochs(events: &[SequencedBrainEvent]) -> Vec<String> {
+    let mut epochs = BTreeSet::new();
+    for event in events {
+        if let Some(epoch) = &event.event.times.occurred.clock_epoch {
+            epochs.insert(format!("occurred:{epoch}"));
+        }
+        if let Some(epoch) = &event.event.times.observed.clock_epoch {
+            epochs.insert(format!("observed:{epoch}"));
+        }
+    }
+    epochs.into_iter().collect()
+}
+
+fn build_diagnostic_session_identity(
+    events: &[SequencedBrainEvent],
+    artifacts: &[ArtifactIdentity],
+    schemas: &BTreeMap<String, String>,
+    session: Option<&SceneSession>,
+    session_uuid: &str,
+    session_created_at_ms: u64,
+    requested_from_ms: u64,
+    requested_to_ms: u64,
+    policy: DiagnosticAssetPolicy,
+) -> DiagnosticSessionIdentity {
+    let robot_identity = DiagnosticIdentityClaim::sensitive(
+        std::env::var("PETE_ROBOT_ID").ok(),
+        policy,
+        "PETE_ROBOT_ID is not configured",
+    );
+    let hardware_revision = std::env::var("PETE_HARDWARE_REVISION")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(DiagnosticIdentityClaim::available)
+        .unwrap_or_else(|| {
+            DiagnosticIdentityClaim::unavailable("PETE_HARDWARE_REVISION is not configured")
+        });
+    let boot_identity = DiagnosticIdentityClaim::sensitive(
+        fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|value| value.trim().to_string()),
+        policy,
+        "host boot identity is unavailable",
+    );
+    let software_revision = option_env!("PETE_GIT_COMMIT")
+        .map(DiagnosticIdentityClaim::available)
+        .unwrap_or_else(|| DiagnosticIdentityClaim::unavailable("git revision not embedded"));
+    let build_identity = DiagnosticIdentityClaim::available(format!(
+        "pete-server@{}+{}",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("PETE_BUILD_ID").unwrap_or("development")
+    ));
+    let brainstem_firmware_identity = session
+        .and_then(|session| session.brainstem_firmware_identity.as_ref())
+        .and_then(|identity| serde_json::to_string(identity).ok())
+        .map(DiagnosticIdentityClaim::available)
+        .unwrap_or_else(|| {
+            DiagnosticIdentityClaim::unavailable("brainstem firmware identity was not observed")
+        });
+    let brainstem_boot_identity = DiagnosticIdentityClaim::sensitive(
+        session.and_then(|session| session.brainstem_boot_id.clone()),
+        policy,
+        "brainstem boot identity was not observed",
+    );
+    let session_value = serde_json::to_value(session).unwrap_or(serde_json::Value::Null);
+    let mut session_canonical = String::new();
+    diagnostic_canonical_json(&session_value, &mut session_canonical);
+    let configuration_sha256 = diagnostic_sha256(session_canonical.as_bytes());
+    let clock_epochs = diagnostic_event_clock_epochs(events);
+    let sensor_providers = events
+        .iter()
+        .map(|event| {
+            format!(
+                "{}:{}",
+                format!("{:?}", event.event.producer.brain).to_lowercase(),
+                event.event.producer.component
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let source_kind = session.map_or("live", |session| session.source.as_str()).to_string();
+    let source_identity = DiagnosticIdentityClaim::available(source_kind.clone());
+    let exported_from_ms = events
+        .iter()
+        .map(|event| event.event.times.observed.t_ms)
+        .min()
+        .unwrap_or(requested_from_ms);
+    let exported_to_ms = events
+        .iter()
+        .map(|event| event.event.times.observed.t_ms)
+        .max()
+        .unwrap_or(requested_to_ms);
+    let claims = [
+        ("robot_identity", &robot_identity),
+        ("hardware_revision", &hardware_revision),
+        ("boot_identity", &boot_identity),
+        ("software_revision", &software_revision),
+        ("brainstem_firmware_identity", &brainstem_firmware_identity),
+        ("brainstem_boot_identity", &brainstem_boot_identity),
+    ];
+    let mut unavailable_fields = claims
+        .into_iter()
+        .filter(|(_, claim)| {
+            claim.availability == DiagnosticIdentityAvailability::Unavailable
+        })
+        .map(|(name, _)| name.to_string())
+        .collect::<Vec<_>>();
+    if clock_epochs.is_empty() {
+        unavailable_fields.push("clock_epochs".into());
+    }
+    if sensor_providers.is_empty() {
+        unavailable_fields.push("sensor_providers".into());
+    }
+    let mut identity = DiagnosticSessionIdentity {
+        schema_version: DIAGNOSTIC_IDENTITY_SCHEMA_VERSION,
+        robot_identity,
+        hardware_revision,
+        boot_identity,
+        session_identity: DiagnosticIdentityClaim::available(session_uuid),
+        software_revision,
+        build_identity,
+        brainstem_firmware_identity,
+        brainstem_boot_identity,
+        configuration_sha256,
+        clock_epochs,
+        sensor_providers,
+        artifacts: artifacts.to_vec(),
+        source_kind,
+        source_identity,
+        created_at_ms: session_created_at_ms,
+        requested_from_ms,
+        requested_to_ms,
+        exported_from_ms,
+        exported_to_ms,
+        schemas: schemas.clone(),
+        unavailable_fields,
+        identity_sha256: String::new(),
+    };
+    identity.identity_sha256 = diagnostic_identity_checksum(&identity);
+    identity
+}
+
+pub fn compare_diagnostic_session_identities(
+    left: &DiagnosticSessionIdentity,
+    right: &DiagnosticSessionIdentity,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (label, left, right) in [
+        ("robot", &left.robot_identity, &right.robot_identity),
+        (
+            "hardware revision",
+            &left.hardware_revision,
+            &right.hardware_revision,
+        ),
+        ("boot", &left.boot_identity, &right.boot_identity),
+        ("session", &left.session_identity, &right.session_identity),
+        ("software revision", &left.software_revision, &right.software_revision),
+        ("build", &left.build_identity, &right.build_identity),
+        (
+            "brainstem firmware",
+            &left.brainstem_firmware_identity,
+            &right.brainstem_firmware_identity,
+        ),
+    ] {
+        if left.comparison_key() != right.comparison_key() {
+            warnings.push(format!("{label} identity differs"));
+        }
+    }
+    if left.configuration_sha256 != right.configuration_sha256 {
+        warnings.push("configuration digest differs".into());
+    }
+    if left.schemas != right.schemas {
+        warnings.push("schema versions differ".into());
+    }
+    warnings
 }
 
 fn diagnostic_canonical_json(value: &serde_json::Value, output: &mut String) {
@@ -320,6 +606,10 @@ fn build_diagnostic_bundle(input: DiagnosticBundleBuild<'_>) -> DiagnosticBundle
         to_ms,
         policy,
         mut partial,
+        session,
+        session_uuid,
+        session_created_at_ms,
+        identity_override,
     } = input;
     let plain_events: Vec<BrainEvent> = events.iter().map(|event| event.event.clone()).collect();
     let assets = diagnostic_asset_entries(&events, policy);
@@ -359,10 +649,46 @@ fn build_diagnostic_bundle(input: DiagnosticBundleBuild<'_>) -> DiagnosticBundle
         "diagnostic_bundle".into(),
         format!("v{DIAGNOSTIC_BUNDLE_SCHEMA_VERSION}"),
     );
+    schemas.insert(
+        "diagnostic_identity".into(),
+        format!("v{DIAGNOSTIC_IDENTITY_SCHEMA_VERSION}"),
+    );
+    let session_identity = if let Some(mut identity) = identity_override {
+        identity.requested_from_ms = from_ms;
+        identity.requested_to_ms = to_ms;
+        identity.exported_from_ms = events
+            .iter()
+            .map(|event| event.event.times.observed.t_ms)
+            .min()
+            .unwrap_or(from_ms);
+        identity.exported_to_ms = events
+            .iter()
+            .map(|event| event.event.times.observed.t_ms)
+            .max()
+            .unwrap_or(to_ms);
+        identity.clock_epochs = diagnostic_event_clock_epochs(&events);
+        identity.artifacts.clone_from(&artifacts);
+        identity.schemas.clone_from(&schemas);
+        identity.identity_sha256 = diagnostic_identity_checksum(&identity);
+        identity
+    } else {
+        build_diagnostic_session_identity(
+            &events,
+            &artifacts,
+            &schemas,
+            session,
+            session_uuid,
+            session_created_at_ms,
+            from_ms,
+            to_ms,
+            policy,
+        )
+    };
+    let source_id = session_identity.source_kind.clone();
     let manifest = DiagnosticBundleManifest {
         schema_version: DIAGNOSTIC_BUNDLE_SCHEMA_VERSION,
         bundle_id: format!("diagnostic:{}", Uuid::new_v4()),
-        source_id: "live".into(),
+        source_id,
         from_ms,
         to_ms,
         asset_policy: policy,
@@ -383,6 +709,7 @@ fn build_diagnostic_bundle(input: DiagnosticBundleBuild<'_>) -> DiagnosticBundle
         assets,
         component_health,
         drops: DiagnosticDropMetadata { gaps, transport },
+        session_identity: Some(session_identity),
     })
 }
 
@@ -420,7 +747,7 @@ pub fn verify_diagnostic_bundle(bundle: &DiagnosticBundle) -> DiagnosticVerifica
         }
     }
     let mut structural_errors = Vec::new();
-    if bundle.manifest.schema_version != DIAGNOSTIC_BUNDLE_SCHEMA_VERSION {
+    if !matches!(bundle.manifest.schema_version, 1 | DIAGNOSTIC_BUNDLE_SCHEMA_VERSION) {
         structural_errors.push(format!(
             "unsupported diagnostic schema {}",
             bundle.manifest.schema_version
@@ -473,7 +800,61 @@ pub fn verify_diagnostic_bundle(bundle: &DiagnosticBundle) -> DiagnosticVerifica
             }
         }
     }
-    let integrity_valid = bundle_checksum_valid && invalid_asset_checksums.is_empty();
+    let legacy_identity = bundle.manifest.schema_version == 1 && bundle.session_identity.is_none();
+    let mut identity_warnings = Vec::new();
+    let identity_valid = if legacy_identity {
+        identity_warnings.push(
+            "legacy v1 bundle has no bound session identity; source correlation is unavailable"
+                .into(),
+        );
+        true
+    } else if let Some(identity) = bundle.session_identity.as_ref() {
+        let mut valid = true;
+        if identity.schema_version != DIAGNOSTIC_IDENTITY_SCHEMA_VERSION {
+            structural_errors.push(format!(
+                "unsupported diagnostic identity schema {}",
+                identity.schema_version
+            ));
+            valid = false;
+        }
+        if diagnostic_identity_checksum(identity) != identity.identity_sha256 {
+            structural_errors.push("session identity checksum mismatch".into());
+            valid = false;
+        }
+        if identity.source_kind != bundle.manifest.source_id
+            || identity.source_identity.value.as_deref() != Some(bundle.manifest.source_id.as_str())
+        {
+            structural_errors.push("manifest source does not match session identity".into());
+            valid = false;
+        }
+        if identity.requested_from_ms != bundle.manifest.from_ms
+            || identity.requested_to_ms != bundle.manifest.to_ms
+        {
+            structural_errors.push("manifest interval does not match session identity".into());
+            valid = false;
+        }
+        if identity.schemas != bundle.manifest.schemas {
+            structural_errors.push("manifest schemas do not match session identity".into());
+            valid = false;
+        }
+        if identity.artifacts != bundle.artifacts {
+            structural_errors.push("bundle artifacts do not match session identity".into());
+            valid = false;
+        }
+        if identity.clock_epochs != diagnostic_event_clock_epochs(&bundle.events) {
+            structural_errors.push("event clock epochs do not match session identity".into());
+            valid = false;
+        }
+        for field in &identity.unavailable_fields {
+            identity_warnings.push(format!("identity field unavailable: {field}"));
+        }
+        valid
+    } else {
+        structural_errors.push("diagnostic v2 bundle is missing session identity".into());
+        false
+    };
+    let integrity_valid =
+        bundle_checksum_valid && invalid_asset_checksums.is_empty() && identity_valid;
     let structurally_valid = structural_errors.is_empty();
     let partial = bundle.manifest.partial
         || bundle
@@ -494,6 +875,10 @@ pub fn verify_diagnostic_bundle(bundle: &DiagnosticBundle) -> DiagnosticVerifica
         replayable,
         evidence_complete,
         structural_errors,
+        identity_valid,
+        legacy_identity,
+        identity_warnings,
+        session_identity: bundle.session_identity.clone(),
     }
 }
 
@@ -507,6 +892,14 @@ impl LiveViewState {
                 verification.invalid_asset_checksums.join(",")
             ));
         }
+        let replay_identity = bundle.session_identity.clone();
+        let replay_session_uuid = replay_identity
+            .as_ref()
+            .and_then(|identity| identity.session_identity.value.clone())
+            .unwrap_or_else(|| format!("legacy-replay:{}", Uuid::new_v4()));
+        let replay_created_at_ms = replay_identity
+            .as_ref()
+            .map_or_else(wall_now_ms, |identity| identity.created_at_ms);
         let history_capacity = bundle.events.len().max(1);
         let hub = BrainEventHub::new(BrainEventHubConfig {
             history_capacity,
@@ -533,6 +926,9 @@ impl LiveViewState {
         let state = Self {
             observatory: hub,
             observatory_now: Arc::new(Mutex::new(bundle.snapshots.into())),
+            diagnostic_session_uuid: Arc::new(replay_session_uuid),
+            diagnostic_session_created_at_ms: replay_created_at_ms,
+            diagnostic_replay_identity: Arc::new(Mutex::new(replay_identity)),
             ..Self::default()
         };
         state.observatory_snapshot_sequence.store(
@@ -554,6 +950,8 @@ impl LiveViewState {
             safety_class: None,
             independent_watchdog: None,
             motion_surface: None,
+            brainstem_boot_id: None,
+            brainstem_firmware_identity: None,
         });
         Ok(state)
     }
@@ -719,6 +1117,7 @@ fn build_diagnostic_comparison(
     events: &[BrainEvent],
     partial: bool,
     warnings: Vec<String>,
+    session_identity: DiagnosticSessionIdentity,
 ) -> DiagnosticComparisonResponse {
     let left_state = diagnostic_event_state(events, left.now.t_ms);
     let right_state = diagnostic_event_state(events, right.now.t_ms);
@@ -795,6 +1194,7 @@ fn build_diagnostic_comparison(
         raw_corrected_pose_paths,
         partial,
         warnings,
+        session_identity,
     }
 }
 
@@ -823,6 +1223,12 @@ async fn get_observatory_diagnostic_export(
         query.from_ms,
         query.to_ms,
     );
+    let session = state.session();
+    let identity_override = state
+        .diagnostic_replay_identity
+        .lock()
+        .ok()
+        .and_then(|identity| identity.clone());
     Ok(Json(build_diagnostic_bundle(DiagnosticBundleBuild {
         events,
         snapshots,
@@ -833,6 +1239,10 @@ async fn get_observatory_diagnostic_export(
         to_ms: query.to_ms,
         policy: query.asset_policy,
         partial,
+        session: session.as_ref(),
+        session_uuid: &state.diagnostic_session_uuid,
+        session_created_at_ms: state.diagnostic_session_created_at_ms,
+        identity_override,
     })))
 }
 
@@ -861,6 +1271,38 @@ async fn get_observatory_compare(
         .then(|| format!("comparison crosses {} declared gaps", gaps.len()))
         .into_iter()
         .collect();
+    let mut schemas = BTreeMap::new();
+    schemas.insert(
+        "brain_event".into(),
+        format!("v{}", BRAIN_EVENT_SCHEMA_VERSION),
+    );
+    schemas.insert(
+        "diagnostic_bundle".into(),
+        format!("v{DIAGNOSTIC_BUNDLE_SCHEMA_VERSION}"),
+    );
+    schemas.insert(
+        "diagnostic_identity".into(),
+        format!("v{DIAGNOSTIC_IDENTITY_SCHEMA_VERSION}"),
+    );
+    let session = state.session();
+    let session_identity = state
+        .diagnostic_replay_identity
+        .lock()
+        .ok()
+        .and_then(|identity| identity.clone())
+        .unwrap_or_else(|| {
+            build_diagnostic_session_identity(
+                &events,
+                &diagnostic_artifacts(&events),
+                &schemas,
+                session.as_ref(),
+                &state.diagnostic_session_uuid,
+                state.diagnostic_session_created_at_ms,
+                left.now.t_ms.min(right.now.t_ms),
+                left.now.t_ms.max(right.now.t_ms),
+                DiagnosticAssetPolicy::RedactSensitive,
+            )
+        });
     Ok(Json(build_diagnostic_comparison(
         &left,
         &right,
@@ -870,5 +1312,6 @@ async fn get_observatory_compare(
             .collect::<Vec<_>>(),
         partial || !gaps.is_empty(),
         warnings,
+        session_identity,
     )))
 }

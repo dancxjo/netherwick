@@ -57,6 +57,8 @@ async fn run_sim(args: SimArgs) -> Result<()> {
             safety_class: None,
             independent_watchdog: None,
             motion_surface: None,
+            brainstem_boot_id: None,
+            brainstem_firmware_identity: None,
         });
         live_state.update_training_status(pete_server::LiveTrainingStatus {
             training_mode: inline_learning.training_mode_label().to_string(),
