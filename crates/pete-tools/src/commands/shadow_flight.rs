@@ -8,6 +8,60 @@ use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+enum ShadowHigherBrainMode {
+    Disabled,
+    AdvisoryStub,
+}
+
+#[derive(Default)]
+struct ShadowLlmAgent {
+    advisory: bool,
+}
+
+#[async_trait::async_trait]
+impl pete_llm::LlmAgent for ShadowLlmAgent {
+    fn enhanced_cognition_available(&self) -> bool {
+        self.advisory
+    }
+
+    fn enhanced_cognition_unavailable_reason(&self) -> Option<&str> {
+        (!self.advisory).then_some("enhanced language service is disabled for shadow flight")
+    }
+
+    async fn combobulate(
+        &mut self,
+        _now: &Now,
+        _impressions: &[pete_experience::Impression],
+        _embodied: Option<&pete_experience::EmbodiedContext>,
+        _z: &pete_experience::ExperienceLatent,
+        _futures: &[pete_experience::FuturePrediction],
+        _recall_summary: &str,
+    ) -> Result<Option<pete_llm::Combobulation>> {
+        Ok(None)
+    }
+
+    async fn maybe_tick(
+        &mut self,
+        _now: &Now,
+        _embodied: Option<&pete_experience::EmbodiedContext>,
+        _z: &pete_experience::ExperienceLatent,
+        _futures: &[pete_experience::FuturePrediction],
+        _recall_summary: &str,
+        _awareness_summary: Option<&str>,
+    ) -> Result<pete_llm::LlmTickResult> {
+        Ok(pete_llm::LlmTickResult::default())
+    }
+
+    async fn scientific_review(
+        &mut self,
+        _request: &pete_llm::LlmReviewRequest,
+    ) -> Result<Option<pete_llm::LlmScientificReview>> {
+        Ok(None)
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 enum ShadowFlightSource {
     Fixture,
     Seeded,
@@ -38,6 +92,8 @@ struct ShadowFlightArgs {
     clock: ShadowClockMode,
     #[arg(long, default_value_t = 100.0)]
     speed: f64,
+    #[arg(long, value_enum, default_value = "disabled")]
+    higher_brain: ShadowHigherBrainMode,
     #[arg(long, value_delimiter = ',')]
     pause_at: Vec<u64>,
     /// Deterministic simulator fault in `tick:kind` form. Supported kinds are
@@ -73,6 +129,7 @@ struct ShadowFlightSummary {
     full_causal_chain_observed: bool,
     simulated_outcomes: u64,
     higher_brain_authority_violations: u64,
+    local_authority_sha256: String,
     safety_gate_events: u64,
     events_sha256: String,
 }
@@ -85,6 +142,7 @@ struct ShadowFlightManifest {
     source_identity: String,
     seed: Option<u64>,
     clock_mode: ShadowClockMode,
+    higher_brain_mode: ShadowHigherBrainMode,
     speed: f64,
     requested_ticks: usize,
     completed_ticks: u64,
@@ -108,10 +166,10 @@ type ShadowRuntime = MinimalRuntime<
     DurableExperienceStore,
     SimpleConductor,
     SimpleSafety,
-    NoopLlmAgent,
+    ShadowLlmAgent,
 >;
 
-fn shadow_runtime(ledger: &Path) -> ShadowRuntime {
+fn shadow_runtime(ledger: &Path, higher_brain: ShadowHigherBrainMode) -> ShadowRuntime {
     let memory = DurableExperienceStore::new(InMemoryExperienceStore::new());
     MinimalRuntime::with_default_events(
         JsonlLedger::new(ledger),
@@ -119,7 +177,9 @@ fn shadow_runtime(ledger: &Path) -> ShadowRuntime {
         memory,
         SimpleConductor::default(),
         SimpleSafety::default(),
-        NoopLlmAgent,
+        ShadowLlmAgent {
+            advisory: higher_brain == ShadowHigherBrainMode::AdvisoryStub,
+        },
     )
     .with_nudge_policy(NudgePolicy::virtual_default())
 }
@@ -308,7 +368,7 @@ async fn run_shadow_flight(args: &ShadowFlightArgs) -> Result<(ShadowFlightManif
         ShadowFlightSource::Fixture | ShadowFlightSource::Seeded => {
             let effective_seed = if args.source == ShadowFlightSource::Fixture { 7 } else { args.seed };
             source_identity = format!("seeded:mixed-room:{effective_seed}");
-            let runtime = shadow_runtime(&ledger_path);
+            let runtime = shadow_runtime(&ledger_path, args.higher_brain);
             let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::MixedRoom, effective_seed));
             let mut runner = SimRunner::new(runtime, scenario.world, scenario.motors);
             for index in 0..args.ticks {
@@ -362,7 +422,7 @@ async fn run_shadow_flight(args: &ShadowFlightArgs) -> Result<(ShadowFlightManif
             let reader = CaptureReader::open(input).await?;
             source_identity = format!("capture:{}", reader.manifest().id);
             let frames = reader.read_frames().await?;
-            let mut runtime = shadow_runtime(&ledger_path);
+            let mut runtime = shadow_runtime(&ledger_path, args.higher_brain);
             for record in frames.into_iter().take(args.ticks) {
                 let input_frame_id = format!("{}:{}", source_identity, record.index);
                 let runtime_frame_id = shadow_frame_uuid(&input_frame_id);
@@ -400,7 +460,7 @@ async fn run_shadow_flight(args: &ShadowFlightArgs) -> Result<(ShadowFlightManif
             source_identity = format!("ledger:{}", input.display());
             let source_ledger = JsonlLedger::new(input);
             let frames = source_ledger.frames().await?;
-            let mut runtime = shadow_runtime(&ledger_path);
+            let mut runtime = shadow_runtime(&ledger_path, args.higher_brain);
             for (index, frame) in frames.into_iter().take(args.ticks).enumerate() {
                 let input_frame_id = format!("ledger-frame:{}", frame.id);
                 runtime.set_next_frame_id(frame.id);
@@ -443,6 +503,20 @@ async fn run_shadow_flight(args: &ShadowFlightArgs) -> Result<(ShadowFlightManif
         *counts.entry(record.event.event_type.as_str().to_string()).or_insert(0) += 1;
         counts
     });
+    let local_authority_bytes = events
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.event.authority,
+                AuthoritySignificance::Gate | AuthoritySignificance::Command
+            ) && !matches!(
+                record.event.producer.brain,
+                Brain::Forebrain | Brain::HigherBrain
+            )
+        })
+        .map(|record| serde_json::to_string(&record.event))
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .join("\n");
     let chain = ["evidence", "interpretation", "belief_update", "proposal", "gate_decision", "command", "outcome"];
     let summary = ShadowFlightSummary {
         ticks_completed: inputs.len() as u64,
@@ -453,6 +527,7 @@ async fn run_shadow_flight(args: &ShadowFlightArgs) -> Result<(ShadowFlightManif
             matches!(record.event.producer.brain, Brain::Forebrain | Brain::HigherBrain)
                 && !matches!(record.event.authority, AuthoritySignificance::None | AuthoritySignificance::Advisory)
         }).count() as u64,
+        local_authority_sha256: hash(local_authority_bytes.as_bytes()),
         safety_gate_events: *event_type_counts.get("gate_decision").unwrap_or(&0),
         event_type_counts,
         events_sha256: hash(event_bytes.as_bytes()),
@@ -475,11 +550,15 @@ async fn run_shadow_flight(args: &ShadowFlightArgs) -> Result<(ShadowFlightManif
             ShadowFlightSource::Capture | ShadowFlightSource::Ledger => None,
         },
         clock_mode: args.clock,
+        higher_brain_mode: args.higher_brain,
         speed: args.speed,
         requested_ticks: args.ticks,
         completed_ticks: summary.ticks_completed,
         production_components: vec!["pete_runtime::MinimalRuntime".into(), "pete_conductor::SimpleConductor".into(), "pete_autonomic::SimpleSafety".into(), "pete_runtime::SimRunner".into(), "pete_server::LiveViewState::runtime_tick_brain_events".into(), "pete_ledger::JsonlLedger".into(), "pete_memory::DurableExperienceStore".into()],
-        substitutions: vec!["higher brain explicitly disabled with NoopLlmAgent".into()],
+        substitutions: match args.higher_brain {
+            ShadowHigherBrainMode::Disabled => vec!["higher brain explicitly disabled".into()],
+            ShadowHigherBrainMode::AdvisoryStub => vec!["higher brain replaced by deterministic advisory-only stub".into()],
+        },
         actuator_transport: "in_process_simulator_only".into(),
         network_required: false,
         physical_hardware_required: false,

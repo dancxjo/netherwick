@@ -28,6 +28,13 @@ at least one safety gate and simulator outcome, and zero higher-brain control
 authority. A failed CLI run writes `failure.json` and still states that no
 physical transport was opened.
 
+`--higher-brain disabled` is the offline default. `--higher-brain
+advisory-stub` exercises the production asynchronous higher-cognition boundary
+with a deterministic, network-free advisory provider. Reports hash local gate
+and command authority separately; tests require that hash to remain identical
+with the provider enabled or disabled and reject any higher-brain gate or
+command authority.
+
 ## Sources and time control
 
 Direct CLI use supports deterministic fixtures, arbitrary seeded simulations,
