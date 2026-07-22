@@ -20,14 +20,22 @@ pub enum CalibrationTransitionKind {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CalibrationClockedTime {
     pub t_ms: u64,
-    pub clock_epoch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_epoch: Option<String>,
 }
 
 impl CalibrationClockedTime {
-    pub fn new(t_ms: u64, clock_epoch: impl Into<String>) -> Self {
+    pub fn new(t_ms: u64) -> Self {
         Self {
             t_ms,
-            clock_epoch: clock_epoch.into(),
+            clock_epoch: None,
+        }
+    }
+
+    pub fn in_epoch(t_ms: u64, clock_epoch: impl Into<String>) -> Self {
+        Self {
+            t_ms,
+            clock_epoch: Some(clock_epoch.into()),
         }
     }
 }
@@ -372,6 +380,9 @@ mod tests {
         assert_eq!(partial[0].changed_degrees_of_freedom, vec!["x"]);
         assert!(partial[0].new.degrees_of_freedom["x"].observable);
         assert!(!partial[0].new.degrees_of_freedom["yaw"].observable);
+        assert_eq!(partial[0].occurred.clock_epoch, None);
+        assert_eq!(partial[0].observed.clock_epoch, None);
+        assert_eq!(partial[0].evidence[0].occurred.clock_epoch, None);
         all.extend(partial);
         geometry.observe(
             transform_evidence(5, 0.02, [true, false, false, false, false, false]),
@@ -514,7 +525,7 @@ mod tests {
                     producer_time_ms: Some(receive - 20),
                     receive_time_ms: receive,
                     canonical_frame_time_ms: receive,
-                    clock_epoch: 7,
+                    clock_epoch: Some(7),
                     clock_confidence: 1.0,
                     event_features: vec![LatencyEventFeature {
                         name: "rotation_cw_started".into(),
@@ -530,7 +541,7 @@ mod tests {
                 producer_time_ms: None,
                 receive_time_ms: 260,
                 canonical_frame_time_ms: 260,
-                clock_epoch: 7,
+                clock_epoch: Some(7),
                 clock_confidence: 1.0,
                 event_features: Vec::new(),
             },
@@ -542,6 +553,10 @@ mod tests {
         assert!(latency_transitions
             .iter()
             .any(|transition| { transition.kind == CalibrationTransitionKind::Rejected }));
+        assert!(latency_transitions.iter().all(|transition| {
+            transition.occurred.clock_epoch.as_deref() == Some("imu:7")
+                && transition.observed.clock_epoch.is_none()
+        }));
         all.extend(latency_transitions);
         registry.snapshot(5_000);
         registry.observe(
@@ -550,7 +565,7 @@ mod tests {
                 producer_time_ms: Some(4_990),
                 receive_time_ms: 5_010,
                 canonical_frame_time_ms: 5_010,
-                clock_epoch: 8,
+                clock_epoch: Some(8),
                 clock_confidence: 1.0,
                 event_features: Vec::new(),
             },
@@ -569,8 +584,16 @@ mod tests {
                 && !transition.prior_artifact.checksum.is_empty()
                 && !transition.candidate_artifact.checksum.is_empty()
                 && !transition.accepted_artifact.checksum.is_empty()
-                && !transition.occurred.clock_epoch.is_empty()
-                && !transition.observed.clock_epoch.is_empty()
+                && transition
+                    .occurred
+                    .clock_epoch
+                    .as_ref()
+                    .is_none_or(|epoch| !epoch.is_empty())
+                && transition
+                    .observed
+                    .clock_epoch
+                    .as_ref()
+                    .is_none_or(|epoch| !epoch.is_empty())
         }));
 
         let encoded = serde_json::to_vec(&all).unwrap();

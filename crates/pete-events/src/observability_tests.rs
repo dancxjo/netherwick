@@ -350,10 +350,9 @@ fn estimator_authored_calibration_transition_preserves_evidence_provenance_and_a
         .artifacts
         .iter()
         .all(|artifact| artifact.checksum.is_some()));
-    assert_ne!(
-        canonical.times.occurred.clock_epoch,
-        canonical.times.observed.clock_epoch
-    );
+    assert_eq!(canonical.times.occurred.clock_epoch, None);
+    assert_eq!(canonical.times.observed.clock_epoch, None);
+    assert_eq!(evidence.times.occurred.clock_epoch, None);
     for event in events {
         event.validate().unwrap();
     }

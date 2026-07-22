@@ -600,8 +600,8 @@ impl CalibrationStateMachine {
         self.transition_sequence = self.transition_sequence.saturating_add(1);
         let allowed_before = prior.trust_state == CalibrationTrustState::Trusted;
         let allowed_after = self.estimate.trust_state == CalibrationTrustState::Trusted;
-        let occurred = CalibrationClockedTime::new(evidence.captured_at_ms, "sensor:0");
-        let observed = CalibrationClockedTime::new(now_ms, "motherbrain:0");
+        let occurred = CalibrationClockedTime::new(evidence.captured_at_ms);
+        let observed = CalibrationClockedTime::new(now_ms);
         let evidence_started_at_ms = self
             .estimate
             .evidence_started_at_ms
@@ -616,7 +616,7 @@ impl CalibrationStateMachine {
             format!("{:?}", evidence.source).to_lowercase(),
             serde_json::to_value(evidence).unwrap_or_else(|_| json!({"unavailable": true})),
             CalibrationEvidenceWindow {
-                started_at: CalibrationClockedTime::new(evidence_started_at_ms, "sensor:0"),
+                started_at: CalibrationClockedTime::new(evidence_started_at_ms),
                 ended_at: occurred.clone(),
                 sample_count: self
                     .estimate

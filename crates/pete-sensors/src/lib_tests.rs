@@ -57,6 +57,16 @@ fn imu_auto_selects_only_trustworthy_brainstem_and_none_without_candidates() {
 }
 
 #[test]
+fn imu_without_a_producer_epoch_is_not_promoted_using_a_fabricated_zero_epoch() {
+    let mut arbiter = ImuArbiter::default();
+    let mut sample = trustworthy_imu("brainstem_board_imu", 990, 4);
+    sample.orientation_source = Some("brainstem_board_imu:accel_gyro_roll_pitch".into());
+    assert_eq!(sample.source_epoch(), None);
+    arbiter.observe(sample, 1_000);
+    assert!(arbiter.select(1_000).selected_source.is_none());
+}
+
+#[test]
 fn imu_auto_discovers_uncalibrated_brainstem_then_selects_after_calibration() {
     let mut arbiter = ImuArbiter::default();
     let mut uncalibrated = trustworthy_imu("brainstem_board_imu", 990, 0);
@@ -1347,7 +1357,7 @@ fn now_builder_interpolates_pose_and_imu_to_depth_exposure() {
     assert!((alignment.pose.heading_rad - std::f32::consts::FRAC_PI_4).abs() < 0.001);
     assert!((alignment.imu.orientation[0] - 0.1).abs() < 0.001);
     assert_eq!(alignment.imu.source_id(), Some("brainstem_board_imu"));
-    assert_eq!(alignment.imu.source_epoch(), 7);
+    assert_eq!(alignment.imu.source_epoch(), Some(7));
     assert!(alignment.imu.mounting_calibrated);
     assert!(alignment.imu.gyro_bias_calibrated);
     assert_eq!(alignment.pose_sample_skew_ms, 50);

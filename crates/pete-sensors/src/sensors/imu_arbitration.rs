@@ -83,7 +83,9 @@ impl ImuArbiter {
         let Some(source_id) = sample.source_id().map(ToOwned::to_owned) else {
             return;
         };
-        let source_epoch = sample.source_epoch();
+        let Some(source_epoch) = sample.source_epoch() else {
+            return;
+        };
         let supported_axes = supported_axes(&sample);
         let provenance = sample.orientation_source.clone().unwrap_or_default();
         self.observe_with_metadata(

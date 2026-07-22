@@ -30,7 +30,8 @@ pub struct SensorTimingObservation {
     pub producer_time_ms: Option<u64>,
     pub receive_time_ms: u64,
     pub canonical_frame_time_ms: u64,
-    pub clock_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_epoch: Option<u64>,
     pub clock_confidence: f32,
     pub event_features: Vec<LatencyEventFeature>,
 }
@@ -163,25 +164,27 @@ impl StreamEstimator {
         self.state.enabled = true;
         self.state.last_observed_at_ms = Some(observation.receive_time_ms);
         self.state.last_observation = Some(observation.clone());
-        if self
-            .last_clock_epoch
-            .is_some_and(|epoch| epoch != observation.clock_epoch)
+        if let (Some(prior_epoch), Some(new_epoch)) =
+            (self.last_clock_epoch, observation.clock_epoch)
         {
-            let reason = format!(
-                "producer clock epoch changed from {} to {}",
-                self.last_clock_epoch.unwrap_or_default(),
-                observation.clock_epoch
-            );
-            self.invalidate(observation.receive_time_ms, reason.clone());
-            self.record_transition(
-                &prior,
-                CalibrationTransitionKind::Invalidated,
-                &observation,
-                Some(reason),
-            );
-            prior = self.state.clone();
+            if prior_epoch != new_epoch {
+                let reason = format!(
+                    "producer clock epoch changed from {} to {}",
+                    prior_epoch, new_epoch
+                );
+                self.invalidate(observation.receive_time_ms, reason.clone());
+                self.record_transition(
+                    &prior,
+                    CalibrationTransitionKind::Invalidated,
+                    &observation,
+                    Some(reason),
+                );
+                prior = self.state.clone();
+            }
         }
-        self.last_clock_epoch = Some(observation.clock_epoch);
+        if observation.clock_epoch.is_some() {
+            self.last_clock_epoch = observation.clock_epoch;
+        }
 
         let Some(producer_time_ms) = observation.producer_time_ms else {
             self.state.rejected_count = self.state.rejected_count.saturating_add(1);
@@ -385,14 +388,19 @@ impl StreamEstimator {
         let allowed_before = prior.trust_state == LatencyTrustState::Trusted;
         let allowed_after = self.state.trust_state == LatencyTrustState::Trusted;
         let estimator = format!("latency.{}", self.state.stream);
-        let producer_epoch = format!("{}:{}", self.state.stream, observation.clock_epoch);
-        let occurred = CalibrationClockedTime::new(
-            observation
-                .producer_time_ms
-                .unwrap_or(observation.receive_time_ms),
-            producer_epoch,
+        let producer_time_ms = observation
+            .producer_time_ms
+            .unwrap_or(observation.receive_time_ms);
+        let occurred = observation.clock_epoch.map_or_else(
+            || CalibrationClockedTime::new(producer_time_ms),
+            |epoch| {
+                CalibrationClockedTime::in_epoch(
+                    producer_time_ms,
+                    format!("{}:{epoch}", self.state.stream),
+                )
+            },
         );
-        let observed = CalibrationClockedTime::new(observation.receive_time_ms, "motherbrain:0");
+        let observed = CalibrationClockedTime::new(observation.receive_time_ms);
         self.transitions.push(CalibrationTransition::author(
             estimator,
             self.state.epoch,
@@ -403,10 +411,7 @@ impl StreamEstimator {
             format!("{}.timing", self.state.stream),
             serde_json::to_value(observation).unwrap_or(Value::Null),
             CalibrationEvidenceWindow {
-                started_at: CalibrationClockedTime::new(
-                    self.state.epoch_started_at_ms,
-                    "motherbrain:0",
-                ),
+                started_at: CalibrationClockedTime::new(self.state.epoch_started_at_ms),
                 ended_at: observed.clone(),
                 sample_count: self.state.evidence_count,
             },
@@ -644,7 +649,7 @@ mod tests {
             producer_time_ms: Some(producer_ms),
             receive_time_ms: receive_ms,
             canonical_frame_time_ms: receive_ms,
-            clock_epoch: epoch,
+            clock_epoch: Some(epoch),
             clock_confidence: 0.95,
             event_features: Vec::new(),
         }

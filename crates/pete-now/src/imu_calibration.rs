@@ -490,7 +490,7 @@ impl ImuCalibrationEstimator {
         self.transition_sequence = self.transition_sequence.saturating_add(1);
         let allowed_before = prior.trust_state == ImuCalibrationTrustState::Trusted;
         let allowed_after = self.state.trust_state == ImuCalibrationTrustState::Trusted;
-        let occurred = CalibrationClockedTime::new(captured_at_ms, "imu:0");
+        let occurred = CalibrationClockedTime::new(captured_at_ms);
         self.transitions.push(CalibrationTransition::author(
             "imu.mounting_and_gyro_bias",
             self.state.epoch.id,
@@ -501,7 +501,7 @@ impl ImuCalibrationEstimator {
             "imu.sample",
             evidence_payload,
             CalibrationEvidenceWindow {
-                started_at: CalibrationClockedTime::new(self.state.epoch.started_at_ms, "imu:0"),
+                started_at: CalibrationClockedTime::new(self.state.epoch.started_at_ms),
                 ended_at: occurred.clone(),
                 sample_count: self
                     .state

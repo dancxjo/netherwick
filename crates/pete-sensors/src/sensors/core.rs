@@ -315,7 +315,7 @@ impl NowBuilder {
         for packet in packets {
             match packet {
                 SensePacket::Eye(eye) => {
-                    observe_packet_timing(&mut self.latency_calibration, "camera", None, t_ms, 0, 0.0, Vec::new());
+                    observe_packet_timing(&mut self.latency_calibration, "camera", None, t_ms, None, 0.0, Vec::new());
                     self.last_snapshot.eye = eye;
                     self.last_updates.eye = Some(t_ms);
                 }
@@ -325,7 +325,7 @@ impl NowBuilder {
                         "camera",
                         nonzero_time(frame.captured_at_ms),
                         t_ms,
-                        0,
+                        None,
                         1.0,
                         Vec::new(),
                     );
@@ -339,7 +339,7 @@ impl NowBuilder {
                     });
                 }
                 SensePacket::Ear(ear) => {
-                    observe_packet_timing(&mut self.latency_calibration, "audio", None, t_ms, 0, 0.0, Vec::new());
+                    observe_packet_timing(&mut self.latency_calibration, "audio", None, t_ms, None, 0.0, Vec::new());
                     self.last_snapshot.ear = ear;
                     self.last_updates.ear = Some(t_ms);
                 }
@@ -349,7 +349,7 @@ impl NowBuilder {
                         "audio",
                         nonzero_time(frame.captured_at_ms),
                         t_ms,
-                        0,
+                        None,
                         1.0,
                         Vec::new(),
                     );
@@ -372,7 +372,7 @@ impl NowBuilder {
                         timing_stream,
                         nonzero_time(range.captured_at_ms),
                         t_ms,
-                        0,
+                        None,
                         1.0,
                         Vec::new(),
                     );
@@ -429,7 +429,7 @@ impl NowBuilder {
                         "kinect",
                         nonzero_time(kinect.captured_at_ms),
                         t_ms,
-                        0,
+                        None,
                         1.0,
                         Vec::new(),
                     );
@@ -513,7 +513,7 @@ fn observe_packet_timing(
     stream: &str,
     producer_time_ms: Option<TimeMs>,
     receive_time_ms: TimeMs,
-    clock_epoch: u64,
+    clock_epoch: Option<u64>,
     clock_confidence: f32,
     event_features: Vec<LatencyEventFeature>,
 ) {
@@ -547,7 +547,7 @@ fn observe_body_timing(
         "body",
         Some(producer_time_ms),
         receive_time_ms,
-        0,
+        None,
         1.0,
         Vec::new(),
     );

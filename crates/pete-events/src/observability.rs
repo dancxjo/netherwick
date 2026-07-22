@@ -634,14 +634,14 @@ impl BrainEvent {
                     BrainEventType::Evidence,
                     ProducerIdentity::new(Brain::Motherbrain, transition.estimator.clone()),
                     EventTimes {
-                        occurred: ClockedTime::in_epoch(
-                            evidence.occurred.t_ms,
-                            evidence.occurred.clock_epoch.clone(),
-                        ),
-                        observed: ClockedTime::in_epoch(
-                            evidence.observed.t_ms,
-                            evidence.observed.clock_epoch.clone(),
-                        ),
+                        occurred: ClockedTime {
+                            t_ms: evidence.occurred.t_ms,
+                            clock_epoch: evidence.occurred.clock_epoch.clone(),
+                        },
+                        observed: ClockedTime {
+                            t_ms: evidence.observed.t_ms,
+                            clock_epoch: evidence.observed.clock_epoch.clone(),
+                        },
                         valid_from: None,
                         expires_at: None,
                     },
@@ -661,18 +661,18 @@ impl BrainEvent {
             BrainEventType::CalibrationTransition,
             ProducerIdentity::new(Brain::Motherbrain, transition.estimator.clone()),
             EventTimes {
-                occurred: ClockedTime::in_epoch(
-                    transition.occurred.t_ms,
-                    transition.occurred.clock_epoch.clone(),
-                ),
-                observed: ClockedTime::in_epoch(
-                    transition.observed.t_ms,
-                    transition.observed.clock_epoch.clone(),
-                ),
-                valid_from: Some(ClockedTime::in_epoch(
-                    transition.observed.t_ms,
-                    transition.observed.clock_epoch.clone(),
-                )),
+                occurred: ClockedTime {
+                    t_ms: transition.occurred.t_ms,
+                    clock_epoch: transition.occurred.clock_epoch.clone(),
+                },
+                observed: ClockedTime {
+                    t_ms: transition.observed.t_ms,
+                    clock_epoch: transition.observed.clock_epoch.clone(),
+                },
+                valid_from: Some(ClockedTime {
+                    t_ms: transition.observed.t_ms,
+                    clock_epoch: transition.observed.clock_epoch.clone(),
+                }),
                 expires_at: None,
             },
         );

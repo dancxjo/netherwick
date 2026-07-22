@@ -526,7 +526,7 @@ impl LocomotionCalibrationEstimator {
         self.transition_sequence = self.transition_sequence.saturating_add(1);
         let allowed_before = prior.trust_state == LocomotionCalibrationTrustState::Trusted;
         let allowed_after = self.state.trust_state == LocomotionCalibrationTrustState::Trusted;
-        let occurred = CalibrationClockedTime::new(captured_at_ms, "motherbrain:0");
+        let occurred = CalibrationClockedTime::new(captured_at_ms);
         let is_rotation = evidence_payload.get("wheel_odometry_angle_rad").is_some();
         self.transitions.push(CalibrationTransition::author(
             estimator,
@@ -538,7 +538,7 @@ impl LocomotionCalibrationEstimator {
             if is_rotation { "rotation_episode" } else { "straight_episode" },
             evidence_payload,
             CalibrationEvidenceWindow {
-                started_at: CalibrationClockedTime::new(self.state.epoch_started_at_ms, "motherbrain:0"),
+                started_at: CalibrationClockedTime::new(self.state.epoch_started_at_ms),
                 ended_at: occurred.clone(),
                 sample_count: self
                     .state

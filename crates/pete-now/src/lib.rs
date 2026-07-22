@@ -779,13 +779,12 @@ impl ImuSense {
             .filter(|source| !source.is_empty())
     }
 
-    pub fn source_epoch(&self) -> u64 {
+    pub fn source_epoch(&self) -> Option<u64> {
         self.orientation_source
             .as_deref()
             .and_then(|source| source.split_once(':').map(|(identity, _)| identity))
             .and_then(|identity| identity.split_once('@').map(|(_, epoch)| epoch))
             .and_then(|epoch| epoch.parse().ok())
-            .unwrap_or(0)
     }
 }
 
