@@ -22,6 +22,8 @@ use uuid::Uuid;
 
 mod adversarial;
 pub use adversarial::*;
+mod certification;
+pub use certification::*;
 
 pub const CAPTURE_SCHEMA_VERSION: u32 = 2;
 pub const CAPTURE_QUEUE_CAPACITY: usize = 4;
