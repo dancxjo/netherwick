@@ -3,6 +3,25 @@ const DEFAULT_OBSERVATORY_HISTORY_CAPACITY: usize = 16_384;
 const DEFAULT_OBSERVATORY_BROADCAST_CAPACITY: usize = 2_048;
 const DEFAULT_OBSERVATORY_QUERY_LIMIT: usize = 500;
 const MAX_OBSERVATORY_QUERY_LIMIT: usize = 2_000;
+const OBSERVATORY_NOW_HISTORY_CAPACITY: usize = 2_048;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ObservatoryNowSnapshot {
+    pub snapshot_id: String,
+    pub now: pete_now::Now,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ObservatoryNowSelection {
+    pub selected: ObservatoryNowSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<ObservatoryNowSnapshot>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct ObservatoryNowSeek {
+    at_or_before_ms: u64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrainEventHubConfig {
@@ -153,7 +172,12 @@ pub struct BrainEventQuery {
     pub observed_from_ms: Option<u64>,
     pub observed_to_ms: Option<u64>,
     pub event_type: Option<BrainEventType>,
+    pub kind: Option<String>,
+    pub brain: Option<Brain>,
     pub component: Option<String>,
+    pub modality: Option<String>,
+    pub model: Option<String>,
+    pub calibration_epoch: Option<String>,
     pub snapshot: Option<String>,
     pub entity: Option<String>,
     pub goal: Option<String>,
@@ -176,7 +200,11 @@ impl BrainEventQuery {
             )));
         }
         for (name, value) in [
+            ("kind", self.kind.as_deref()),
             ("component", self.component.as_deref()),
+            ("modality", self.modality.as_deref()),
+            ("model", self.model.as_deref()),
+            ("calibration_epoch", self.calibration_epoch.as_deref()),
             ("snapshot", self.snapshot.as_deref()),
             ("entity", self.entity.as_deref()),
             ("goal", self.goal.as_deref()),
@@ -203,10 +231,24 @@ impl BrainEventQuery {
         ) && self
             .event_type
             .is_none_or(|event_type| event.event_type == event_type)
+            && self.kind.as_ref().is_none_or(|kind| event.kind == *kind)
+            && self
+                .brain
+                .is_none_or(|brain| event.producer.brain == brain)
             && self
                 .component
                 .as_ref()
                 .is_none_or(|component| event.producer.component == *component)
+            && self.modality.as_ref().is_none_or(|modality| {
+                matches!(&event.payload, BrainEventPayload::Inline { data, .. }
+                    if data.get("modality").and_then(serde_json::Value::as_str) == Some(modality))
+            })
+            && self.model.as_ref().is_none_or(|model| {
+                event.artifacts.iter().any(|artifact| {
+                    artifact.kind == ArtifactKind::Model && artifact.id == *model
+                })
+            })
+            && contains_filter(&event.calibration_epochs, self.calibration_epoch.as_ref())
             && self
                 .snapshot
                 .as_ref()
@@ -696,6 +738,35 @@ async fn get_observatory_health(
     State(state): State<LiveViewState>,
 ) -> Json<BrainEventTransportHealth> {
     Json(state.observatory().health())
+}
+
+async fn get_observatory_now_snapshot(
+    State(state): State<LiveViewState>,
+    AxumPath(snapshot_id): AxumPath<String>,
+) -> Result<Json<ObservatoryNowSelection>, ObservatoryHttpError> {
+    state
+        .observatory_now_snapshot(&snapshot_id)
+        .map(Json)
+        .ok_or_else(|| {
+            ObservatoryHttpError::unavailable(format!(
+                "Now snapshot {snapshot_id} is not retained by this source"
+            ))
+        })
+}
+
+async fn get_observatory_now_at_or_before(
+    State(state): State<LiveViewState>,
+    Query(seek): Query<ObservatoryNowSeek>,
+) -> Result<Json<ObservatoryNowSelection>, ObservatoryHttpError> {
+    state
+        .observatory_now_at_or_before(seek.at_or_before_ms)
+        .map(Json)
+        .ok_or_else(|| {
+            ObservatoryHttpError::unavailable(format!(
+                "no retained Now snapshot exists at or before {}",
+                seek.at_or_before_ms
+            ))
+        })
 }
 
 async fn get_observatory_events_ws(

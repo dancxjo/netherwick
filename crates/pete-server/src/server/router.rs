@@ -21,6 +21,7 @@ pub fn live_view_router(state: LiveViewState) -> Router {
             post(post_promote_behavior_node),
         )
         .route("/view/cognitive", get(cognitive_view_page))
+        .route("/view/observatory", get(observatory_page))
         .route("/api/cognitive/features", get(get_cognitive_features))
         .route("/api/cognitive/clusters", get(get_cognitive_clusters))
         .route("/api/cognitive/bindings", get(get_cognitive_bindings))
@@ -49,6 +50,14 @@ pub fn live_view_router(state: LiveViewState) -> Router {
         .route("/memory/entities", get(get_entity_memory))
         .route("/api/observatory/history", get(get_observatory_history))
         .route("/api/observatory/health", get(get_observatory_health))
+        .route(
+            "/api/observatory/snapshots/{id}",
+            get(get_observatory_now_snapshot),
+        )
+        .route(
+            "/api/observatory/snapshot",
+            get(get_observatory_now_at_or_before),
+        )
         .route("/api/observatory/events/ws", get(get_observatory_events_ws))
         .nest_service(
             "/static",

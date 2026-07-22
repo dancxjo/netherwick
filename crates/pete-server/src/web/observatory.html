@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Brain Observatory</title>
+  <style>
+    :root{color-scheme:dark;--bg:#071018;--panel:#0d1822;--line:#263746;--text:#e8f0f5;--muted:#9cb0bf;--cyan:#51d2e6;--amber:#ffc857;--red:#ff6b6b;--green:#67d391;--row:42px}
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:13px/1.35 ui-monospace,SFMono-Regular,Consolas,monospace;height:100vh;overflow:hidden}
+    button,input,select{font:inherit;color:inherit;background:#142431;border:1px solid #3a5265;border-radius:4px;padding:5px 7px} button{cursor:pointer} button:hover,button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--cyan);outline-offset:1px}
+    header{height:52px;display:flex;align-items:center;gap:12px;padding:7px 12px;border-bottom:1px solid var(--line);background:#09151e} h1{font:700 17px/1 system-ui;margin:0}.status{display:flex;gap:6px;align-items:center}.pill{border:1px solid var(--line);border-radius:999px;padding:3px 8px;color:var(--muted)}.pill.good{color:var(--green)}.pill.bad{color:var(--red)}
+    main{height:calc(100vh - 116px);display:grid;grid-template-columns:minmax(330px,32vw) 1fr minmax(380px,36vw)}.panel{min-width:0;border-right:1px solid var(--line);display:flex;flex-direction:column}.panel:last-child{border:0}.panel-head{padding:8px 10px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between}.panel h2{font:650 13px system-ui;margin:0;letter-spacing:.04em}.filters{padding:7px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;border-bottom:1px solid var(--line)}.filters input,.filters select{min-width:0;width:100%}
+    .viewport{position:relative;overflow:auto;flex:1;min-height:0}.spacer{position:relative;width:100%}.event{position:absolute;left:0;right:0;height:var(--row);padding:5px 8px;border-bottom:1px solid #172835;display:grid;grid-template-columns:72px 1fr 60px;gap:6px;align-items:center}.event:hover,.event[aria-selected=true]{background:#163044}.event.critical{border-left:4px solid var(--amber)}.event.gap{border-left:4px solid var(--red);background:#2a1519}.event small,.muted{color:var(--muted)}.latency{color:var(--cyan);text-align:right}.event-kind{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.empty{padding:24px;color:var(--muted);text-align:center}
+    #center{padding:12px;overflow:auto}.selection{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.metric{background:var(--panel);border:1px solid var(--line);padding:10px}.metric strong{display:block;font-size:16px;color:var(--cyan)}.notice{margin-top:10px;padding:9px;border-left:3px solid var(--amber);background:#251f12}.legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:16px;color:var(--muted)}
+    .tree-row{position:absolute;left:0;right:0;height:30px;display:grid;grid-template-columns:minmax(150px,1fr) minmax(110px,1fr) repeat(4,minmax(70px,.7fr));gap:7px;padding:5px 8px;border-bottom:1px solid #172835;align-items:center}.tree-row.changed{background:#202b18}.tree-row.stale{color:#ffc857}.tree-row.untrusted{color:#ff8585}.path,.value{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pin{padding:1px 4px}.tree-head{display:grid;grid-template-columns:minmax(150px,1fr) minmax(110px,1fr) repeat(4,minmax(70px,.7fr));gap:7px;padding:6px 8px;color:var(--muted);border-bottom:1px solid var(--line)}details{border-top:1px solid var(--line);padding:7px}pre{white-space:pre-wrap;word-break:break-word;color:#cce2ef;max-height:35vh;overflow:auto}
+    footer{height:64px;border-top:1px solid var(--line);background:#09151e;padding:7px 12px;display:grid;grid-template-columns:auto auto 1fr auto;gap:10px;align-items:center}#scrubber{width:100%}.kbd{color:var(--muted)}
+    @media(max-width:1050px){main{grid-template-columns:42% 58%}#center{display:none}}@media(max-width:720px){header{height:auto;min-height:52px;flex-wrap:wrap}main{height:calc(100vh - 150px);grid-template-columns:1fr}.panel:first-child{display:none}.filters{grid-template-columns:repeat(2,1fr)}footer{height:98px;grid-template-columns:auto 1fr}.kbd{display:none}}
+  </style>
+</head>
+<body>
+<header>
+  <h1>Brain Observatory</h1>
+  <div class="status"><span id="connection" class="pill">connecting</span><span id="mode" class="pill good">LIVE · FOLLOW</span><span id="loss" class="pill">no reported gaps</span><span id="pending" class="pill" hidden></span></div>
+  <span class="muted">read-only · no control authority</span>
+</header>
+<main>
+  <section class="panel" aria-labelledby="timeline-title">
+    <div class="panel-head"><h2 id="timeline-title">Event timeline</h2><span id="event-count" class="muted">0 events</span></div>
+    <div class="filters" aria-label="Timeline filters">
+      <input id="search" aria-label="Search event ID, kind, goal, or entity" placeholder="search">
+      <select id="event-type" aria-label="Event class"><option value="">all classes</option><option>evidence</option><option>interpretation</option><option>belief_update</option><option>proposal</option><option>gate_decision</option><option>command</option><option>outcome</option><option>transport_gap</option></select>
+      <select id="trust" aria-label="Trust"><option value="">all trust</option><option>trusted</option><option>conditional</option><option>untrusted</option><option>rejected</option><option>unknown</option></select>
+      <input id="component" aria-label="Component or brain" placeholder="brain/component">
+      <input id="modality" aria-label="Modality" placeholder="modality">
+      <input id="disposition" aria-label="Disposition" placeholder="disposition">
+      <input id="goal" aria-label="Goal" placeholder="goal">
+      <input id="entity" aria-label="Entity" placeholder="entity">
+      <input id="model" aria-label="Model" placeholder="model">
+      <input id="calibration" aria-label="Calibration epoch" placeholder="cal epoch">
+    </div>
+    <div id="timeline" class="viewport" role="listbox" aria-label="Event timeline" tabindex="0"><div id="timeline-spacer" class="spacer"></div></div>
+  </section>
+  <section id="center" class="panel" aria-labelledby="event-title">
+    <div class="panel-head"><h2 id="event-title">Selected event</h2></div>
+    <div class="selection">
+      <div class="metric">Occurred<strong id="occurred">—</strong><span id="occurred-epoch" class="muted"></span></div>
+      <div class="metric">Observed<strong id="observed">—</strong><span id="observed-epoch" class="muted"></span></div>
+      <div class="metric">Latency<strong id="latency">—</strong><span class="muted">observed − occurred</span></div>
+    </div>
+    <div id="event-summary" class="notice">Select an event to inspect its synchronized snapshot.</div>
+    <div class="legend"><span>▌ amber: safety/authority transition</span><span>▌ red: recorded transport gap</span><span>green row: changed since previous tick</span></div>
+  </section>
+  <section class="panel" aria-labelledby="now-title">
+    <div class="panel-head"><h2 id="now-title">Canonical Now</h2><span id="snapshot-id" class="muted">no snapshot</span></div>
+    <div class="tree-head" aria-hidden="true"><span>field</span><span>value</span><span>source</span><span>age</span><span>confidence / uncertainty</span><span>freshness / trust / epoch</span></div>
+    <div id="tree" class="viewport" role="tree" aria-label="Canonical Now field inspector" tabindex="0"><div id="tree-spacer" class="spacer"></div></div>
+    <details><summary>Raw JSON</summary><pre id="raw">No snapshot selected.</pre></details>
+  </section>
+</main>
+<footer>
+  <button id="pause" aria-label="Pause live updates" aria-keyshortcuts="Space">Pause</button>
+  <button id="follow" aria-label="Follow live" aria-keyshortcuts="End">Follow live</button>
+  <label for="scrubber">Time scrubber</label><input id="scrubber" type="range" min="0" max="0" value="0" step="1" aria-label="Time scrubber">
+  <span class="kbd">↑/↓ select · Space pause · End follow</span>
+</footer>
+<script>
+(() => {
+  'use strict';
+  const MAX_BROWSER_EVENTS = 20000;
+  const TIMELINE_ROW_HEIGHT = 42;
+  const TREE_ROW_HEIGHT = 30;
+  const $ = id => document.getElementById(id);
+  const state = {events:[], filtered:[], byId:new Map(), nowCache:new Map(), selectedId:null, paused:false, ingesting:true, frozenSequence:null, pins:new Set(JSON.parse(sessionStorage.getItem('observatory-pins')||'[]')), treeRows:[], previousNow:null, gaps:0};
+  const filterIds = ['search','event-type','trust','component','modality','disposition','goal','entity','model','calibration'];
+  const eventOf = record => record.record === 'event' ? record.envelope : record.gap ? {sequence:record.gap.to_sequence,event:record.gap.event} : null;
+  const inline = e => e.payload?.storage === 'inline' ? e.payload.data : {};
+  const text = value => value == null ? '—' : typeof value === 'object' ? JSON.stringify(value) : String(value);
+  const fmtTime = ms => Number.isFinite(ms) ? new Date(ms).toISOString().slice(11,23) : '—';
+  const latency = e => Math.max(0,(e.times?.observed?.t_ms||0)-(e.times?.occurred?.t_ms||0));
+  const critical = e => ['safety_transition','authority_transition','gate','command','outcome'].includes(e.authority) || ['gate_decision','command','outcome','calibration_transition'].includes(e.event_type);
+
+  function ingest(record){
+    const envelope=eventOf(record); if(!envelope) return;
+    const id=envelope.event.event_id;
+    if(state.byId.has(id)) return;
+    state.byId.set(id,envelope); state.events.push(envelope);
+    state.events.sort((a,b)=>a.sequence-b.sequence);
+    while(state.events.length>MAX_BROWSER_EVENTS){const gone=state.events.shift();state.byId.delete(gone.event.event_id)}
+    if(envelope.event.event_type==='transport_gap'){state.gaps++;$('loss').textContent=`${state.gaps} reported gap${state.gaps===1?'':'s'}`;$('loss').className='pill bad'}
+    if(state.paused){$('pending').hidden=false;$('pending').textContent=`${state.events.filter(e=>e.sequence>state.frozenSequence).length} new`}
+    else {applyFilters(); selectNewest();}
+  }
+
+  function matches(envelope){
+    const e=envelope.event,p=inline(e),q=$('search').value.toLowerCase(),component=$('component').value.toLowerCase();
+    const hay=JSON.stringify([e.event_id,e.kind,e.references?.goal_ids,e.references?.entity_ids]).toLowerCase();
+    const models=(e.artifacts||[]).filter(a=>a.kind==='model').map(a=>a.id);
+    return (!q||hay.includes(q)) && (!$('event-type').value||e.event_type===$('event-type').value) && (!$('trust').value||e.quality?.trust===$('trust').value)
+      && (!component||`${e.producer?.brain}/${e.producer?.component}`.toLowerCase().includes(component)) && (!$('modality').value||String(p.modality||'').toLowerCase().includes($('modality').value.toLowerCase()))
+      && (!$('disposition').value||e.disposition===$('disposition').value) && (!$('goal').value||(e.references?.goal_ids||[]).some(x=>x.includes($('goal').value)))
+      && (!$('entity').value||(e.references?.entity_ids||[]).some(x=>x.includes($('entity').value))) && (!$('model').value||models.some(x=>x.includes($('model').value)))
+      && (!$('calibration').value||(e.calibration_epochs||[]).some(x=>x.includes($('calibration').value)));
+  }
+  function applyFilters(){
+    const visible=state.paused?state.events.filter(e=>e.sequence<=state.frozenSequence):state.events;
+    state.filtered=visible.filter(matches); $('event-count').textContent=`${state.filtered.length} events`; syncScrubber(); renderVirtualTimeline();
+  }
+  function renderVirtualTimeline(){
+    const view=$('timeline'),spacer=$('timeline-spacer'),start=Math.max(0,Math.floor(view.scrollTop/TIMELINE_ROW_HEIGHT)-5),count=Math.ceil(view.clientHeight/TIMELINE_ROW_HEIGHT)+10,end=Math.min(state.filtered.length,start+count);
+    spacer.style.height=`${state.filtered.length*TIMELINE_ROW_HEIGHT}px`; spacer.replaceChildren();
+    for(let i=start;i<end;i++){const env=state.filtered[i],e=env.event,row=document.createElement('div');row.className=`event ${critical(e)?'critical':''} ${e.event_type==='transport_gap'?'gap':''}`;row.style.top=`${i*TIMELINE_ROW_HEIGHT}px`;row.role='option';row.tabIndex=-1;row.ariaSelected=String(e.event_id===state.selectedId);row.dataset.id=e.event_id;
+      row.innerHTML=`<small>${fmtTime(e.times?.occurred?.t_ms)}</small><span class="event-kind"><b>${escapeHtml(e.event_type)}</b> · ${escapeHtml(e.kind)}<br><small>${escapeHtml(e.producer?.brain||'?')} / ${escapeHtml(e.producer?.component||'?')}</small></span><span class="latency">+${latency(e)} ms</span>`;row.onclick=()=>selectEvent(e.event_id);spacer.append(row)}
+  }
+  function escapeHtml(value){const span=document.createElement('span');span.textContent=String(value);return span.innerHTML}
+  function selectNewest(){if(state.filtered.length&&!state.selectedId)selectEvent(state.filtered.at(-1).event.event_id)}
+  async function selectEvent(id){
+    const env=state.byId.get(id);if(!env)return;state.selectedId=id;const e=env.event;$('occurred').textContent=fmtTime(e.times?.occurred?.t_ms);$('observed').textContent=fmtTime(e.times?.observed?.t_ms);$('latency').textContent=`${latency(e)} ms`;$('occurred-epoch').textContent=e.times?.occurred?.clock_epoch||'clock epoch unavailable';$('observed-epoch').textContent=e.times?.observed?.clock_epoch||'clock epoch unavailable';
+    $('event-summary').textContent=`${e.event_id} · ${e.quality?.trust||'unknown'} · ${e.disposition||'unknown'} · evidence ${(e.links?.parents||[]).length+(e.links?.supports||[]).length}`;renderVirtualTimeline();
+    const sid=e.references?.snapshot_id;await loadSnapshot(sid,e.times?.occurred?.t_ms);
+    const idx=state.filtered.findIndex(x=>x.event.event_id===id);if(idx>=0)$('scrubber').value=idx;
+  }
+  async function loadSnapshot(id,tMs){
+    const key=id||`at:${tMs}`;$('snapshot-id').textContent=id||`as of ${fmtTime(tMs)}`;let entry=state.nowCache.get(key);
+    if(!entry){try{const url=id?`/api/observatory/snapshots/${encodeURIComponent(id)}`:`/api/observatory/snapshot?at_or_before_ms=${encodeURIComponent(tMs)}`,res=await fetch(url,{cache:'no-store'});if(!res.ok)throw new Error(await res.text());entry=await res.json();state.nowCache.set(key,entry)}catch(err){state.treeRows=[];renderVirtualTree();$('raw').textContent=`Snapshot unavailable from this source: ${err.message}`;return}}
+    const current=entry.selected.now,previous=entry.previous?.now||null;$('snapshot-id').textContent=entry.selected.snapshot_id+(id?'':' · nearest prior');state.previousNow=previous;state.treeRows=flattenNow(current,previous);$('raw').textContent=JSON.stringify(current,null,2);renderVirtualTree();
+  }
+  function flattenNow(root,previous){const rows=[];walk(root,previous,'now',{},rows);rows.sort((a,b)=>(state.pins.has(a.path)?-1:0)-(state.pins.has(b.path)?-1:0)||a.path.localeCompare(b.path));return rows}
+  function walk(value,prev,path,inherited,rows){
+    if(value&&typeof value==='object'&&!Array.isArray(value)){const meta=value.meta&&typeof value.meta==='object'?value.meta:inherited;for(const [key,child] of Object.entries(value)){if(key==='meta')continue;walk(child,prev?.[key],`${path}.${key}`,meta,rows)}return}
+    if(Array.isArray(value)){value.forEach((child,i)=>walk(child,prev?.[i],`${path}[${i}]`,inherited,rows));if(!value.length)rows.push(fieldRow(path,'[]',prev,inherited));return} rows.push(fieldRow(path,value,prev,inherited));
+  }
+  function fieldRow(path,value,prev,meta){const evidence=meta.provenance||meta.evidence||[];return {path,value:text(value),changed:JSON.stringify(value)!==JSON.stringify(prev),source:meta.source_kind||evidence[0]?.source||'not recorded',age:meta.observed_at_ms?`${Math.max(0,(state.byId.get(state.selectedId)?.event.times?.occurred?.t_ms||meta.observed_at_ms)-meta.observed_at_ms)} ms`:'—',quality:[meta.confidence==null?'conf —':`conf ${Number(meta.confidence).toFixed(2)}`,meta.uncertainty==null?'unc —':`unc ${text(meta.uncertainty)}`].join(' · '),status:[meta.freshness?.state||meta.freshness||'freshness —',meta.trust||'trust —',meta.calibration_epoch||'epoch —'].join(' · '),evidence}}
+  function renderVirtualTree(){
+    const view=$('tree'),spacer=$('tree-spacer'),start=Math.max(0,Math.floor(view.scrollTop/TREE_ROW_HEIGHT)-6),count=Math.ceil(view.clientHeight/TREE_ROW_HEIGHT)+12,end=Math.min(state.treeRows.length,start+count);spacer.style.height=`${state.treeRows.length*TREE_ROW_HEIGHT}px`;spacer.replaceChildren();
+    if(!state.treeRows.length){spacer.innerHTML='<div class="empty">No retained canonical snapshot for this event.</div>';return}
+    for(let i=start;i<end;i++){const f=state.treeRows[i],row=document.createElement('div');row.className=`tree-row ${f.changed?'changed':''} ${f.status.includes('stale')?'stale':''} ${f.status.includes('untrusted')?'untrusted':''}`;row.style.top=`${i*TREE_ROW_HEIGHT}px`;row.role='treeitem';row.title=f.evidence.length?`Evidence: ${f.evidence.map(x=>x.id||x.source).join(', ')}`:'No field evidence recorded';row.innerHTML=`<span class="path"><button class="pin" aria-label="Pin ${escapeHtml(f.path)}">${state.pins.has(f.path)?'★':'☆'}</button> ${escapeHtml(f.path.replace('now.',''))}</span><span class="value">${escapeHtml(f.value)}</span><span>${escapeHtml(f.source)}</span><span>${escapeHtml(f.age)}</span><span>${escapeHtml(f.quality)}</span><span>${escapeHtml(f.status)}</span>`;row.querySelector('button').onclick=()=>togglePin(f.path);spacer.append(row)}
+  }
+  function togglePin(path){state.pins.has(path)?state.pins.delete(path):state.pins.add(path);sessionStorage.setItem('observatory-pins',JSON.stringify([...state.pins]));state.treeRows.sort((a,b)=>(state.pins.has(a.path)?-1:0)-(state.pins.has(b.path)?-1:0)||a.path.localeCompare(b.path));renderVirtualTree()}
+  function syncScrubber(){$('scrubber').max=Math.max(0,state.filtered.length-1);if(state.selectedId){const i=state.filtered.findIndex(x=>x.event.event_id===state.selectedId);if(i>=0)$('scrubber').value=i}}
+  function togglePause(forceFollow=false){state.paused=forceFollow?false:!state.paused;state.frozenSequence=state.paused?(state.events.at(-1)?.sequence||0):null;$('pause').textContent=state.paused?'Resume':'Pause';$('pause').setAttribute('aria-label',state.paused?'Resume live updates':'Pause live updates');$('mode').textContent=state.paused?'LIVE · INSPECTING':'LIVE · FOLLOW';$('pending').hidden=!state.paused;applyFilters();if(!state.paused){$('pending').hidden=true;selectEvent(state.filtered.at(-1)?.event.event_id)}}
+  async function connect(){
+    try{const res=await fetch('/api/observatory/history?limit=2000',{cache:'no-store'}),data=await res.json();for(const record of data.records||[])ingest(record);const cursor=data.next_cursor||0,scheme=location.protocol==='https:'?'wss':'ws',ws=new WebSocket(`${scheme}://${location.host}/api/observatory/events/ws?after_sequence=${cursor}&limit=2000`);ws.onopen=()=>{$('connection').textContent='connected';$('connection').className='pill good'};ws.onmessage=message=>ingest(JSON.parse(message.data));ws.onclose=()=>{$('connection').textContent='disconnected · retrying';$('connection').className='pill bad';setTimeout(connect,1500)}}catch(err){$('connection').textContent='history unavailable';$('connection').className='pill bad';setTimeout(connect,2000)}
+  }
+  filterIds.forEach(id=>$(id).addEventListener('input',applyFilters));$('timeline').addEventListener('scroll',renderVirtualTimeline,{passive:true});$('tree').addEventListener('scroll',renderVirtualTree,{passive:true});$('pause').onclick=()=>togglePause();$('follow').onclick=()=>togglePause(true);$('scrubber').oninput=e=>selectEvent(state.filtered[Number(e.target.value)]?.event.event_id);
+  document.addEventListener('keydown',e=>{if(e.target.matches('input,select'))return;if(e.code==='Space'){e.preventDefault();togglePause()}else if(e.key==='End'){togglePause(true)}else if(['ArrowUp','ArrowDown'].includes(e.key)){e.preventDefault();const i=Math.max(0,state.filtered.findIndex(x=>x.event.event_id===state.selectedId)),n=Math.max(0,Math.min(state.filtered.length-1,i+(e.key==='ArrowDown'?1:-1)));selectEvent(state.filtered[n]?.event.event_id)}});
+  connect();
+})();
+</script>
+</body>
+</html>

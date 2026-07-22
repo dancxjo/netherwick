@@ -19,6 +19,8 @@ pub struct LiveViewState {
     pub retina_fps: f32,
     retina_state: Arc<Mutex<RetinaState>>,
     observatory: BrainEventHub,
+    observatory_now: Arc<Mutex<VecDeque<ObservatoryNowSnapshot>>>,
+    observatory_snapshot_sequence: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -54,6 +56,8 @@ impl Default for LiveViewState {
             retina_fps: 5.0,
             retina_state: Arc::new(Mutex::new(RetinaState::default())),
             observatory: BrainEventHub::new(BrainEventHubConfig::default()),
+            observatory_now: Arc::new(Mutex::new(VecDeque::new())),
+            observatory_snapshot_sequence: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -157,6 +161,11 @@ impl LiveViewState {
 
     pub fn update_with_runtime_map(&self, snapshot: WorldSnapshot, runtime_map: Option<&LocalMap>) {
         let now = snapshot.to_now(snapshot.body.last_update_ms);
+        let snapshot_sequence = self
+            .observatory_snapshot_sequence
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let snapshot_id = format!("live-now-{}-{snapshot_sequence}", now.t_ms);
         let mut map = self.map.lock().expect("live map mutex poisoned");
         if let Some(runtime_map) = runtime_map {
             *map = runtime_map.clone();
@@ -199,6 +208,56 @@ impl LiveViewState {
             .latest
             .lock()
             .expect("live view snapshot mutex poisoned") = Some(snapshot);
+        {
+            let mut history = self
+                .observatory_now
+                .lock()
+                .expect("observatory Now history mutex poisoned");
+            if history.back().is_none_or(|entry| entry.snapshot_id != snapshot_id) {
+                if history.len() == OBSERVATORY_NOW_HISTORY_CAPACITY {
+                    history.pop_front();
+                }
+                history.push_back(ObservatoryNowSnapshot {
+                    snapshot_id: snapshot_id.clone(),
+                    now: now.clone(),
+                });
+            }
+        }
+        let _ = self.publish_brain_event(BrainEvent::from_now_snapshot(
+            snapshot_id,
+            &now,
+            wall_now_ms(),
+            None,
+        ));
+    }
+
+    fn observatory_now_snapshot(
+        &self,
+        snapshot_id: &str,
+    ) -> Option<ObservatoryNowSelection> {
+        let history = self
+            .observatory_now
+            .lock()
+            .expect("observatory Now history mutex poisoned");
+        let index = history
+            .iter()
+            .rposition(|entry| entry.snapshot_id == snapshot_id)?;
+        Some(ObservatoryNowSelection {
+            selected: history[index].clone(),
+            previous: index.checked_sub(1).map(|previous| history[previous].clone()),
+        })
+    }
+
+    fn observatory_now_at_or_before(&self, t_ms: u64) -> Option<ObservatoryNowSelection> {
+        let history = self
+            .observatory_now
+            .lock()
+            .expect("observatory Now history mutex poisoned");
+        let index = history.iter().rposition(|entry| entry.now.t_ms <= t_ms)?;
+        Some(ObservatoryNowSelection {
+            selected: history[index].clone(),
+            previous: index.checked_sub(1).map(|previous| history[previous].clone()),
+        })
     }
 
     pub fn entity_memory_report(&self) -> EntityMemoryReport {

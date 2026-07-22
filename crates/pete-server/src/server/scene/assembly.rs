@@ -210,6 +210,10 @@ async fn cognitive_view_page() -> Html<&'static str> {
     Html(COGNITIVE_VIEW_PAGE)
 }
 
+async fn observatory_page() -> Html<&'static str> {
+    Html(OBSERVATORY_PAGE)
+}
+
 async fn live_view_3d_page() -> Html<&'static str> {
     Html(LIVE_VIEW_3D_PAGE)
 }

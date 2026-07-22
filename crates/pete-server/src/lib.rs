@@ -23,8 +23,9 @@ use pete_behaviors::{BehaviorNodeState, BehaviorNodeUpdate, BehaviorRegime};
 use pete_cockpit::{MotionCommand, MotorCommand};
 use pete_core::TimeMs;
 use pete_events::{
-    AuthoritySignificance, Brain, BrainEvent, BrainEventId, BrainEventPayload, BrainEventType,
-    EventDisposition, EventTimes, LossPolicy, PayloadReference, ProducerIdentity, TrustState,
+    ArtifactKind, AuthoritySignificance, Brain, BrainEvent, BrainEventId, BrainEventPayload,
+    BrainEventType, EventDisposition, EventTimes, LossPolicy, PayloadReference, ProducerIdentity,
+    TrustState,
 };
 use pete_experience::EmbodiedContext;
 use pete_map::{
@@ -68,6 +69,7 @@ const REIGN_PAGE: &str = include_str!("web/reign.html");
 const COGNITIVE_VIEW_PAGE: &str = include_str!("web/cognitive.html");
 const LIVE_VIEW_PAGE: &str = include_str!("web/live.html");
 const LIVE_VIEW_3D_PAGE: &str = include_str!("web/live_3d.html");
+const OBSERVATORY_PAGE: &str = include_str!("web/observatory.html");
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]
