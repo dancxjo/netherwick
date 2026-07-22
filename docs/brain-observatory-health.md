@@ -23,11 +23,17 @@ Threshold history is derived from recorded event payloads. Queue pressure,
 thermal pressure, stale heartbeats, low disk space, and tick-budget overruns are
 linked back to their source event so an operator can move the whole Observatory
 to that point in time. Current transport health additionally exposes bounded
-ingress/history loss and lag. Browser reconnect count is labeled separately as
-page-session evidence because it is not part of the replay capture.
+ingress/history behavior and lag. Critical ingress rejection, telemetry drops,
+intentional replacement, expected bounded-history expiry, viewer-local
+broadcast lag, and browser reconnects are shown separately; none is presented
+as a single generic loss counter. Browser reconnect count is page-session
+evidence because it is not part of the replay capture.
 
 The endpoint is `GET /api/observatory/component-health?at_ms=<observed-ms>`.
 It returns only component events observed at or before the requested time and
-uses the nearest retained `Now` snapshot for snapshot-backed provider health.
+chooses the maximum `(clock_epoch, observed time, delivery order)` state per
+component, so a late older observation cannot overwrite a newer historical
+state. It uses the nearest retained `Now` snapshot for snapshot-backed provider
+health.
 If the snapshot is no longer retained, event-backed rows remain available and
 snapshot-backed fields remain absent.

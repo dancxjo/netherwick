@@ -8,6 +8,9 @@ typed gaps, schema identities, and an overall SHA-256 checksum. Event inline
 payloads retain the canonical size limit. Export pagination continues through
 the bounded live history; a 50,000-event safety cap is reported as an explicit
 partial bundle rather than silently truncating it.
+Snapshots carry both their organism time and server-observed time. Export
+selects them directly from the requested observed-time interval, so a quiet
+interval can still contain its retained state even when it has no events.
 
 The default `redact_sensitive` policy replaces image, audio, and vector asset
 locators with redacted identities while retaining media type, byte length,
@@ -17,17 +20,21 @@ Large bytes are never pulled into the Observatory merely because an interval is
 exported.
 
 `POST /api/observatory/diagnostic-verify` accepts a bundle without changing
-server state. It verifies the overall checksum, verifies checksummed embedded
-assets when present, reports references missing from the asset manifest, and
-retains partial/gap status. Missing optional heavy bytes do not prevent event
-and snapshot replay; invalid bundle or embedded-content checksums do.
+server state. It reports four separate claims: `integrity_valid` for the bundle
+and embedded checksums, `structurally_valid` for schema/count/event/sequence and
+snapshot-clock consistency, `replayable` for mechanically loadable evidence,
+and `evidence_complete` for a replay with no unavailable gaps, partial marker,
+or missing payload/snapshot references. Intentional telemetry replacement is
+declared but does not make a bundle partial. Missing optional heavy bytes do not
+prevent event and snapshot replay; invalid integrity or structure does.
 
 The comparison controls select two timeline times. The server resolves the
 nearest retained snapshot at or before each time and compares flattened
 canonical state plus the latest recorded event state. Ordinary value changes
 are separate from source, provenance, trust, confidence, uncertainty,
 freshness, and calibration-epoch changes. The response also compares event
-categories, calibration artifacts, baseline/candidate model identities,
+categories, first-class calibration epochs, distinct calibration artifacts,
+baseline/candidate model identities,
 recorded/reprocessed lanes, and raw/corrected pose or map paths. Added, removed,
 and changed beliefs, entities, tracks, parameters, evidence, proposals, and
 outcomes remain visible rather than being reduced to a single diff count.

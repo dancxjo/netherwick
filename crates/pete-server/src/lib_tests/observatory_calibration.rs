@@ -6,10 +6,12 @@ fn calibration_selection(
         selected: ObservatoryNowSnapshot {
             snapshot_id: format!("now-{}", current.t_ms),
             now: current,
+            observed_at_ms: 0,
         },
         previous: previous.map(|now| ObservatoryNowSnapshot {
             snapshot_id: format!("now-{}", now.t_ms),
             now,
+            observed_at_ms: 0,
         }),
     }
 }

@@ -154,6 +154,65 @@ fn reconnects_are_component_evidence_not_transport_drop_counters() {
 }
 
 #[test]
+fn historical_state_uses_observed_time_not_insertion_order() {
+    let newer = component_health_event(
+        "motherbrain.runtime",
+        BrainEventType::ProviderState,
+        200,
+        serde_json::json!({
+            "component_id": "motherbrain.runtime",
+            "availability": "available",
+            "health": "healthy"
+        }),
+    );
+    let older_arriving_late = component_health_event(
+        "motherbrain.runtime",
+        BrainEventType::ProviderState,
+        100,
+        serde_json::json!({
+            "component_id": "motherbrain.runtime",
+            "availability": "available",
+            "health": "failed",
+            "latest_error": "old failure"
+        }),
+    );
+
+    let response = health_response(&[newer, older_arriving_late], 300);
+    let row = health_row(&response, "motherbrain.runtime");
+
+    assert_eq!(row.health, ComponentHealthState::Healthy);
+    assert!(row.latest_error.is_none());
+}
+
+#[test]
+fn transport_health_preserves_server_retention_and_viewer_loss_domains() {
+    let response = build_component_health(
+        &[],
+        100,
+        BrainEventTransportHealth {
+            running: true,
+            ingress_dropped_telemetry: 2,
+            ingress_rejected_critical: 1,
+            history_expired: 3,
+            history_coalesced: 4,
+            client_lag_gaps: 5,
+            ..Default::default()
+        },
+        &LiveTrainingStatus::default(),
+        None,
+    );
+    let row = health_row(&response, "observatory.transport");
+
+    assert_eq!(row.health, ComponentHealthState::Failed);
+    assert_eq!(row.metrics.dropped, Some(2));
+    assert_eq!(row.metrics.ingress_dropped_telemetry, Some(2));
+    assert_eq!(row.metrics.ingress_rejected_critical, Some(1));
+    assert_eq!(row.metrics.history_expired, Some(3));
+    assert_eq!(row.metrics.history_coalesced, Some(4));
+    assert_eq!(row.metrics.client_lag_gaps, Some(5));
+}
+
+#[test]
 fn thermal_pressure_and_reduced_watchdog_degrade_health_without_faking_authority() {
     let thermal = component_health_event(
         "brainstem",
@@ -228,6 +287,9 @@ fn observatory_health_ui_separates_truth_dimensions_and_links_alerts() {
         "capture / disk",
         "No recorded health threshold alert at this time.",
         "browser reconnects in this page session",
+        "critical rejects",
+        "retained expiry",
+        "viewer gaps",
         "physical mode unknown",
         "tick / queues / drops / health not reported",
         "/api/observatory/component-health?at_ms=",

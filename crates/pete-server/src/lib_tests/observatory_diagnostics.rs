@@ -2,6 +2,7 @@ fn diagnostic_snapshot(id: &str, t_ms: u64) -> ObservatoryNowSnapshot {
     ObservatoryNowSnapshot {
         snapshot_id: id.into(),
         now: blank_now(t_ms),
+        observed_at_ms: t_ms,
     }
 }
 
@@ -59,7 +60,11 @@ fn diagnostic_export_redacts_sensitive_assets_but_preserves_manifest_identity() 
     assert!(bundle.assets[0].reference.redacted);
     assert_eq!(bundle.assets[0].reference.locator, "redacted://rgb-7");
     assert!(bundle.assets[0].locator_sha256.starts_with("sha256:"));
-    assert!(verify_diagnostic_bundle(&bundle).bundle_checksum_valid);
+    let verification = verify_diagnostic_bundle(&bundle);
+    assert!(verification.integrity_valid);
+    assert!(verification.structurally_valid);
+    assert!(verification.replayable);
+    assert!(verification.evidence_complete);
 }
 
 #[test]
@@ -76,14 +81,47 @@ fn export_links_observed_wall_time_events_to_monotonic_snapshots() {
         ObservatoryNowSnapshot {
             snapshot_id: "snapshot-linked".into(),
             now,
+            observed_at_ms: 1_784_683_256_368,
         },
     ];
 
-    let selected =
-        diagnostic_select_snapshots(&retained, &[SequencedBrainEvent { sequence: 1, event }]);
+    let selected = diagnostic_select_snapshots(
+        &retained,
+        &[SequencedBrainEvent { sequence: 1, event }],
+        1_784_683_256_368,
+        1_784_683_256_368,
+    );
 
     assert_eq!(selected.len(), 1);
     assert_eq!(selected[0].snapshot_id, "snapshot-linked");
+}
+
+#[test]
+fn quiet_interval_selects_snapshots_by_requested_observed_time() {
+    let retained = vec![
+        ObservatoryNowSnapshot {
+            snapshot_id: "before".into(),
+            now: blank_now(10),
+            observed_at_ms: 90,
+        },
+        ObservatoryNowSnapshot {
+            snapshot_id: "quiet".into(),
+            now: blank_now(20),
+            observed_at_ms: 150,
+        },
+    ];
+
+    let selected = diagnostic_select_snapshots(&retained, &[], 100, 200);
+
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].snapshot_id, "quiet");
+    let bundle = test_diagnostic_bundle(
+        vec![],
+        selected,
+        vec![],
+        DiagnosticAssetPolicy::ManifestOnly,
+    );
+    assert!(!bundle.manifest.partial);
 }
 
 #[test]
@@ -111,7 +149,10 @@ fn import_verification_reports_missing_asset_manifest_entries() {
 
     assert_eq!(report.missing_references, ["audio-2"]);
     assert!(report.bundle_checksum_valid);
+    assert!(report.integrity_valid);
+    assert!(report.structurally_valid);
     assert!(report.replayable);
+    assert!(!report.evidence_complete);
 }
 
 #[test]
@@ -140,7 +181,34 @@ fn import_verification_rejects_bundle_and_embedded_asset_checksum_failures() {
     bundle = finalize_diagnostic_bundle(bundle);
     let report = verify_diagnostic_bundle(&bundle);
     assert_eq!(report.invalid_asset_checksums, ["config"]);
+    assert!(!report.integrity_valid);
     assert!(!report.replayable);
+}
+
+#[test]
+fn structurally_invalid_bundle_is_not_labeled_replayable() {
+    let first = diagnostic_envelope(2, graph_event("first", BrainEventType::Evidence, 100));
+    let second = diagnostic_envelope(2, graph_event("second", BrainEventType::Evidence, 200));
+    let bundle = test_diagnostic_bundle(
+        vec![first, second],
+        vec![
+            diagnostic_snapshot("snapshot-2", 100),
+            diagnostic_snapshot("snapshot-2", 200),
+        ],
+        vec![],
+        DiagnosticAssetPolicy::ManifestOnly,
+    );
+
+    let report = verify_diagnostic_bundle(&bundle);
+
+    assert!(report.integrity_valid);
+    assert!(!report.structurally_valid);
+    assert!(!report.replayable);
+    assert!(!report.evidence_complete);
+    assert!(report
+        .structural_errors
+        .iter()
+        .any(|error| error.contains("duplicate or out of order")));
 }
 
 #[test]
@@ -194,6 +262,8 @@ fn partial_capture_keeps_declared_gaps_and_round_trips_for_offline_replay() {
     let report = verify_diagnostic_bundle(&decoded);
     assert!(report.bundle_checksum_valid);
     assert!(report.partial);
+    assert!(report.replayable);
+    assert!(!report.evidence_complete);
     assert_eq!(report.declared_gaps, 1);
     assert_eq!(
         replay
@@ -203,6 +273,28 @@ fn partial_capture_keeps_declared_gaps_and_round_trips_for_offline_replay() {
             .len(),
         1
     );
+}
+
+#[test]
+fn intentional_replacement_does_not_make_evidence_partial() {
+    let event = BrainEvent::from_now_snapshot(
+        "snapshot-2",
+        &blank_now(200),
+        200,
+        Some("clock-a".into()),
+    );
+    let bundle = test_diagnostic_bundle(
+        vec![diagnostic_envelope(2, event)],
+        vec![diagnostic_snapshot("snapshot-2", 200)],
+        vec![BrainEventSequenceGap::coalesced(1, 2)],
+        DiagnosticAssetPolicy::ManifestOnly,
+    );
+
+    let report = verify_diagnostic_bundle(&bundle);
+
+    assert!(!bundle.manifest.partial);
+    assert!(!report.partial);
+    assert!(report.evidence_complete);
 }
 
 #[test]
@@ -280,6 +372,7 @@ fn comparison_separates_value_from_trust_and_epoch_changes() {
         version: Some("1".into()),
         checksum: Some("sha256:old".into()),
     });
+    old_epoch.calibration_epochs.push("mount-epoch-1".into());
     let mut new_epoch = graph_event("epoch-2", BrainEventType::CalibrationTransition, 190);
     new_epoch.artifacts.push(ArtifactIdentity {
         kind: ArtifactKind::Calibration,
@@ -287,6 +380,7 @@ fn comparison_separates_value_from_trust_and_epoch_changes() {
         version: Some("2".into()),
         checksum: Some("sha256:new".into()),
     });
+    new_epoch.calibration_epochs.push("mount-epoch-2".into());
 
     let comparison =
         build_diagnostic_comparison(&left, &right, &[old_epoch, new_epoch], false, vec![]);
@@ -300,6 +394,10 @@ fn comparison_separates_value_from_trust_and_epoch_changes() {
     }));
     assert!(comparison
         .calibration_epochs
+        .added
+        .contains(&"mount-epoch-2".into()));
+    assert!(comparison
+        .calibration_artifacts
         .added
         .contains(&"kinect-epoch-2".into()));
 }

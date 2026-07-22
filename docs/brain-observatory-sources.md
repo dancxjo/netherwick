@@ -19,8 +19,12 @@ Recorded truth and optional recomputation are separate lanes:
 - `recorded` is the immutable captured event stream used by normal replay;
 - `reprocessed { model_id }` contains candidate-model output for comparison.
 
-Normal source queries return the recorded lane. Candidate output cannot replace
-or silently amend historical trust decisions.
+Source queries select `recorded`, `reprocessed`, or `all`, with an optional
+reprocessed model ID. Every returned envelope retains its lane metadata, so
+candidate identity does not depend on naming conventions in `kind`. Recorded
+remains the default, and candidate output cannot replace or silently amend
+historical trust decisions. Live snapshot discovery paginates through bounded
+history rather than truncating at the per-query limit.
 
 `ObservatoryNavigationState` is serializable deep-link state. It retains source,
 playback mode, selected time/event, active panel, filters, speed, and loop range.
@@ -32,4 +36,7 @@ retaining source, panel, selection filters, and other navigation context.
 Stream sequence remains delivery order. Occurred/observed times and clock epochs
 are display/filter facts and never reorder replay. Incomplete sources remain
 navigable, but `ObservatorySourceHealth.complete` is false and its typed gaps and
-warnings are always available to the UI.
+warnings are always available to the UI. Intentional state-projection
+replacement is a `coalesced` discontinuity with the replacement sequence, not
+an unavailable-history gap. Capture frame gaps end immediately before the next
+present frame.

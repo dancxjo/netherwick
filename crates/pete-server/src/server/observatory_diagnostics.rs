@@ -69,11 +69,15 @@ struct DiagnosticBundleBuild<'a> {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DiagnosticVerificationReport {
     pub bundle_checksum_valid: bool,
+    pub integrity_valid: bool,
+    pub structurally_valid: bool,
     pub invalid_asset_checksums: Vec<String>,
     pub missing_references: Vec<String>,
     pub declared_gaps: usize,
     pub partial: bool,
     pub replayable: bool,
+    pub evidence_complete: bool,
+    pub structural_errors: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -125,6 +129,7 @@ pub struct DiagnosticComparisonResponse {
     pub fields: Vec<DiagnosticFieldChange>,
     pub event_categories: BTreeMap<String, DiagnosticSetComparison>,
     pub calibration_epochs: DiagnosticSetComparison,
+    pub calibration_artifacts: DiagnosticSetComparison,
     pub model_artifacts: DiagnosticSetComparison,
     pub recorded_reprocessed: DiagnosticSetComparison,
     pub raw_corrected_pose_paths: Vec<String>,
@@ -287,28 +292,18 @@ fn diagnostic_artifacts(events: &[SequencedBrainEvent]) -> Vec<ArtifactIdentity>
 fn diagnostic_select_snapshots(
     snapshots: &[ObservatoryNowSnapshot],
     events: &[SequencedBrainEvent],
+    from_ms: u64,
+    to_ms: u64,
 ) -> Vec<ObservatoryNowSnapshot> {
     let snapshot_ids: BTreeSet<String> = events
         .iter()
         .filter_map(|event| event.event.references.snapshot_id.clone())
         .collect();
-    let occurred_from_ms = events
-        .iter()
-        .map(|event| event.event.times.occurred.t_ms)
-        .min();
-    let occurred_to_ms = events
-        .iter()
-        .map(|event| event.event.times.occurred.t_ms)
-        .max();
     snapshots
         .iter()
         .filter(|snapshot| {
             snapshot_ids.contains(&snapshot.snapshot_id)
-                || matches!(
-                    (occurred_from_ms, occurred_to_ms),
-                    (Some(from_ms), Some(to_ms))
-                        if snapshot.now.t_ms >= from_ms && snapshot.now.t_ms <= to_ms
-                )
+                || (snapshot.observed_at_ms >= from_ms && snapshot.observed_at_ms <= to_ms)
         })
         .cloned()
         .collect()
@@ -330,8 +325,20 @@ fn build_diagnostic_bundle(input: DiagnosticBundleBuild<'_>) -> DiagnosticBundle
     let assets = diagnostic_asset_entries(&events, policy);
     let artifacts = diagnostic_artifacts(&events);
     let mut warnings = Vec::new();
-    if !gaps.is_empty() {
-        warnings.push(format!("{} declared transport/capture gaps", gaps.len()));
+    let replacements = gaps
+        .iter()
+        .filter(|gap| gap.reason == SequenceGapReason::Coalesced)
+        .count();
+    let unavailable_gaps = gaps.len().saturating_sub(replacements);
+    if unavailable_gaps > 0 {
+        warnings.push(format!(
+            "{unavailable_gaps} declared unavailable transport/capture gaps"
+        ));
+    }
+    if replacements > 0 {
+        warnings.push(format!(
+            "{replacements} intentional telemetry replacements"
+        ));
     }
     if snapshots.is_empty() {
         warnings.push("no retained snapshots overlap the interval".into());
@@ -395,20 +402,98 @@ pub fn verify_diagnostic_bundle(bundle: &DiagnosticBundle) -> DiagnosticVerifica
         }
     }
     let mut missing_references = BTreeSet::new();
+    let snapshot_ids: BTreeSet<_> = bundle
+        .snapshots
+        .iter()
+        .map(|snapshot| snapshot.snapshot_id.as_str())
+        .collect();
     for envelope in &bundle.events {
         if let BrainEventPayload::Reference { reference } = &envelope.event.payload {
             if !manifest_ids.contains(&reference.id) {
                 missing_references.insert(reference.id.clone());
             }
         }
+        if let Some(snapshot_id) = envelope.event.references.snapshot_id.as_deref() {
+            if !snapshot_ids.contains(snapshot_id) {
+                missing_references.insert(format!("snapshot:{snapshot_id}"));
+            }
+        }
     }
+    let mut structural_errors = Vec::new();
+    if bundle.manifest.schema_version != DIAGNOSTIC_BUNDLE_SCHEMA_VERSION {
+        structural_errors.push(format!(
+            "unsupported diagnostic schema {}",
+            bundle.manifest.schema_version
+        ));
+    }
+    for (name, declared, actual) in [
+        ("events", bundle.manifest.event_count, bundle.events.len()),
+        (
+            "snapshots",
+            bundle.manifest.snapshot_count,
+            bundle.snapshots.len(),
+        ),
+        ("assets", bundle.manifest.asset_count, bundle.assets.len()),
+        ("gaps", bundle.manifest.gap_count, bundle.drops.gaps.len()),
+    ] {
+        if declared != actual {
+            structural_errors.push(format!(
+                "manifest {name} count {declared} does not match {actual}"
+            ));
+        }
+    }
+    let mut prior_sequence = None;
+    for envelope in &bundle.events {
+        if prior_sequence.is_some_and(|prior| envelope.sequence <= prior) {
+            structural_errors.push(format!(
+                "event sequence {} is duplicate or out of order",
+                envelope.sequence
+            ));
+        }
+        prior_sequence = Some(envelope.sequence);
+        if let Err(error) = envelope.event.validate() {
+            structural_errors.push(format!(
+                "event {} is invalid: {error}",
+                envelope.event.event_id.0
+            ));
+        }
+        if envelope.event.event_type == BrainEventType::Snapshot {
+            if let Some(snapshot_id) = envelope.event.references.snapshot_id.as_deref() {
+                if let Some(snapshot) = bundle
+                    .snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.snapshot_id == snapshot_id)
+                {
+                    if envelope.event.times.occurred.t_ms != snapshot.now.t_ms {
+                        structural_errors.push(format!(
+                            "snapshot {snapshot_id} event time does not match retained Now"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let integrity_valid = bundle_checksum_valid && invalid_asset_checksums.is_empty();
+    let structurally_valid = structural_errors.is_empty();
+    let partial = bundle.manifest.partial
+        || bundle
+            .drops
+            .gaps
+            .iter()
+            .any(|gap| gap.reason != SequenceGapReason::Coalesced);
+    let replayable = integrity_valid && structurally_valid;
+    let evidence_complete = replayable && !partial && missing_references.is_empty();
     DiagnosticVerificationReport {
         bundle_checksum_valid,
-        replayable: bundle_checksum_valid && invalid_asset_checksums.is_empty(),
+        integrity_valid,
+        structurally_valid,
         invalid_asset_checksums,
         missing_references: missing_references.into_iter().collect(),
         declared_gaps: bundle.drops.gaps.len(),
-        partial: bundle.manifest.partial || !bundle.drops.gaps.is_empty(),
+        partial,
+        replayable,
+        evidence_complete,
+        structural_errors,
     }
 }
 
@@ -612,6 +697,22 @@ fn diagnostic_identity_sets(
         .collect()
 }
 
+fn diagnostic_calibration_epoch_sets(
+    events: &[BrainEvent],
+    at_ms: u64,
+) -> BTreeMap<String, String> {
+    events
+        .iter()
+        .filter(|event| event.times.observed.t_ms <= at_ms)
+        .flat_map(|event| {
+            event
+                .calibration_epochs
+                .iter()
+                .map(move |epoch| (epoch.clone(), event.producer.component.clone()))
+        })
+        .collect()
+}
+
 fn build_diagnostic_comparison(
     left: &ObservatoryNowSnapshot,
     right: &ObservatoryNowSnapshot,
@@ -643,8 +744,12 @@ fn build_diagnostic_comparison(
         .collect();
     let left_models = diagnostic_identity_sets(events, left.now.t_ms, ArtifactKind::Model);
     let right_models = diagnostic_identity_sets(events, right.now.t_ms, ArtifactKind::Model);
-    let left_epochs = diagnostic_identity_sets(events, left.now.t_ms, ArtifactKind::Calibration);
-    let right_epochs = diagnostic_identity_sets(events, right.now.t_ms, ArtifactKind::Calibration);
+    let left_epochs = diagnostic_calibration_epoch_sets(events, left.now.t_ms);
+    let right_epochs = diagnostic_calibration_epoch_sets(events, right.now.t_ms);
+    let left_calibration_artifacts =
+        diagnostic_identity_sets(events, left.now.t_ms, ArtifactKind::Calibration);
+    let right_calibration_artifacts =
+        diagnostic_identity_sets(events, right.now.t_ms, ArtifactKind::Calibration);
     let lane = |at_ms| {
         events
             .iter()
@@ -681,6 +786,10 @@ fn build_diagnostic_comparison(
         fields,
         event_categories,
         calibration_epochs: diagnostic_compare_sets(&left_epochs, &right_epochs),
+        calibration_artifacts: diagnostic_compare_sets(
+            &left_calibration_artifacts,
+            &right_calibration_artifacts,
+        ),
         model_artifacts: diagnostic_compare_sets(&left_models, &right_models),
         recorded_reprocessed: diagnostic_compare_sets(&lane(left.now.t_ms), &lane(right.now.t_ms)),
         raw_corrected_pose_paths,
@@ -708,7 +817,12 @@ async fn get_observatory_diagnostic_export(
         .iter()
         .cloned()
         .collect();
-    let snapshots = diagnostic_select_snapshots(&retained_snapshots, &events);
+    let snapshots = diagnostic_select_snapshots(
+        &retained_snapshots,
+        &events,
+        query.from_ms,
+        query.to_ms,
+    );
     Ok(Json(build_diagnostic_bundle(DiagnosticBundleBuild {
         events,
         snapshots,

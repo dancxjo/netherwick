@@ -58,6 +58,11 @@ pub struct ComponentHealthMetrics {
     pub writer_backlog: Option<u64>,
     pub disk_free_bytes: Option<u64>,
     pub reduced_watchdog: Option<bool>,
+    pub ingress_dropped_telemetry: Option<u64>,
+    pub ingress_rejected_critical: Option<u64>,
+    pub history_expired: Option<u64>,
+    pub history_coalesced: Option<u64>,
+    pub client_lag_gaps: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -115,8 +120,8 @@ fn build_component_health(
     now: Option<&pete_now::Now>,
 ) -> ComponentHealthResponse {
     let mut rows = baseline_health_rows();
-    let mut latest: BTreeMap<String, &BrainEvent> = BTreeMap::new();
-    for event in events.iter().filter(|event| {
+    let mut latest: BTreeMap<String, (usize, &BrainEvent)> = BTreeMap::new();
+    for (sequence, event) in events.iter().enumerate().filter(|(_, event)| {
         event.times.observed.t_ms <= at_ms
             && matches!(
                 event.event_type,
@@ -126,9 +131,25 @@ fn build_component_health(
                     | BrainEventType::QueueState
             )
     }) {
-        latest.insert(health_component_id(event), event);
+        let id = health_component_id(event);
+        let candidate = (
+            event.times.observed.clock_epoch.as_deref(),
+            event.times.observed.t_ms,
+            sequence,
+        );
+        let replace = latest.get(&id).is_none_or(|(prior_sequence, prior)| {
+            candidate
+                > (
+                    prior.times.observed.clock_epoch.as_deref(),
+                    prior.times.observed.t_ms,
+                    *prior_sequence,
+                )
+        });
+        if replace {
+            latest.insert(id, (sequence, event));
+        }
     }
-    for (id, event) in latest {
+    for (id, (_, event)) in latest {
         if let Some(index) = rows.iter().position(|row| row.id == id) {
             let optional = rows[index].optional;
             let group = rows[index].group.clone();
@@ -386,10 +407,7 @@ fn capture_health_row(training: &LiveTrainingStatus) -> ComponentHealthRow {
 }
 
 fn transport_health_row(health: &BrainEventTransportHealth) -> ComponentHealthRow {
-    let loss = health.ingress_dropped_telemetry
-        + health.ingress_rejected_critical
-        + health.history_expired
-        + health.client_lag_gaps;
+    let server_loss = health.ingress_dropped_telemetry + health.ingress_rejected_critical;
     ComponentHealthRow {
         id: "observatory.transport".into(),
         group: "ui transport".into(),
@@ -401,9 +419,9 @@ fn transport_health_row(health: &BrainEventTransportHealth) -> ComponentHealthRo
         } else {
             ComponentAvailability::Unavailable
         },
-        health: if !health.running {
+        health: if !health.running || health.ingress_rejected_critical > 0 {
             ComponentHealthState::Failed
-        } else if loss > 0 {
+        } else if health.ingress_dropped_telemetry > 0 {
             ComponentHealthState::Degraded
         } else {
             ComponentHealthState::Healthy
@@ -420,15 +438,24 @@ fn transport_health_row(health: &BrainEventTransportHealth) -> ComponentHealthRo
         metrics: ComponentHealthMetrics {
             queue_depth: Some(health.ingress_depth as u64),
             queue_capacity: Some(health.ingress_capacity as u64),
-            dropped: Some(health.ingress_dropped_telemetry + health.client_lag_gaps),
+            dropped: Some(health.ingress_dropped_telemetry),
             replaced: Some(health.ingress_coalesced + health.history_coalesced),
+            ingress_dropped_telemetry: Some(health.ingress_dropped_telemetry),
+            ingress_rejected_critical: Some(health.ingress_rejected_critical),
+            history_expired: Some(health.history_expired),
+            history_coalesced: Some(health.history_coalesced),
+            client_lag_gaps: Some(health.client_lag_gaps),
             ..Default::default()
         },
         artifacts: Vec::new(),
         candidate_state: None,
         rollback_state: None,
-        latest_error: (loss > 0)
-            .then(|| format!("transport recorded {loss} loss/expiry/rejection events")),
+        latest_error: (server_loss > 0).then(|| {
+            format!(
+                "observatory server rejected {} critical and dropped {} telemetry events",
+                health.ingress_rejected_critical, health.ingress_dropped_telemetry
+            )
+        }),
         event_id: None,
     }
 }

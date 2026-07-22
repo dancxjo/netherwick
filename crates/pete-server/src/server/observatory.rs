@@ -9,6 +9,8 @@ const OBSERVATORY_NOW_HISTORY_CAPACITY: usize = 2_048;
 pub struct ObservatoryNowSnapshot {
     pub snapshot_id: String,
     pub now: pete_now::Now,
+    #[serde(default)]
+    pub observed_at_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

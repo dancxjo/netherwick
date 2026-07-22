@@ -210,6 +210,7 @@ impl LiveViewState {
             .latest
             .lock()
             .expect("live view snapshot mutex poisoned") = Some(snapshot);
+        let observed_at_ms = wall_now_ms();
         {
             let mut history = self
                 .observatory_now
@@ -222,13 +223,14 @@ impl LiveViewState {
                 history.push_back(ObservatoryNowSnapshot {
                     snapshot_id: snapshot_id.clone(),
                     now: retained_now,
+                    observed_at_ms,
                 });
             }
         }
         let _ = self.publish_brain_event(BrainEvent::from_now_snapshot(
             snapshot_id,
             &now,
-            wall_now_ms(),
+            observed_at_ms,
             None,
         ));
     }
