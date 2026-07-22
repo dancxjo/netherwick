@@ -481,7 +481,7 @@ fn finalize_diagnostic_bundle(mut bundle: DiagnosticBundle) -> DiagnosticBundle 
     bundle
 }
 
-fn diagnostic_query_events(
+async fn diagnostic_query_events(
     hub: &BrainEventHub,
     from_ms: u64,
     to_ms: u64,
@@ -491,13 +491,15 @@ fn diagnostic_query_events(
     let mut gaps = Vec::new();
     let mut partial = false;
     loop {
-        let page = hub.query(&BrainEventQuery {
-            after_sequence: Some(after_sequence),
-            observed_from_ms: Some(from_ms),
-            observed_to_ms: Some(to_ms),
-            limit: Some(MAX_OBSERVATORY_QUERY_LIMIT),
-            ..Default::default()
-        })?;
+        let page = hub
+            .query_async(BrainEventQuery {
+                after_sequence: Some(after_sequence),
+                observed_from_ms: Some(from_ms),
+                observed_to_ms: Some(to_ms),
+                limit: Some(MAX_OBSERVATORY_QUERY_LIMIT),
+                ..Default::default()
+            })
+            .await?;
         let next = page.next_cursor;
         for record in page.records {
             match record {
@@ -1209,6 +1211,7 @@ async fn get_observatory_diagnostic_export(
     }
     let hub = state.observatory();
     let (events, gaps, partial) = diagnostic_query_events(&hub, query.from_ms, query.to_ms)
+        .await
         .map_err(|error| ObservatoryHttpError::bad_request(error.to_string()))?;
     let retained_snapshots: Vec<ObservatoryNowSnapshot> = state
         .observatory_now
@@ -1266,6 +1269,7 @@ async fn get_observatory_compare(
         .ok_or_else(|| ObservatoryHttpError::unavailable("right snapshot is not retained"))?;
     let (events, gaps, partial) =
         diagnostic_query_events(&state.observatory(), 0, left.now.t_ms.max(right.now.t_ms))
+            .await
             .map_err(|error| ObservatoryHttpError::bad_request(error.to_string()))?;
     let warnings = (!gaps.is_empty())
         .then(|| format!("comparison crosses {} declared gaps", gaps.len()))

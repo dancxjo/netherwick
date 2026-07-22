@@ -553,25 +553,66 @@ impl BrainEventHub {
             .lock()
             .map_err(|_| BrainEventQueryError::new("history lock poisoned"))?;
         let replacements = history.replacements.clone();
-        let mut combined: BTreeMap<u64, SequencedBrainEvent> = history
+        let live: VecDeque<SequencedBrainEvent> = history
             .events
             .iter()
+            .filter(|event| event.sequence > after)
             .cloned()
-            .map(|event| (event.sequence, event))
             .collect();
         drop(history);
-        if let Some(durable) = &self.shared.durable {
-            for event in durable.read_events().map_err(|error| {
-                BrainEventQueryError::new(format!("durable history unavailable: {error}"))
-            })? {
-                combined.entry(event.sequence).or_insert(event);
-            }
-        }
+        let durable = self.shared.durable.as_ref();
+        let mut live = live;
+        let mut durable_entries = VecDeque::new();
+        let mut durable_cursor = after;
+        let mut durable_exhausted = durable.is_none();
         let mut records = Vec::new();
         let mut expected = after.saturating_add(1);
         let mut next_cursor = after;
         let mut matched = 0;
-        for envelope in combined.values().filter(|event| event.sequence > after) {
+        loop {
+            if durable_entries.is_empty() && !durable_exhausted {
+                let page = durable
+                    .expect("durable store exists while index is not exhausted")
+                    .index_page_after(durable_cursor, 256)
+                    .map_err(|error| {
+                        BrainEventQueryError::new(format!(
+                            "durable history index unavailable: {error}"
+                        ))
+                    })?;
+                durable_exhausted = page.is_empty();
+                if let Some(last) = page.last() {
+                    durable_cursor = last.sequence;
+                }
+                durable_entries.extend(page);
+            }
+            let live_sequence = live.front().map(|event| event.sequence);
+            let durable_sequence = durable_entries.front().map(|entry| entry.sequence);
+            let envelope = match (live_sequence, durable_sequence) {
+                (Some(live_sequence), Some(durable_sequence))
+                    if live_sequence <= durable_sequence =>
+                {
+                    if live_sequence == durable_sequence {
+                        durable_entries.pop_front();
+                    }
+                    live.pop_front().expect("front live event exists")
+                }
+                (_, Some(_)) => {
+                    let entry = durable_entries
+                        .pop_front()
+                        .expect("front durable index entry exists");
+                    durable
+                        .expect("durable store exists for indexed entry")
+                        .read_indexed_event(&entry)
+                        .map_err(|error| {
+                            BrainEventQueryError::new(format!(
+                                "durable indexed event unavailable: {error}"
+                            ))
+                        })?
+                }
+                (Some(_), None) => live.pop_front().expect("front live event exists"),
+                (None, None) if !durable_exhausted => continue,
+                (None, None) => break,
+            };
             if envelope.sequence > expected {
                 append_history_discontinuities(
                     &mut records,
@@ -584,7 +625,7 @@ impl BrainEventHub {
             next_cursor = envelope.sequence;
             if query.matches(&envelope.event) {
                 records.push(BrainEventStreamRecord::Event {
-                    envelope: envelope.clone(),
+                    envelope,
                 });
                 matched += 1;
                 if matched >= limit {
@@ -597,6 +638,18 @@ impl BrainEventHub {
             next_cursor,
             health: self.health(),
         })
+    }
+
+    pub async fn query_async(
+        &self,
+        query: BrainEventQuery,
+    ) -> Result<BrainEventHistoryResponse, BrainEventQueryError> {
+        let hub = self.clone();
+        tokio::task::spawn_blocking(move || hub.query(&query))
+            .await
+            .map_err(|error| {
+                BrainEventQueryError::new(format!("observatory query worker failed: {error}"))
+            })?
     }
 
     pub fn health(&self) -> BrainEventTransportHealth {
@@ -904,7 +957,8 @@ async fn get_observatory_history(
 ) -> Result<Json<BrainEventHistoryResponse>, ObservatoryHttpError> {
     state
         .observatory()
-        .query(&query)
+        .query_async(query)
+        .await
         .map(Json)
         .map_err(|error| ObservatoryHttpError::bad_request(error.to_string()))
 }
@@ -967,7 +1021,7 @@ async fn stream_observatory_events(
 ) {
     let hub = state.observatory();
     let mut receiver = hub.subscribe();
-    let Ok(history) = hub.query(&query) else {
+    let Ok(history) = hub.query_async(query.clone()).await else {
         return;
     };
     let mut last_sequence = query.after_sequence.unwrap_or(0);

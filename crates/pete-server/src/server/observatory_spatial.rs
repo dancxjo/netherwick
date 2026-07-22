@@ -258,11 +258,12 @@ async fn get_observatory_spatial(
             .is_some_and(|latest| latest.eye_frame.is_some());
     let history = state
         .observatory()
-        .query(&BrainEventQuery {
+        .query_async(BrainEventQuery {
             occurred_to_ms: Some(selection.selected.now.t_ms),
             limit: Some(MAX_OBSERVATORY_QUERY_LIMIT),
             ..Default::default()
         })
+        .await
         .map_err(|error| ObservatoryHttpError::bad_request(error.to_string()))?;
     let events: Vec<BrainEvent> = history
         .records

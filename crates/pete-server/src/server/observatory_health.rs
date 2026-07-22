@@ -647,11 +647,12 @@ async fn get_observatory_component_health(
 ) -> Result<Json<ComponentHealthResponse>, ObservatoryHttpError> {
     let history = state
         .observatory()
-        .query(&BrainEventQuery {
+        .query_async(BrainEventQuery {
             observed_to_ms: query.at_ms,
             limit: Some(MAX_OBSERVATORY_QUERY_LIMIT),
             ..Default::default()
         })
+        .await
         .map_err(|error| ObservatoryHttpError::bad_request(error.to_string()))?;
     let events: Vec<BrainEvent> = history
         .records

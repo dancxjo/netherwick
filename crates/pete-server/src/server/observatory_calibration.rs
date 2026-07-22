@@ -539,11 +539,12 @@ async fn get_observatory_calibration(
     })?;
     let history = state
         .observatory()
-        .query(&BrainEventQuery {
+        .query_async(BrainEventQuery {
             event_type: Some(BrainEventType::CalibrationTransition),
             limit: Some(MAX_OBSERVATORY_QUERY_LIMIT),
             ..Default::default()
         })
+        .await
         .map_err(|error| ObservatoryHttpError::bad_request(error.to_string()))?;
     let events: Vec<BrainEvent> = history
         .records

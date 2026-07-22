@@ -71,11 +71,19 @@ enum DurableWriterCommand {
 }
 
 struct DurableBrainEventStore {
-    config: BrainEventDurabilityConfig,
     sender: Mutex<Option<std::sync::mpsc::SyncSender<DurableWriterCommand>>>,
     writer: Mutex<Option<std::thread::JoinHandle<()>>>,
     stats: Arc<DurableBrainEventStats>,
     seen_ids: Mutex<DurableSeenEventIds>,
+    index: Arc<Mutex<BTreeMap<u64, DurableBrainEventIndexEntry>>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DurableBrainEventIndexEntry {
+    sequence: u64,
+    path: PathBuf,
+    offset: u64,
+    length: u64,
 }
 
 struct DurableSeenEventIds {
@@ -134,6 +142,7 @@ impl DurableBrainEventStore {
             fs::create_dir_all(parent)?;
         }
         let scan = scan_durable_history(&config, true)?;
+        persist_durable_index(&config, scan.index.values())?;
         let stats = Arc::new(DurableBrainEventStats::default());
         stats
             .last_durable_sequence
@@ -149,16 +158,20 @@ impl DurableBrainEventStore {
             std::sync::mpsc::sync_channel(config.writer_queue_capacity);
         let writer_config = config.clone();
         let writer_stats = Arc::clone(&stats);
+        let index = Arc::new(Mutex::new(scan.index));
+        let writer_index = Arc::clone(&index);
         let writer = std::thread::Builder::new()
             .name("observatory-durable-writer".into())
-            .spawn(move || run_durable_writer(writer_config, writer_stats, receiver))?;
+            .spawn(move || {
+                run_durable_writer(writer_config, writer_stats, writer_index, receiver)
+            })?;
         Ok((
             Self {
-                config,
                 sender: Mutex::new(Some(sender)),
                 writer: Mutex::new(Some(writer)),
                 stats,
                 seen_ids: Mutex::new(seen_ids),
+                index,
             },
             scan.events,
         ))
@@ -195,8 +208,43 @@ impl DurableBrainEventStore {
         }
     }
 
-    fn read_events(&self) -> io::Result<Vec<SequencedBrainEvent>> {
-        Ok(scan_durable_history(&self.config, false)?.events)
+    fn index_page_after(
+        &self,
+        after_sequence: u64,
+        limit: usize,
+    ) -> io::Result<Vec<DurableBrainEventIndexEntry>> {
+        let index = self
+            .index
+            .lock()
+            .map_err(|_| io::Error::other("durable event index lock poisoned"))?;
+        Ok(index
+            .range((std::ops::Bound::Excluded(after_sequence), std::ops::Bound::Unbounded))
+            .take(limit.max(1))
+            .map(|(_, entry)| entry.clone())
+            .collect())
+    }
+
+    fn read_indexed_event(
+        &self,
+        entry: &DurableBrainEventIndexEntry,
+    ) -> io::Result<SequencedBrainEvent> {
+        use std::io::{Read, Seek};
+
+        let mut file = fs::File::open(&entry.path)?;
+        file.seek(std::io::SeekFrom::Start(entry.offset))?;
+        let length = usize::try_from(entry.length)
+            .map_err(|_| io::Error::other("durable index record length exceeds address space"))?;
+        let mut bytes = vec![0_u8; length];
+        file.read_exact(&mut bytes)?;
+        if bytes.pop() != Some(b'\n') {
+            return Err(io::Error::other("durable indexed record is not newline framed"));
+        }
+        let record: DurableBrainEventRecord =
+            serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        if !record.validate() || record.envelope.sequence != entry.sequence {
+            return Err(io::Error::other("durable indexed record failed validation"));
+        }
+        Ok(record.envelope)
     }
 
     fn close(&self) {
@@ -250,6 +298,7 @@ impl Drop for DurableBrainEventStore {
 fn run_durable_writer(
     config: BrainEventDurabilityConfig,
     stats: Arc<DurableBrainEventStats>,
+    index: Arc<Mutex<BTreeMap<u64, DurableBrainEventIndexEntry>>>,
     receiver: std::sync::mpsc::Receiver<DurableWriterCommand>,
 ) {
     let mut successful_records = 0_u64;
@@ -261,7 +310,7 @@ fn run_durable_writer(
         let result = if injected_failure {
             Err(io::Error::other("injected durable writer failure"))
         } else {
-            append_durable_record(&config, &stats, envelope.clone())
+            append_durable_record(&config, &stats, &index, envelope.clone())
         };
         match result {
             Ok(()) => {
@@ -282,24 +331,88 @@ fn run_durable_writer(
 fn append_durable_record(
     config: &BrainEventDurabilityConfig,
     stats: &DurableBrainEventStats,
+    index: &Mutex<BTreeMap<u64, DurableBrainEventIndexEntry>>,
     envelope: SequencedBrainEvent,
 ) -> io::Result<()> {
     use std::io::Write;
 
+    let sequence = envelope.sequence;
     let record = DurableBrainEventRecord::new(envelope)?;
     let mut bytes = serde_json::to_vec(&record).map_err(io::Error::other)?;
     bytes.push(b'\n');
     let current_len = fs::metadata(&config.path).map_or(0, |metadata| metadata.len());
-    if current_len > 0 && current_len.saturating_add(bytes.len() as u64) > config.max_segment_bytes
-    {
+    let rotated = current_len > 0
+        && current_len.saturating_add(bytes.len() as u64) > config.max_segment_bytes;
+    if rotated {
         rotate_durable_history(config)?;
         stats.rotations.fetch_add(1, Ordering::Relaxed);
     }
+    let offset = if rotated { 0 } else { current_len };
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&config.path)?;
     file.write_all(&bytes)?;
+    file.flush()?;
+    if config.sync_data {
+        file.sync_data()?;
+    }
+    let entry = DurableBrainEventIndexEntry {
+        sequence,
+        path: config.path.clone(),
+        offset,
+        length: bytes.len() as u64,
+    };
+    let mut index = index
+        .lock()
+        .map_err(|_| io::Error::other("durable event index lock poisoned"))?;
+    if rotated {
+        let scan = scan_durable_history(config, false)?;
+        *index = scan.index;
+        persist_durable_index(config, index.values())?;
+    } else {
+        index.insert(entry.sequence, entry.clone());
+        append_durable_index_entry(config, &entry)?;
+    }
+    Ok(())
+}
+
+fn durable_index_path(config: &BrainEventDurabilityConfig) -> PathBuf {
+    PathBuf::from(format!("{}.index.jsonl", config.path.display()))
+}
+
+fn persist_durable_index<'a>(
+    config: &BrainEventDurabilityConfig,
+    entries: impl IntoIterator<Item = &'a DurableBrainEventIndexEntry>,
+) -> io::Result<()> {
+    use std::io::Write;
+
+    let path = durable_index_path(config);
+    let temporary = PathBuf::from(format!("{}.tmp", path.display()));
+    let mut file = fs::File::create(&temporary)?;
+    for entry in entries {
+        serde_json::to_writer(&mut file, entry).map_err(io::Error::other)?;
+        file.write_all(b"\n")?;
+    }
+    file.flush()?;
+    if config.sync_data {
+        file.sync_data()?;
+    }
+    fs::rename(temporary, path)
+}
+
+fn append_durable_index_entry(
+    config: &BrainEventDurabilityConfig,
+    entry: &DurableBrainEventIndexEntry,
+) -> io::Result<()> {
+    use std::io::Write;
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(durable_index_path(config))?;
+    serde_json::to_writer(&mut file, entry).map_err(io::Error::other)?;
+    file.write_all(b"\n")?;
     file.flush()?;
     if config.sync_data {
         file.sync_data()?;
@@ -331,6 +444,7 @@ fn rotate_durable_history(config: &BrainEventDurabilityConfig) -> io::Result<()>
 #[derive(Default)]
 struct DurableHistoryScan {
     events: Vec<SequencedBrainEvent>,
+    index: BTreeMap<u64, DurableBrainEventIndexEntry>,
     newest_sequence: u64,
     recovery_gaps: u64,
 }
@@ -369,9 +483,16 @@ fn scan_durable_history(
             valid_len = valid_len.saturating_add(line.len());
             let event_id = record.envelope.event.event_id.clone();
             if seen_ids.insert(event_id) {
-                by_sequence
-                    .entry(record.envelope.sequence)
-                    .or_insert(record.envelope);
+                let sequence = record.envelope.sequence;
+                by_sequence.entry(sequence).or_insert(record.envelope);
+                scan.index
+                    .entry(sequence)
+                    .or_insert(DurableBrainEventIndexEntry {
+                        sequence,
+                        path: path.clone(),
+                        offset: valid_len.saturating_sub(line.len()) as u64,
+                        length: line.len() as u64,
+                    });
             }
         }
         if invalid_tail {

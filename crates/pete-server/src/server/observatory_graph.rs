@@ -445,10 +445,11 @@ async fn get_observatory_provenance(
 ) -> Result<Json<ProvenanceGraphResponse>, ObservatoryHttpError> {
     let history = state
         .observatory()
-        .query(&BrainEventQuery {
+        .query_async(BrainEventQuery {
             limit: Some(MAX_OBSERVATORY_QUERY_LIMIT),
             ..BrainEventQuery::default()
         })
+        .await
         .map_err(|error| ObservatoryHttpError::bad_request(error.to_string()))?;
     let events: Vec<BrainEvent> = history
         .records

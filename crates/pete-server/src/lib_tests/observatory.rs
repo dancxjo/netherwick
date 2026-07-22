@@ -104,6 +104,65 @@ async fn durable_critical_history_survives_restart_and_deduplicates_event_identi
 }
 
 #[tokio::test]
+async fn durable_query_reads_only_the_bounded_index_page_it_returns() {
+    use std::io::{Seek, Write};
+
+    let (directory, durability) = durable_test_config("indexed-page");
+    let config = BrainEventHubConfig {
+        ingress_capacity: 16,
+        history_capacity: 1,
+        ..Default::default()
+    };
+    let hub = BrainEventHub::new_with_durability(config, durability.clone()).unwrap();
+    assert!(hub.start());
+    for id in 1..=3 {
+        hub.publish(observatory_event(
+            id,
+            BrainEventType::Command,
+            LossPolicy::LossIntolerant,
+        ))
+        .unwrap();
+    }
+    wait_for_durable_sequence(&hub, 3).await;
+    hub.shutdown().await;
+
+    let restarted = BrainEventHub::new_with_durability(config, durability.clone()).unwrap();
+    assert!(durable_index_path(&durability).is_file());
+    let bytes = fs::read(&durability.path).unwrap();
+    let first_line_end = bytes.iter().position(|byte| *byte == b'\n').unwrap();
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(&durability.path)
+        .unwrap();
+    file.seek(std::io::SeekFrom::Start((first_line_end + 1) as u64))
+        .unwrap();
+    file.write_all(b"!").unwrap();
+    file.flush().unwrap();
+
+    let first_page = restarted
+        .query(&BrainEventQuery {
+            limit: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(matches!(
+        first_page.records.as_slice(),
+        [BrainEventStreamRecord::Event { envelope }] if envelope.sequence == 1
+    ));
+    let error = restarted
+        .query(&BrainEventQuery {
+            after_sequence: Some(1),
+            limit: Some(1),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("indexed event"));
+
+    restarted.shutdown().await;
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
 async fn durable_recovery_repairs_a_truncated_tail_and_declares_the_gap() {
     use std::io::Write;
 
@@ -252,7 +311,7 @@ async fn diagnostic_export_query_merges_live_and_durable_history_without_duplica
         .unwrap();
     }
     wait_for_durable_sequence(&hub, 5).await;
-    let (events, gaps, partial) = diagnostic_query_events(&hub, 0, 100).unwrap();
+    let (events, gaps, partial) = diagnostic_query_events(&hub, 0, 100).await.unwrap();
     assert_eq!(
         events
             .iter()
