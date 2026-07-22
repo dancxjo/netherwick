@@ -271,32 +271,24 @@ async fn server_forwards_runtime_boundary_events_without_reconstructing_causalit
 }
 
 #[tokio::test]
-async fn scene_calibration_updates_publish_first_class_epoch_transitions() {
+async fn scene_snapshot_updates_never_reconstruct_calibration_transitions() {
     let state = LiveViewState::new();
     assert!(state.observatory().start());
     state.update_scene_metadata(LiveSceneMetadata {
         sensor_calibration: Some(SceneSensorCalibration::sim_default()),
         ..LiveSceneMetadata::default()
     });
-    wait_for_observatory_sequence(&state.observatory(), 1).await;
-
     let response = state
         .observatory()
         .query(&BrainEventQuery::default())
         .unwrap();
-    let event = response
+    assert!(response
         .records
         .iter()
-        .find_map(|record| match record {
+        .all(|record| match record {
             BrainEventStreamRecord::Event { envelope }
-                if envelope.event.event_type == BrainEventType::CalibrationTransition =>
-            {
-                Some(&envelope.event)
-            }
-            _ => None,
-        })
-        .unwrap();
-    assert_eq!(event.calibration_epochs.len(), 1);
-    assert_eq!(event.artifacts[0].kind, ArtifactKind::Calibration);
+                if envelope.event.event_type == BrainEventType::CalibrationTransition => false,
+            _ => true,
+        }));
     state.observatory().shutdown().await;
 }

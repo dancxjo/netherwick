@@ -21,7 +21,6 @@ pub struct LiveViewState {
     observatory: BrainEventHub,
     observatory_now: Arc<Mutex<VecDeque<ObservatoryNowSnapshot>>>,
     observatory_snapshot_sequence: Arc<AtomicU64>,
-    observatory_calibration_epoch: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -59,7 +58,6 @@ impl Default for LiveViewState {
             observatory: BrainEventHub::new(BrainEventHubConfig::default()),
             observatory_now: Arc::new(Mutex::new(VecDeque::new())),
             observatory_snapshot_sequence: Arc::new(AtomicU64::new(0)),
-            observatory_calibration_epoch: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -344,43 +342,6 @@ impl LiveViewState {
     }
 
     pub fn update_scene_metadata(&self, metadata: LiveSceneMetadata) {
-        if let Some(calibration) = metadata.sensor_calibration {
-            let payload = serde_json::to_value(calibration).unwrap_or(serde_json::Value::Null);
-            let encoded = serde_json::to_vec(&payload).unwrap_or_default();
-            let checksum = format!("sha256:{:x}", Sha256::digest(&encoded));
-            let epoch = format!("scene-depth:{checksum}");
-            let changed = self
-                .observatory_calibration_epoch
-                .lock()
-                .map(|mut prior| {
-                    if prior.as_deref() == Some(epoch.as_str()) {
-                        false
-                    } else {
-                        *prior = Some(epoch.clone());
-                        true
-                    }
-                })
-                .unwrap_or(false);
-            if changed {
-                let t_ms = wall_now_ms();
-                let mut event = BrainEvent::historical(
-                    BrainEventId::from_domain("calibration-transition", format!("{epoch}:{t_ms}")),
-                    BrainEventType::CalibrationTransition,
-                    ProducerIdentity::new(Brain::Motherbrain, "scene.calibration"),
-                    EventTimes::observed(t_ms, t_ms),
-                );
-                event.kind = "calibration.scene_depth".into();
-                event.calibration_epochs.push(epoch.clone());
-                event.artifacts.push(ArtifactIdentity {
-                    kind: ArtifactKind::Calibration,
-                    id: epoch,
-                    version: None,
-                    checksum: Some(checksum),
-                });
-                event.payload = BrainEventPayload::inline(payload);
-                let _ = self.publish_brain_event(event);
-            }
-        }
         *self
             .scene_metadata
             .lock()

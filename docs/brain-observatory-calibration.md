@@ -25,3 +25,20 @@ cover mount transform parameters, gyro bias/noise, latency distribution,
 wheel scales, CW/CCW rotation scale, wheelbase, and confidence. Lidar is
 identified as optional corroboration: missing lidar is visible but is not an
 independent trust requirement.
+
+## Canonical transition ownership
+
+Calibration history is authored where the decision is made, never by comparing
+Observatory snapshots. The Kinect transform state machine, IMU mounting/bias
+estimator, locomotion distance/rotation estimator, and each latency estimator
+emit a loss-intolerant transition only for an accepted or rejected candidate,
+degradation, invalidation/remount, rollback, or newly trusted state. Periodic
+state projection with no decision or trust change remains silent.
+
+Each transition retains the complete prior/new calibration view, epoch,
+per-degree observability and uncertainty, evidence window, supporting evidence
+event and artifact checksums, candidate/prior/accepted artifact identities,
+consumer impact, reason, and occurred/observed clock domains. Runtime converts
+the estimator-authored records into canonical `BrainEvent` evidence and
+transition envelopes; `pete-server` only retains and serves them. Replay applies
+the same records in order to reconstruct the identical epoch/trust sequence.

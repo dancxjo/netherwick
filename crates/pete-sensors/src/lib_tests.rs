@@ -16,6 +16,7 @@ fn trustworthy_imu(source: &str, captured_at_ms: u64, source_epoch: u64) -> ImuS
         gyro_bias_calibrated: true,
         mounting_calibrated: true,
         calibration: None,
+        calibration_transitions: Vec::new(),
         orientation_source: Some(format!("{source}@{source_epoch}:accel_gyro_roll_pitch")),
     }
 }

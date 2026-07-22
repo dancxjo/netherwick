@@ -310,6 +310,56 @@ fn safety_authority_and_calibration_events_cannot_be_coalesced() {
 }
 
 #[test]
+fn estimator_authored_calibration_transition_preserves_evidence_provenance_and_artifacts() {
+    let mut estimator = pete_now::CalibrationStateMachine::new(
+        pete_now::RigidTransform3::default(),
+        0,
+        pete_now::CalibrationStateConfig {
+            minimum_evidence_per_dof: 1,
+            minimum_independent_sources: 1,
+            minimum_trust_span_ms: 0,
+            ..pete_now::CalibrationStateConfig::default()
+        },
+    );
+    estimator.observe(
+        pete_now::TransformEstimateEvidence {
+            source: pete_now::CalibrationEvidenceSource::FloorPlane,
+            captured_at_ms: 10,
+            transform: pete_now::RigidTransform3 {
+                translation_m: [0.0, 0.0, 0.4],
+                ..pete_now::RigidTransform3::default()
+            },
+            observable_dofs: [false, false, true, true, true, false],
+            covariance: [0.001; pete_now::TRANSFORM_DOF_COUNT],
+            residuals: pete_now::CalibrationResiduals::default(),
+        },
+        12,
+    );
+    let transition = estimator.take_transitions().pop().unwrap();
+    let events = BrainEvent::from_calibration_transition(&transition);
+    assert_eq!(events.len(), 2);
+    let evidence = &events[0];
+    let canonical = &events[1];
+    assert_eq!(evidence.event_type, BrainEventType::Evidence);
+    assert_eq!(canonical.event_type, BrainEventType::CalibrationTransition);
+    assert_eq!(canonical.links.supports.len(), 1);
+    assert_eq!(canonical.links.supports[0].event_id, evidence.event_id);
+    assert_eq!(evidence.artifacts[0].kind, ArtifactKind::Calibration);
+    assert_eq!(canonical.artifacts.len(), 3);
+    assert!(canonical
+        .artifacts
+        .iter()
+        .all(|artifact| artifact.checksum.is_some()));
+    assert_ne!(
+        canonical.times.occurred.clock_epoch,
+        canonical.times.observed.clock_epoch
+    );
+    for event in events {
+        event.validate().unwrap();
+    }
+}
+
+#[test]
 fn live_and_replay_now_adaptation_is_identical_and_marks_projection() {
     let now = Now::blank(777, BodySense::default());
     let live =

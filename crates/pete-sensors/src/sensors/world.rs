@@ -20,6 +20,8 @@ pub struct WorldSnapshot {
     pub latency_calibration: BTreeMap<String, pete_now::StreamLatencyCalibration>,
     #[serde(default)]
     pub locomotion_calibration: pete_now::LocomotionCalibrationState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calibration_transitions: Vec<pete_now::CalibrationTransition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub power_assessment: Option<serde_json::Value>,
     pub extensions: Vec<ExtensionSense>,
@@ -69,6 +71,7 @@ impl Default for WorldSnapshot {
             },
             latency_calibration: BTreeMap::new(),
             locomotion_calibration: pete_now::LocomotionCalibrationState::default(),
+            calibration_transitions: Vec::new(),
             power_assessment: None,
             extensions: Vec::new(),
         }
@@ -88,6 +91,7 @@ impl WorldSnapshot {
         now.gps = self.gps.clone();
         now.kinect = self.kinect.clone();
         now.objects = self.objects.clone();
+        now.calibration_transitions = self.calibration_transitions.clone();
         if !self.latency_calibration.is_empty() {
             now.extensions.insert(
                 "sensor.latency_calibration".to_string(),

@@ -1,5 +1,10 @@
-use crate::{CalibrationEpoch, RigidTransform3};
+use crate::calibration_transition::{consumer_impacts, CalibrationDofState};
+use crate::{
+    calibration_state, CalibrationClockedTime, CalibrationEpoch, CalibrationEvidenceWindow,
+    CalibrationTransition, CalibrationTransitionKind, CalibrationTransitionState, RigidTransform3,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -122,6 +127,8 @@ pub struct ImuCalibrationEstimator {
     gravity: RunningVectorStats,
     temperature_bias_anchor: Option<([f32; 3], f32)>,
     state: ImuCalibrationState,
+    transitions: Vec<CalibrationTransition>,
+    transition_sequence: u64,
 }
 
 impl ImuCalibrationEstimator {
@@ -166,12 +173,18 @@ impl ImuCalibrationEstimator {
                 updated_at_ms: started_at_ms,
                 rejection_reasons: vec!["stationary warm-up is incomplete".to_string()],
             },
+            transitions: Vec::new(),
+            transition_sequence: 0,
             config,
         }
     }
 
     pub fn state(&self) -> &ImuCalibrationState {
         &self.state
+    }
+
+    pub fn take_transitions(&mut self) -> Vec<CalibrationTransition> {
+        std::mem::take(&mut self.transitions)
     }
 
     pub fn observe(
@@ -182,6 +195,13 @@ impl ImuCalibrationEstimator {
         motion: ImuMotionContext,
         captured_at_ms: u64,
     ) -> &ImuCalibrationState {
+        let prior = self.state.clone();
+        let evidence_payload = json!({
+            "acceleration_g": acceleration_g,
+            "angular_velocity_rad_s": angular_velocity_rad_s,
+            "temperature_c": temperature_c,
+            "motion": motion,
+        });
         self.state.total_samples = self.state.total_samples.saturating_add(1);
         self.state.updated_at_ms = captured_at_ms;
         self.state.warmup_elapsed_ms =
@@ -201,9 +221,14 @@ impl ImuCalibrationEstimator {
         }
         if inertial_candidate && motion.confidently_stationary() {
             if self.detect_remount(acceleration_g, angular_velocity_rad_s) {
-                self.invalidate(
+                let reason = "gravity or stationary bias changed abruptly";
+                self.invalidate(captured_at_ms, reason);
+                self.record_transition(
+                    &prior,
+                    CalibrationTransitionKind::Remounted,
+                    evidence_payload,
                     captured_at_ms,
-                    "gravity or stationary bias changed abruptly",
+                    Some(reason.to_string()),
                 );
                 return &self.state;
             }
@@ -214,9 +239,32 @@ impl ImuCalibrationEstimator {
         } else if inertial_candidate {
             self.state.rejected_motion_samples =
                 self.state.rejected_motion_samples.saturating_add(1);
+            self.refresh_trust();
+            self.record_transition(
+                &prior,
+                CalibrationTransitionKind::Rejected,
+                evidence_payload,
+                captured_at_ms,
+                Some("stationary-looking IMU sample contradicted robot motion evidence".into()),
+            );
+            return &self.state;
         }
         self.observe_rotation(angular_velocity_rad_s, motion);
         self.refresh_trust();
+        let kind = match (prior.trust_state, self.state.trust_state) {
+            (_, ImuCalibrationTrustState::Trusted)
+                if prior.trust_state != ImuCalibrationTrustState::Trusted =>
+            {
+                CalibrationTransitionKind::NewlyTrusted
+            }
+            (_, ImuCalibrationTrustState::Degraded)
+                if prior.trust_state != ImuCalibrationTrustState::Degraded =>
+            {
+                CalibrationTransitionKind::Degraded
+            }
+            _ => CalibrationTransitionKind::Accepted,
+        };
+        self.record_transition(&prior, kind, evidence_payload, captured_at_ms, None);
         &self.state
     }
 
@@ -424,6 +472,142 @@ impl ImuCalibrationEstimator {
                 .push("yaw mounting remains unobservable without rotation evidence".to_string());
         }
     }
+
+    fn record_transition(
+        &mut self,
+        prior: &ImuCalibrationState,
+        kind: CalibrationTransitionKind,
+        evidence_payload: Value,
+        captured_at_ms: u64,
+        reason: Option<String>,
+    ) {
+        let prior_state = imu_transition_state(prior, &self.config);
+        let new_state = imu_transition_state(&self.state, &self.config);
+        let calibration_changed = prior_state != new_state;
+        if !calibration_changed && kind != CalibrationTransitionKind::Rejected {
+            return;
+        }
+        self.transition_sequence = self.transition_sequence.saturating_add(1);
+        let allowed_before = prior.trust_state == ImuCalibrationTrustState::Trusted;
+        let allowed_after = self.state.trust_state == ImuCalibrationTrustState::Trusted;
+        let occurred = CalibrationClockedTime::new(captured_at_ms, "imu:0");
+        self.transitions.push(CalibrationTransition::author(
+            "imu.mounting_and_gyro_bias",
+            self.state.epoch.id,
+            self.transition_sequence,
+            kind,
+            prior_state,
+            new_state,
+            "imu.sample",
+            evidence_payload,
+            CalibrationEvidenceWindow {
+                started_at: CalibrationClockedTime::new(self.state.epoch.started_at_ms, "imu:0"),
+                ended_at: occurred.clone(),
+                sample_count: self
+                    .state
+                    .stationary_samples
+                    .saturating_add(self.state.rotation_evidence_samples),
+            },
+            consumer_impacts(
+                &["fusion.imu_alignment", "navigation.imu_orientation"],
+                allowed_before,
+                allowed_after,
+                "trusted mounting, gyro bias, and observable yaw scale are required",
+            ),
+            reason,
+            occurred.clone(),
+            occurred,
+        ));
+    }
+}
+
+fn imu_transition_state(
+    state: &ImuCalibrationState,
+    config: &ImuCalibrationConfig,
+) -> CalibrationTransitionState {
+    let bias_observable = state.stationary_samples >= config.minimum_stationary_samples;
+    let values = [
+        (
+            "gyro_bias_x",
+            state.gyro_bias_rad_s[0],
+            bias_observable,
+            state.gyro_variance[0],
+        ),
+        (
+            "gyro_bias_y",
+            state.gyro_bias_rad_s[1],
+            bias_observable,
+            state.gyro_variance[1],
+        ),
+        (
+            "gyro_bias_z",
+            state.gyro_bias_rad_s[2],
+            bias_observable,
+            state.gyro_variance[2],
+        ),
+        (
+            "mount_roll",
+            state.sensor_to_base.rotation_rpy_rad[0],
+            state.roll_pitch_observable,
+            state.gravity_variance[0],
+        ),
+        (
+            "mount_pitch",
+            state.sensor_to_base.rotation_rpy_rad[1],
+            state.roll_pitch_observable,
+            state.gravity_variance[1],
+        ),
+        (
+            "mount_yaw",
+            state.sensor_to_base.rotation_rpy_rad[2],
+            state.yaw_axis_observable,
+            state.gravity_variance[2],
+        ),
+    ];
+    let mut dofs = values
+        .into_iter()
+        .map(|(name, value, observable, uncertainty)| {
+            (
+                name.to_string(),
+                CalibrationDofState {
+                    value: json!(value),
+                    observable,
+                    uncertainty: uncertainty.is_finite().then_some(uncertainty),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    dofs.push((
+        "yaw_rate_scale".to_string(),
+        CalibrationDofState {
+            value: serde_json::to_value(state.yaw_rate_scale).unwrap_or(Value::Null),
+            observable: state.yaw_axis_observable,
+            uncertainty: None,
+        },
+    ));
+    calibration_state(
+        match state.trust_state {
+            ImuCalibrationTrustState::WarmingUp => "warming_up",
+            ImuCalibrationTrustState::Estimating => "estimating",
+            ImuCalibrationTrustState::Trusted => "trusted",
+            ImuCalibrationTrustState::Degraded => "degraded",
+            ImuCalibrationTrustState::Invalidated => "invalidated",
+        }
+        .to_owned(),
+        state.confidence,
+        json!({
+            "epoch": state.epoch,
+            "sensor_to_base": state.sensor_to_base,
+            "gyro_bias_rad_s": state.gyro_bias_rad_s,
+            "gyro_variance": state.gyro_variance.map(|value| value.is_finite().then_some(value)),
+            "gravity_unit": state.gravity_unit,
+            "gravity_variance": state.gravity_variance.map(|value| value.is_finite().then_some(value)),
+            "yaw_rate_scale": state.yaw_rate_scale,
+            "bias_temperature_slope_rad_s_per_c": state.bias_temperature_slope_rad_s_per_c,
+            "rejection_reasons": state.rejection_reasons,
+        }),
+        dofs,
+    )
 }
 
 fn norm(vector: [f32; 3]) -> f32 {

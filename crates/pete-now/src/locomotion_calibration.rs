@@ -1,4 +1,10 @@
+use crate::calibration_transition::{consumer_impacts, CalibrationDofState};
+use crate::{
+    calibration_state, CalibrationClockedTime, CalibrationEvidenceWindow, CalibrationTransition,
+    CalibrationTransitionKind, CalibrationTransitionState,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -184,6 +190,8 @@ impl Default for LocomotionCalibrationConfig {
 pub struct LocomotionCalibrationEstimator {
     pub config: LocomotionCalibrationConfig,
     state: LocomotionCalibrationState,
+    transitions: Vec<CalibrationTransition>,
+    transition_sequence: u64,
 }
 
 impl LocomotionCalibrationEstimator {
@@ -191,15 +199,43 @@ impl LocomotionCalibrationEstimator {
         &self.state
     }
 
+    pub fn take_transitions(&mut self) -> Vec<CalibrationTransition> {
+        std::mem::take(&mut self.transitions)
+    }
+
     pub fn observe_straight(&mut self, episode: StraightCalibrationEpisode) -> bool {
+        let prior = self.state.clone();
         push_recent(&mut self.state.recent_straight_episodes, episode.clone());
         if let Some(reason) = self.reject_straight(&episode) {
             self.state.rejected_straight_count =
                 self.state.rejected_straight_count.saturating_add(1);
-            self.degrade(reason);
+            self.degrade(reason.clone());
+            self.record_transition(
+                "locomotion",
+                &prior,
+                CalibrationTransitionKind::Rejected,
+                serde_json::to_value(&episode).unwrap_or(Value::Null),
+                episode.captured_at_ms,
+                Some(reason),
+            );
             return false;
         }
-        self.update_conditions(&episode.conditions, episode.captured_at_ms);
+        let mut prior_for_accept = prior;
+        if self.update_conditions(&episode.conditions, episode.captured_at_ms) {
+            let rolled_back = self.state.clone();
+            self.record_transition(
+                "locomotion",
+                &prior_for_accept,
+                CalibrationTransitionKind::RolledBack,
+                serde_json::to_value(&episode).unwrap_or(Value::Null),
+                episode.captured_at_ms,
+                Some(
+                    "surface or tire conditions changed; accepted calibration was rolled back"
+                        .into(),
+                ),
+            );
+            prior_for_accept = rolled_back;
+        }
         let ratio = episode.actual_distance_m.abs() / episode.reported_distance_m.abs();
         update_estimate(
             &mut self.state.global_distance_scale,
@@ -229,20 +265,62 @@ impl LocomotionCalibrationEstimator {
             (self.state.left_distance_scale.value - self.state.right_distance_scale.value).abs()
                 <= 0.12;
         self.refresh_trust();
+        let kind = locomotion_transition_kind(prior_for_accept.trust_state, self.state.trust_state);
+        self.record_transition(
+            "locomotion",
+            &prior_for_accept,
+            kind,
+            serde_json::to_value(&episode).unwrap_or(Value::Null),
+            episode.captured_at_ms,
+            None,
+        );
         true
     }
 
     pub fn observe_rotation(&mut self, episode: RotationCalibrationEpisode) -> bool {
+        let prior = self.state.clone();
         push_recent(&mut self.state.recent_rotation_episodes, episode.clone());
         let Some(reference_angle) = fused_rotation_reference(&episode) else {
-            self.reject_rotation("rotation has no trusted external angle reference");
+            let reason = "rotation has no trusted external angle reference";
+            self.reject_rotation(reason);
+            self.record_transition(
+                "locomotion",
+                &prior,
+                CalibrationTransitionKind::Rejected,
+                serde_json::to_value(&episode).unwrap_or(Value::Null),
+                episode.captured_at_ms,
+                Some(reason.into()),
+            );
             return false;
         };
         if let Some(reason) = self.reject_rotation_episode(&episode, reference_angle) {
             self.reject_rotation(&reason);
+            self.record_transition(
+                "locomotion",
+                &prior,
+                CalibrationTransitionKind::Rejected,
+                serde_json::to_value(&episode).unwrap_or(Value::Null),
+                episode.captured_at_ms,
+                Some(reason),
+            );
             return false;
         }
-        self.update_conditions(&episode.conditions, episode.captured_at_ms);
+        let mut prior_for_accept = prior;
+        if self.update_conditions(&episode.conditions, episode.captured_at_ms) {
+            let rolled_back = self.state.clone();
+            self.record_transition(
+                "locomotion",
+                &prior_for_accept,
+                CalibrationTransitionKind::RolledBack,
+                serde_json::to_value(&episode).unwrap_or(Value::Null),
+                episode.captured_at_ms,
+                Some(
+                    "surface or tire conditions changed; accepted calibration was rolled back"
+                        .into(),
+                ),
+            );
+            prior_for_accept = rolled_back;
+        }
         let ratio = reference_angle.abs() / episode.wheel_odometry_angle_rad.abs();
         let estimate = match episode.direction {
             RotationDirection::CounterClockwise => &mut self.state.counter_clockwise_rotation_scale,
@@ -257,6 +335,15 @@ impl LocomotionCalibrationEstimator {
         );
         self.state.rotation_evidence_count = self.state.rotation_evidence_count.saturating_add(1);
         self.refresh_trust();
+        let kind = locomotion_transition_kind(prior_for_accept.trust_state, self.state.trust_state);
+        self.record_transition(
+            "locomotion",
+            &prior_for_accept,
+            kind,
+            serde_json::to_value(&episode).unwrap_or(Value::Null),
+            episode.captured_at_ms,
+            None,
+        );
         true
     }
 
@@ -369,7 +456,7 @@ impl LocomotionCalibrationEstimator {
         }
     }
 
-    fn update_conditions(&mut self, conditions: &LocomotionConditions, timestamp_ms: u64) {
+    fn update_conditions(&mut self, conditions: &LocomotionConditions, timestamp_ms: u64) -> bool {
         if self.state.conditions != *conditions
             && (self.state.conditions.surface.is_some()
                 || self.state.conditions.tire_condition.is_some())
@@ -385,9 +472,10 @@ impl LocomotionCalibrationEstimator {
                 ],
                 ..LocomotionCalibrationState::default()
             };
-            return;
+            return true;
         }
         self.state.conditions = conditions.clone();
+        false
     }
 
     fn refresh_trust(&mut self) {
@@ -420,6 +508,142 @@ impl LocomotionCalibrationEstimator {
                 .push("left/right estimates conflict with straight-line validation".to_string());
         }
     }
+
+    fn record_transition(
+        &mut self,
+        estimator: &str,
+        prior: &LocomotionCalibrationState,
+        kind: CalibrationTransitionKind,
+        evidence_payload: Value,
+        captured_at_ms: u64,
+        reason: Option<String>,
+    ) {
+        let prior_state = locomotion_transition_state(prior);
+        let new_state = locomotion_transition_state(&self.state);
+        if prior_state == new_state && kind != CalibrationTransitionKind::Rejected {
+            return;
+        }
+        self.transition_sequence = self.transition_sequence.saturating_add(1);
+        let allowed_before = prior.trust_state == LocomotionCalibrationTrustState::Trusted;
+        let allowed_after = self.state.trust_state == LocomotionCalibrationTrustState::Trusted;
+        let occurred = CalibrationClockedTime::new(captured_at_ms, "motherbrain:0");
+        let is_rotation = evidence_payload.get("wheel_odometry_angle_rad").is_some();
+        self.transitions.push(CalibrationTransition::author(
+            estimator,
+            self.state.epoch,
+            self.transition_sequence,
+            kind,
+            prior_state,
+            new_state,
+            if is_rotation { "rotation_episode" } else { "straight_episode" },
+            evidence_payload,
+            CalibrationEvidenceWindow {
+                started_at: CalibrationClockedTime::new(self.state.epoch_started_at_ms, "motherbrain:0"),
+                ended_at: occurred.clone(),
+                sample_count: self
+                    .state
+                    .straight_evidence_count
+                    .saturating_add(self.state.rotation_evidence_count),
+            },
+            consumer_impacts(
+                &[if is_rotation {
+                    "locomotion.advisory_rotation_model"
+                } else {
+                    "locomotion.advisory_distance_model"
+                }],
+                allowed_before,
+                allowed_after,
+                "learned locomotion calibration remains advisory and requires trusted held-out evidence",
+            ),
+            reason,
+            occurred.clone(),
+            occurred,
+        ));
+    }
+}
+
+fn locomotion_transition_kind(
+    prior: LocomotionCalibrationTrustState,
+    new: LocomotionCalibrationTrustState,
+) -> CalibrationTransitionKind {
+    match (prior, new) {
+        (_, LocomotionCalibrationTrustState::Trusted)
+            if prior != LocomotionCalibrationTrustState::Trusted =>
+        {
+            CalibrationTransitionKind::NewlyTrusted
+        }
+        (_, LocomotionCalibrationTrustState::Degraded)
+            if prior != LocomotionCalibrationTrustState::Degraded =>
+        {
+            CalibrationTransitionKind::Degraded
+        }
+        _ => CalibrationTransitionKind::Accepted,
+    }
+}
+
+fn locomotion_transition_state(state: &LocomotionCalibrationState) -> CalibrationTransitionState {
+    let observable_distance = state.straight_evidence_count > 0;
+    let observable_rotation = state.rotation_evidence_count > 0;
+    let values = [
+        (
+            "global_distance_scale",
+            state.global_distance_scale,
+            observable_distance,
+        ),
+        (
+            "left_distance_scale",
+            state.left_distance_scale,
+            observable_distance,
+        ),
+        (
+            "right_distance_scale",
+            state.right_distance_scale,
+            observable_distance,
+        ),
+        (
+            "forward_distance_ratio",
+            state.forward_distance_ratio,
+            observable_distance,
+        ),
+        (
+            "reverse_distance_ratio",
+            state.reverse_distance_ratio,
+            observable_distance,
+        ),
+        (
+            "counter_clockwise_rotation_scale",
+            state.counter_clockwise_rotation_scale,
+            observable_rotation,
+        ),
+        (
+            "clockwise_rotation_scale",
+            state.clockwise_rotation_scale,
+            observable_rotation,
+        ),
+        (
+            "effective_wheelbase_m",
+            state.effective_wheelbase_m,
+            observable_rotation,
+        ),
+    ];
+    calibration_state(
+        format!("{:?}", state.trust_state).to_lowercase(),
+        state.confidence,
+        serde_json::to_value(state).unwrap_or(Value::Null),
+        values.into_iter().map(|(name, estimate, observable)| {
+            (
+                name.to_string(),
+                CalibrationDofState {
+                    value: json!(estimate.value),
+                    observable,
+                    uncertainty: estimate
+                        .uncertainty
+                        .is_finite()
+                        .then_some(estimate.uncertainty),
+                },
+            )
+        }),
+    )
 }
 
 fn fused_rotation_reference(episode: &RotationCalibrationEpisode) -> Option<f32> {

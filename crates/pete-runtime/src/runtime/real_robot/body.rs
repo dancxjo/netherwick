@@ -445,6 +445,7 @@ fn brainstem_imu_sense(
         gyro_bias_calibrated,
         mounting_calibrated,
         calibration: None,
+        calibration_transitions: Vec::new(),
         orientation_source: Some(format!(
             "{source_id}@{}:{orientation_source}",
             source_epoch

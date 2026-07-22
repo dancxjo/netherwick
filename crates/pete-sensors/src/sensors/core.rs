@@ -292,6 +292,7 @@ impl NowBuilder {
         mut body: BodySense,
         packets: Vec<SensePacket>,
     ) -> Result<Now> {
+        self.last_snapshot.calibration_transitions.clear();
         let body_sample_ms = if body.last_update_ms == 0 {
             t_ms
         } else {
@@ -386,6 +387,9 @@ impl NowBuilder {
                     saw_range_packet = true;
                 }
                 SensePacket::Imu(imu) => {
+                    self.last_snapshot
+                        .calibration_transitions
+                        .extend(imu.calibration_transitions.iter().cloned());
                     let source_epoch = imu.source_epoch();
                     let source_name = imu.source_id().unwrap_or("imu").to_string();
                     let event_features = rotation_event_features(
@@ -417,6 +421,9 @@ impl NowBuilder {
                     self.last_updates.gps = Some(t_ms);
                 }
                 SensePacket::Kinect(kinect) => {
+                    self.last_snapshot
+                        .calibration_transitions
+                        .extend(kinect.calibration_transitions.iter().cloned());
                     observe_packet_timing(
                         &mut self.latency_calibration,
                         "kinect",
@@ -463,6 +470,12 @@ impl NowBuilder {
         }
 
         let latency_calibration = self.latency_calibration.snapshot(t_ms);
+        self.last_snapshot
+            .calibration_transitions
+            .extend(self.latency_calibration.take_transitions());
+        self.last_snapshot
+            .calibration_transitions
+            .extend(self.locomotion_calibration.take_transitions());
         self.last_snapshot.latency_calibration = latency_calibration.clone();
         self.last_snapshot.locomotion_calibration = self.locomotion_calibration.state().clone();
         if self.last_snapshot.kinect.captured_at_ms > 0 {
@@ -1276,6 +1289,9 @@ impl FrameProcessor {
             } else {
                 state.refresh(t_ms);
             }
+            kinect
+                .calibration_transitions
+                .extend(state.take_transitions());
         }
         kinect.live_geometry_calibration = self
             .kinect_calibration

@@ -6,6 +6,13 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Ready: Author canonical loss-intolerant calibration transitions at the Kinect,
+  IMU, locomotion, and per-stream latency estimator boundaries, preserving
+  prior/new state, epochs, per-degree observability and uncertainty, evidence
+  and artifact provenance, affected consumers, reasons, and clock domains;
+  replay now reconstructs identical epoch/trust transitions and the server no
+  longer infers calibration events from snapshots. Lidar remains optional.
+
 - Ready: Add a new versioned `pete-events::BrainEvent` observability contract with
   typed event identity, causality, quality, trust, authority, loss policy, and
   payload/reference boundaries; include migration support from legacy v0 input and a

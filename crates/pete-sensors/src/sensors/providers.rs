@@ -504,6 +504,7 @@ impl Mpu6050OrientationFilter {
             motion,
             sense.captured_at_ms,
         );
+        let calibration_transitions = self.calibration.take_transitions();
         let calibration = self.calibration.state().clone();
         let acceleration = self.calibration.acceleration_in_base(raw_acceleration);
         let mut angular_velocity = self.calibration.corrected_gyro(raw_angular_velocity);
@@ -574,6 +575,7 @@ impl Mpu6050OrientationFilter {
             calibration.epoch.id
         ));
         sense.calibration = Some(calibration);
+        sense.calibration_transitions = calibration_transitions;
         sense
     }
 }

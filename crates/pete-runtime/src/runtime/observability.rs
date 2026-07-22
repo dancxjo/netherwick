@@ -4,6 +4,13 @@ fn frame_domain_brain_events(frame: &ExperienceFrame) -> Vec<BrainEvent> {
     events.extend(frame.sensations.iter().map(BrainEvent::from));
     events.extend(frame.impressions.iter().map(BrainEvent::from));
     events.extend(frame.experiences.iter().map(BrainEvent::from));
+    events.extend(
+        frame
+            .now
+            .calibration_transitions
+            .iter()
+            .flat_map(BrainEvent::from_calibration_transition),
+    );
     let mut seen_ids = HashSet::new();
     events.retain(|event| seen_ids.insert(event.event_id.clone()));
     for event in &mut events {

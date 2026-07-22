@@ -1,5 +1,10 @@
-use crate::RigidTransform3;
+use crate::calibration_transition::{consumer_impacts, CalibrationDofState};
+use crate::{
+    calibration_state, CalibrationClockedTime, CalibrationEvidenceWindow, CalibrationTransition,
+    CalibrationTransitionKind, CalibrationTransitionState, RigidTransform3,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const TRANSFORM_DOF_COUNT: usize = 6;
@@ -157,6 +162,8 @@ pub struct CalibrationStateMachine {
     pub config: CalibrationStateConfig,
     estimate: LiveCalibrationEstimate,
     dof_covariance_sources: [BTreeSet<CalibrationEvidenceSource>; TRANSFORM_DOF_COUNT],
+    transitions: Vec<CalibrationTransition>,
+    transition_sequence: u64,
 }
 
 impl CalibrationStateMachine {
@@ -187,6 +194,8 @@ impl CalibrationStateMachine {
                 rejection_reasons: vec!["configured transform is only an initial guess".to_string()],
             },
             dof_covariance_sources: std::array::from_fn(|_| BTreeSet::new()),
+            transitions: Vec::new(),
+            transition_sequence: 0,
             config,
         }
     }
@@ -195,20 +204,39 @@ impl CalibrationStateMachine {
         &self.estimate
     }
 
+    pub fn take_transitions(&mut self) -> Vec<CalibrationTransition> {
+        std::mem::take(&mut self.transitions)
+    }
+
     pub fn observe(
         &mut self,
         evidence: TransformEstimateEvidence,
         now_ms: u64,
     ) -> &LiveCalibrationEstimate {
+        let prior = self.estimate.clone();
         self.estimate.rejection_reasons.clear();
         if let Err(reason) = self.validate_evidence(&evidence, now_ms) {
             self.refresh_trust_state(now_ms);
-            self.estimate.rejection_reasons.insert(0, reason);
+            self.estimate.rejection_reasons.insert(0, reason.clone());
+            self.record_transition(
+                &prior,
+                CalibrationTransitionKind::Rejected,
+                &evidence,
+                now_ms,
+                Some(reason),
+            );
             return &self.estimate;
         }
         if self.shift_detection_ready(&evidence) {
             if let Some(reason) = self.shift_reason(&evidence) {
-                self.invalidate_epoch(&evidence, now_ms, reason);
+                self.invalidate_epoch(&evidence, now_ms, reason.clone());
+                self.record_transition(
+                    &prior,
+                    CalibrationTransitionKind::Remounted,
+                    &evidence,
+                    now_ms,
+                    Some(reason),
+                );
                 return &self.estimate;
             }
         }
@@ -230,15 +258,38 @@ impl CalibrationStateMachine {
             .or_default() += 1;
         self.estimate.residuals.merge(&evidence.residuals);
         self.refresh_trust_state(now_ms);
+        let kind = transition_kind(prior.trust_state, self.estimate.trust_state);
+        self.record_transition(&prior, kind, &evidence, now_ms, None);
         &self.estimate
     }
 
     pub fn refresh(&mut self, now_ms: u64) -> &LiveCalibrationEstimate {
+        let prior = self.estimate.clone();
         self.refresh_trust_state(now_ms);
+        if prior.trust_state != self.estimate.trust_state {
+            let evidence = TransformEstimateEvidence {
+                source: CalibrationEvidenceSource::MapConsistency,
+                captured_at_ms: now_ms,
+                transform: self.estimate.transform,
+                observable_dofs: [false; TRANSFORM_DOF_COUNT],
+                covariance: self.estimate.covariance,
+                residuals: self.estimate.residuals.clone(),
+            };
+            let kind = transition_kind(prior.trust_state, self.estimate.trust_state);
+            self.record_transition(
+                &prior,
+                kind,
+                &evidence,
+                now_ms,
+                self.estimate.rejection_reasons.first().cloned(),
+            );
+        }
         &self.estimate
     }
 
     pub fn invalidate(&mut self, now_ms: u64, reason: impl Into<String>) {
+        let prior = self.estimate.clone();
+        let reason = reason.into();
         let seed = TransformEstimateEvidence {
             source: CalibrationEvidenceSource::MapConsistency,
             captured_at_ms: now_ms,
@@ -247,7 +298,14 @@ impl CalibrationStateMachine {
             covariance: self.config.reset_covariance,
             residuals: CalibrationResiduals::default(),
         };
-        self.invalidate_epoch(&seed, now_ms, reason.into());
+        self.invalidate_epoch(&seed, now_ms, reason.clone());
+        self.record_transition(
+            &prior,
+            CalibrationTransitionKind::Invalidated,
+            &seed,
+            now_ms,
+            Some(reason),
+        );
     }
 
     fn validate_evidence(
@@ -525,6 +583,101 @@ impl CalibrationStateMachine {
                 .push("geometry residuals exceed trusted limits".to_string());
         }
     }
+
+    fn record_transition(
+        &mut self,
+        prior: &LiveCalibrationEstimate,
+        kind: CalibrationTransitionKind,
+        evidence: &TransformEstimateEvidence,
+        now_ms: u64,
+        reason: Option<String>,
+    ) {
+        let prior_state = transform_transition_state(prior);
+        let new_state = transform_transition_state(&self.estimate);
+        if prior_state == new_state && kind != CalibrationTransitionKind::Rejected {
+            return;
+        }
+        self.transition_sequence = self.transition_sequence.saturating_add(1);
+        let allowed_before = prior.trust_state == CalibrationTrustState::Trusted;
+        let allowed_after = self.estimate.trust_state == CalibrationTrustState::Trusted;
+        let occurred = CalibrationClockedTime::new(evidence.captured_at_ms, "sensor:0");
+        let observed = CalibrationClockedTime::new(now_ms, "motherbrain:0");
+        let evidence_started_at_ms = self
+            .estimate
+            .evidence_started_at_ms
+            .unwrap_or(evidence.captured_at_ms);
+        self.transitions.push(CalibrationTransition::author(
+            "kinect.extrinsics",
+            self.estimate.epoch.id,
+            self.transition_sequence,
+            kind,
+            prior_state,
+            new_state,
+            format!("{:?}", evidence.source).to_lowercase(),
+            serde_json::to_value(evidence).unwrap_or_else(|_| json!({"unavailable": true})),
+            CalibrationEvidenceWindow {
+                started_at: CalibrationClockedTime::new(evidence_started_at_ms, "sensor:0"),
+                ended_at: occurred.clone(),
+                sample_count: self
+                    .estimate
+                    .evidence_counts
+                    .values()
+                    .copied()
+                    .map(u64::from)
+                    .sum(),
+            },
+            consumer_impacts(
+                &[
+                    "map.3d_fusion",
+                    "navigation.geometry",
+                    "perception.depth_projection",
+                ],
+                allowed_before,
+                allowed_after,
+                "full calibrated Kinect extrinsics are required",
+            ),
+            reason,
+            occurred,
+            observed,
+        ));
+    }
+}
+
+fn transition_kind(
+    prior: CalibrationTrustState,
+    new: CalibrationTrustState,
+) -> CalibrationTransitionKind {
+    match (prior, new) {
+        (_, CalibrationTrustState::Trusted) if prior != CalibrationTrustState::Trusted => {
+            CalibrationTransitionKind::NewlyTrusted
+        }
+        (_, CalibrationTrustState::Degraded) if prior != CalibrationTrustState::Degraded => {
+            CalibrationTransitionKind::Degraded
+        }
+        _ => CalibrationTransitionKind::Accepted,
+    }
+}
+
+fn transform_transition_state(estimate: &LiveCalibrationEstimate) -> CalibrationTransitionState {
+    const NAMES: [&str; TRANSFORM_DOF_COUNT] = ["x", "y", "z", "roll", "pitch", "yaw"];
+    let values = transform_values(estimate.transform);
+    calibration_state(
+        format!("{:?}", estimate.trust_state).to_lowercase(),
+        estimate.confidence,
+        serde_json::to_value(estimate).unwrap_or(Value::Null),
+        NAMES.into_iter().enumerate().map(|(index, name)| {
+            (
+                name.to_string(),
+                CalibrationDofState {
+                    value: json!(values[index]),
+                    observable: estimate.observable_dofs[index],
+                    uncertainty: estimate.covariance[index]
+                        .is_finite()
+                        .then_some(estimate.covariance[index]),
+                },
+            )
+        }),
+    )
 }
 
 fn transform_values(transform: RigidTransform3) -> [f32; TRANSFORM_DOF_COUNT] {

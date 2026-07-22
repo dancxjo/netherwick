@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 pub mod beliefs;
 pub mod calibration;
+pub mod calibration_transition;
 pub mod depth_geometry;
 pub mod epistemic;
 pub mod imu_calibration;
@@ -34,6 +35,12 @@ pub use calibration::{
     CalibrationEpoch, CalibrationEvidenceSource, CalibrationResiduals, CalibrationStateConfig,
     CalibrationStateMachine, CalibrationTrustState, LiveCalibrationEstimate,
     TransformEstimateEvidence, TransformEstimator, TRANSFORM_DOF_COUNT,
+};
+pub use calibration_transition::{
+    calibration_state, CalibrationArtifactIdentity, CalibrationClockedTime,
+    CalibrationConsumerImpact, CalibrationDofState, CalibrationEvidenceRecord,
+    CalibrationEvidenceWindow, CalibrationReplay, CalibrationReplayError, CalibrationTransition,
+    CalibrationTransitionKind, CalibrationTransitionState,
 };
 pub use depth_geometry::{
     CameraIntrinsics, DepthCalibrationValidation, DepthGeometry, DepthGeometryCalibration,
@@ -756,6 +763,8 @@ pub struct ImuSense {
     pub mounting_calibrated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calibration: Option<ImuCalibrationState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calibration_transitions: Vec<CalibrationTransition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orientation_source: Option<String>,
 }
@@ -1099,6 +1108,8 @@ pub struct KinectSense {
     /// epoch, covariance, evidence, residual, and trust history per frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_geometry_calibration: Option<LiveCalibrationEstimate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calibration_transitions: Vec<CalibrationTransition>,
     #[serde(default)]
     pub min_depth_m: f32,
     #[serde(default)]
@@ -1170,6 +1181,11 @@ pub struct Now {
     pub reign: ReignSense,
     #[serde(default)]
     pub self_sense: SelfSense,
+    /// Loss-intolerant calibration decisions authored by the owning estimator.
+    /// Consumers must drain these as historical events, never infer them by
+    /// comparing this or another state projection with an older snapshot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calibration_transitions: Vec<CalibrationTransition>,
     #[serde(default)]
     pub extensions: ExtensionMap,
 }
@@ -1237,6 +1253,7 @@ impl Now {
                 schema_version: 1,
                 ..SelfSense::default()
             },
+            calibration_transitions: Vec::new(),
             extensions: ExtensionMap::default(),
         }
     }

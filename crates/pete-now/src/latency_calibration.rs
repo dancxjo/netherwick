@@ -1,4 +1,10 @@
+use crate::calibration_transition::{consumer_impacts, CalibrationDofState};
+use crate::{
+    calibration_state, CalibrationClockedTime, CalibrationEvidenceWindow, CalibrationTransition,
+    CalibrationTransitionKind, CalibrationTransitionState,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +123,8 @@ struct StreamEstimator {
     correlated_offsets_ms: VecDeque<f32>,
     baseline_median_ms: Option<f32>,
     last_clock_epoch: Option<u64>,
+    transitions: Vec<CalibrationTransition>,
+    transition_sequence: u64,
 }
 
 impl StreamEstimator {
@@ -127,6 +135,8 @@ impl StreamEstimator {
             correlated_offsets_ms: VecDeque::new(),
             baseline_median_ms: None,
             last_clock_epoch: None,
+            transitions: Vec::new(),
+            transition_sequence: 0,
         }
     }
 
@@ -149,6 +159,7 @@ impl StreamEstimator {
         reference_events: &BTreeMap<String, VecDeque<u64>>,
         config: &LatencyCalibrationConfig,
     ) {
+        let mut prior = self.state.clone();
         self.state.enabled = true;
         self.state.last_observed_at_ms = Some(observation.receive_time_ms);
         self.state.last_observation = Some(observation.clone());
@@ -156,31 +167,63 @@ impl StreamEstimator {
             .last_clock_epoch
             .is_some_and(|epoch| epoch != observation.clock_epoch)
         {
-            self.invalidate(
-                observation.receive_time_ms,
-                format!(
-                    "producer clock epoch changed from {} to {}",
-                    self.last_clock_epoch.unwrap_or_default(),
-                    observation.clock_epoch
-                ),
+            let reason = format!(
+                "producer clock epoch changed from {} to {}",
+                self.last_clock_epoch.unwrap_or_default(),
+                observation.clock_epoch
             );
+            self.invalidate(observation.receive_time_ms, reason.clone());
+            self.record_transition(
+                &prior,
+                CalibrationTransitionKind::Invalidated,
+                &observation,
+                Some(reason),
+            );
+            prior = self.state.clone();
         }
         self.last_clock_epoch = Some(observation.clock_epoch);
 
         let Some(producer_time_ms) = observation.producer_time_ms else {
             self.state.rejected_count = self.state.rejected_count.saturating_add(1);
             self.refresh(observation.receive_time_ms, config);
+            let reason = "producer timestamp is unavailable".to_string();
+            self.state.rejection_reasons.insert(0, reason.clone());
+            self.record_transition(
+                &prior,
+                CalibrationTransitionKind::Rejected,
+                &observation,
+                Some(reason),
+            );
             return;
         };
         if observation.clock_confidence < config.minimum_clock_confidence {
             self.state.rejected_count = self.state.rejected_count.saturating_add(1);
             self.refresh(observation.receive_time_ms, config);
+            let reason = format!(
+                "clock confidence {:.3} is below {:.3}",
+                observation.clock_confidence, config.minimum_clock_confidence
+            );
+            self.state.rejection_reasons.insert(0, reason.clone());
+            self.record_transition(
+                &prior,
+                CalibrationTransitionKind::Rejected,
+                &observation,
+                Some(reason),
+            );
             return;
         }
         let latency_ms = observation.receive_time_ms as i128 - producer_time_ms as i128;
         if !(0..=60_000).contains(&latency_ms) {
             self.state.rejected_count = self.state.rejected_count.saturating_add(1);
             self.refresh(observation.receive_time_ms, config);
+            let reason = format!("transport latency {latency_ms} ms is outside plausible bounds");
+            self.state.rejection_reasons.insert(0, reason.clone());
+            self.record_transition(
+                &prior,
+                CalibrationTransitionKind::Rejected,
+                &observation,
+                Some(reason),
+            );
             return;
         }
         push_bounded(
@@ -212,14 +255,20 @@ impl StreamEstimator {
             if let Some(baseline) = self.baseline_median_ms {
                 let recent = recent_median(&self.transport_samples_ms, 8);
                 if (recent - baseline).abs() > config.drift_threshold_ms {
-                    self.invalidate(
-                        observation.receive_time_ms,
-                        format!(
-                            "latency median shifted by {:.1} ms (threshold {:.1} ms)",
-                            (recent - baseline).abs(),
-                            config.drift_threshold_ms
-                        ),
+                    let before_invalidation = self.state.clone();
+                    let reason = format!(
+                        "latency median shifted by {:.1} ms (threshold {:.1} ms)",
+                        (recent - baseline).abs(),
+                        config.drift_threshold_ms
                     );
+                    self.invalidate(observation.receive_time_ms, reason.clone());
+                    self.record_transition(
+                        &before_invalidation,
+                        CalibrationTransitionKind::Invalidated,
+                        &observation,
+                        Some(reason),
+                    );
+                    let invalidated = self.state.clone();
                     push_bounded(
                         &mut self.transport_samples_ms,
                         latency_ms as f32,
@@ -227,6 +276,12 @@ impl StreamEstimator {
                     );
                     self.state.evidence_count = self.state.evidence_count.saturating_add(1);
                     self.refresh(observation.receive_time_ms, config);
+                    self.record_transition(
+                        &invalidated,
+                        CalibrationTransitionKind::Accepted,
+                        &observation,
+                        None,
+                    );
                     return;
                 }
             } else {
@@ -234,6 +289,8 @@ impl StreamEstimator {
             }
         }
         self.refresh(observation.receive_time_ms, config);
+        let kind = latency_transition_kind(prior.trust_state, self.state.trust_state);
+        self.record_transition(&prior, kind, &observation, None);
     }
 
     fn refresh(&mut self, now_ms: u64, config: &LatencyCalibrationConfig) {
@@ -311,6 +368,118 @@ impl StreamEstimator {
             ));
         }
     }
+
+    fn record_transition(
+        &mut self,
+        prior: &StreamLatencyCalibration,
+        kind: CalibrationTransitionKind,
+        observation: &SensorTimingObservation,
+        reason: Option<String>,
+    ) {
+        let prior_state = latency_transition_state(prior);
+        let new_state = latency_transition_state(&self.state);
+        if prior_state == new_state && kind != CalibrationTransitionKind::Rejected {
+            return;
+        }
+        self.transition_sequence = self.transition_sequence.saturating_add(1);
+        let allowed_before = prior.trust_state == LatencyTrustState::Trusted;
+        let allowed_after = self.state.trust_state == LatencyTrustState::Trusted;
+        let estimator = format!("latency.{}", self.state.stream);
+        let producer_epoch = format!("{}:{}", self.state.stream, observation.clock_epoch);
+        let occurred = CalibrationClockedTime::new(
+            observation
+                .producer_time_ms
+                .unwrap_or(observation.receive_time_ms),
+            producer_epoch,
+        );
+        let observed = CalibrationClockedTime::new(observation.receive_time_ms, "motherbrain:0");
+        self.transitions.push(CalibrationTransition::author(
+            estimator,
+            self.state.epoch,
+            self.transition_sequence,
+            kind,
+            prior_state,
+            new_state,
+            format!("{}.timing", self.state.stream),
+            serde_json::to_value(observation).unwrap_or(Value::Null),
+            CalibrationEvidenceWindow {
+                started_at: CalibrationClockedTime::new(
+                    self.state.epoch_started_at_ms,
+                    "motherbrain:0",
+                ),
+                ended_at: observed.clone(),
+                sample_count: self.state.evidence_count,
+            },
+            consumer_impacts(
+                &["fusion.temporal_alignment"],
+                allowed_before,
+                allowed_after,
+                "trusted correlated latency with bounded uncertainty is required",
+            ),
+            reason,
+            occurred,
+            observed,
+        ));
+    }
+}
+
+fn latency_transition_kind(
+    prior: LatencyTrustState,
+    new: LatencyTrustState,
+) -> CalibrationTransitionKind {
+    match (prior, new) {
+        (_, LatencyTrustState::Trusted) if prior != LatencyTrustState::Trusted => {
+            CalibrationTransitionKind::NewlyTrusted
+        }
+        (_, LatencyTrustState::Degraded) if prior != LatencyTrustState::Degraded => {
+            CalibrationTransitionKind::Degraded
+        }
+        _ => CalibrationTransitionKind::Accepted,
+    }
+}
+
+fn latency_transition_state(state: &StreamLatencyCalibration) -> CalibrationTransitionState {
+    let transport = state.transport_latency.as_ref();
+    let correlated = state.correlated_offset.as_ref();
+    let enough_transport = transport.is_some();
+    let enough_correlated = correlated.is_some();
+    calibration_state(
+        format!("{:?}", state.trust_state).to_lowercase(),
+        state.confidence,
+        serde_json::to_value(state).unwrap_or(Value::Null),
+        [
+            (
+                "transport_median_ms".to_string(),
+                CalibrationDofState {
+                    value: transport
+                        .map(|value| json!(value.median_ms))
+                        .unwrap_or(Value::Null),
+                    observable: enough_transport,
+                    uncertainty: transport.map(|value| value.uncertainty_ms),
+                },
+            ),
+            (
+                "transport_p95_ms".to_string(),
+                CalibrationDofState {
+                    value: transport
+                        .map(|value| json!(value.p95_ms))
+                        .unwrap_or(Value::Null),
+                    observable: enough_transport,
+                    uncertainty: transport.map(|value| value.uncertainty_ms),
+                },
+            ),
+            (
+                "correlated_offset_ms".to_string(),
+                CalibrationDofState {
+                    value: correlated
+                        .map(|value| json!(value.median_ms))
+                        .unwrap_or(Value::Null),
+                    observable: enough_correlated,
+                    uncertainty: correlated.map(|value| value.uncertainty_ms),
+                },
+            ),
+        ],
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -358,9 +527,34 @@ impl SensorLatencyRegistry {
         self.streams
             .iter_mut()
             .map(|(name, estimator)| {
+                let prior = estimator.state.clone();
                 estimator.refresh(now_ms, &self.config);
+                if prior.trust_state != estimator.state.trust_state {
+                    let observation = estimator.state.last_observation.clone().unwrap_or(
+                        SensorTimingObservation {
+                            receive_time_ms: now_ms,
+                            canonical_frame_time_ms: now_ms,
+                            ..SensorTimingObservation::default()
+                        },
+                    );
+                    let kind =
+                        latency_transition_kind(prior.trust_state, estimator.state.trust_state);
+                    estimator.record_transition(
+                        &prior,
+                        kind,
+                        &observation,
+                        estimator.state.rejection_reasons.first().cloned(),
+                    );
+                }
                 (name.clone(), estimator.state.clone())
             })
+            .collect()
+    }
+
+    pub fn take_transitions(&mut self) -> Vec<CalibrationTransition> {
+        self.streams
+            .values_mut()
+            .flat_map(|estimator| std::mem::take(&mut estimator.transitions))
             .collect()
     }
 

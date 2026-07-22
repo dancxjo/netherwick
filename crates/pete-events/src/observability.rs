@@ -5,6 +5,7 @@ use pete_autonomic::SafetyDecision;
 use pete_core::{Provenance, ProvenanceKind};
 use pete_experience::{Experience, Impression, Sensation, SensationPayloadKind, VectorEmbedding};
 use pete_now::Now;
+use pete_now::{CalibrationArtifactIdentity, CalibrationTransition, CalibrationTransitionKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -619,6 +620,110 @@ impl BrainEvent {
         event
     }
 
+    /// Converts an estimator-authored calibration decision into its supporting
+    /// evidence records followed by the canonical loss-intolerant transition.
+    /// No state comparison occurs here: the estimator already decided whether
+    /// a real accepted/rejected/trust/epoch transition happened.
+    pub fn from_calibration_transition(transition: &CalibrationTransition) -> Vec<BrainEvent> {
+        let mut events = transition
+            .evidence
+            .iter()
+            .map(|evidence| {
+                let mut event = BrainEvent::historical(
+                    BrainEventId(evidence.event_id.clone()),
+                    BrainEventType::Evidence,
+                    ProducerIdentity::new(Brain::Motherbrain, transition.estimator.clone()),
+                    EventTimes {
+                        occurred: ClockedTime::in_epoch(
+                            evidence.occurred.t_ms,
+                            evidence.occurred.clock_epoch.clone(),
+                        ),
+                        observed: ClockedTime::in_epoch(
+                            evidence.observed.t_ms,
+                            evidence.observed.clock_epoch.clone(),
+                        ),
+                        valid_from: None,
+                        expires_at: None,
+                    },
+                );
+                event.kind = format!("calibration.evidence.{}", evidence.source);
+                event
+                    .artifacts
+                    .push(calibration_artifact(&evidence.artifact));
+                event.payload =
+                    compact_payload_or_reference(&event.event_id, evidence.payload.clone());
+                event
+            })
+            .collect::<Vec<_>>();
+
+        let mut event = BrainEvent::historical(
+            BrainEventId(transition.id.clone()),
+            BrainEventType::CalibrationTransition,
+            ProducerIdentity::new(Brain::Motherbrain, transition.estimator.clone()),
+            EventTimes {
+                occurred: ClockedTime::in_epoch(
+                    transition.occurred.t_ms,
+                    transition.occurred.clock_epoch.clone(),
+                ),
+                observed: ClockedTime::in_epoch(
+                    transition.observed.t_ms,
+                    transition.observed.clock_epoch.clone(),
+                ),
+                valid_from: Some(ClockedTime::in_epoch(
+                    transition.observed.t_ms,
+                    transition.observed.clock_epoch.clone(),
+                )),
+                expires_at: None,
+            },
+        );
+        event.kind = format!(
+            "calibration.{}.{}",
+            transition.estimator,
+            transition_kind_name(transition.kind)
+        );
+        event
+            .calibration_epochs
+            .push(format!("{}:{}", transition.estimator, transition.epoch));
+        event.artifacts.extend([
+            calibration_artifact(&transition.prior_artifact),
+            calibration_artifact(&transition.candidate_artifact),
+            calibration_artifact(&transition.accepted_artifact),
+        ]);
+        event
+            .links
+            .supports
+            .extend(transition.evidence.iter().map(|evidence| {
+                TypedEventRef::new(
+                    BrainEventId(evidence.event_id.clone()),
+                    BrainEventType::Evidence,
+                )
+            }));
+        event.quality.confidence = Some(transition.new.confidence.clamp(0.0, 1.0));
+        event.quality.trust = match transition.new.trust.as_str() {
+            "trusted" => TrustState::Trusted,
+            "estimating" | "configured" | "warming_up" | "nominal" => TrustState::Conditional,
+            "invalidated" | "degraded" | "unobservable" => TrustState::Untrusted,
+            _ => TrustState::Unknown,
+        };
+        event.disposition = match transition.kind {
+            CalibrationTransitionKind::Accepted | CalibrationTransitionKind::NewlyTrusted => {
+                EventDisposition::Accepted
+            }
+            CalibrationTransitionKind::Rejected => EventDisposition::Rejected,
+            CalibrationTransitionKind::Invalidated
+            | CalibrationTransitionKind::Remounted
+            | CalibrationTransitionKind::RolledBack => EventDisposition::Superseded,
+            CalibrationTransitionKind::Degraded => EventDisposition::Unavailable,
+        };
+        event.payload = compact_payload_or_reference(
+            &event.event_id,
+            serde_json::to_value(transition).unwrap_or(Value::Null),
+        );
+        event.loss_policy = LossPolicy::LossIntolerant;
+        events.push(event);
+        events
+    }
+
     pub fn from_reign_input(input: &ReignInput, observed_at_ms: u64) -> Self {
         let mut event = Self::historical(
             BrainEventId::from_domain("reign-input", input.id),
@@ -701,6 +806,27 @@ impl BrainEvent {
         event.payload = compact_payload_or_reference(&event.event_id, json!(decision));
         event.authority = AuthoritySignificance::SafetyTransition;
         event
+    }
+}
+
+fn calibration_artifact(artifact: &CalibrationArtifactIdentity) -> ArtifactIdentity {
+    ArtifactIdentity {
+        kind: ArtifactKind::Calibration,
+        id: artifact.id.clone(),
+        version: None,
+        checksum: Some(artifact.checksum.clone()),
+    }
+}
+
+fn transition_kind_name(kind: CalibrationTransitionKind) -> &'static str {
+    match kind {
+        CalibrationTransitionKind::Accepted => "accepted",
+        CalibrationTransitionKind::Rejected => "rejected",
+        CalibrationTransitionKind::Degraded => "degraded",
+        CalibrationTransitionKind::Invalidated => "invalidated",
+        CalibrationTransitionKind::Remounted => "remounted",
+        CalibrationTransitionKind::RolledBack => "rolled_back",
+        CalibrationTransitionKind::NewlyTrusted => "newly_trusted",
     }
 }
 
