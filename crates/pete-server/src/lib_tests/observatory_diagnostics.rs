@@ -144,6 +144,29 @@ fn import_verification_rejects_bundle_and_embedded_asset_checksum_failures() {
 }
 
 #[test]
+fn bundle_checksum_is_stable_across_json_object_key_order() {
+    let mut bundle = test_diagnostic_bundle(
+        vec![],
+        vec![diagnostic_snapshot("snapshot-1", 100)],
+        vec![],
+        DiagnosticAssetPolicy::ManifestOnly,
+    );
+    bundle.snapshots[0].now.extensions.insert(
+        "unordered".into(),
+        serde_json::from_str(r#"{"z":1,"a":2,"middle":{"y":3,"b":4}}"#).unwrap(),
+    );
+    bundle = finalize_diagnostic_bundle(bundle);
+    let encoded = serde_json::to_string(&bundle).unwrap();
+    let reordered = encoded.replace(
+        r#""unordered":{"a":2,"middle":{"b":4,"y":3},"z":1}"#,
+        r#""unordered":{"z":1,"middle":{"y":3,"b":4},"a":2}"#,
+    );
+    let decoded: DiagnosticBundle = serde_json::from_str(&reordered).unwrap();
+
+    assert!(verify_diagnostic_bundle(&decoded).bundle_checksum_valid);
+}
+
+#[test]
 fn partial_capture_keeps_declared_gaps_and_round_trips_for_offline_replay() {
     let snapshot_event =
         BrainEvent::from_now_snapshot("snapshot-1", &blank_now(100), 101, Some("clock-a".into()));

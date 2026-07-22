@@ -136,10 +136,53 @@ fn diagnostic_sha256(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
+fn diagnostic_canonical_json(value: &serde_json::Value, output: &mut String) {
+    match value {
+        serde_json::Value::Null => output.push_str("null"),
+        serde_json::Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+        serde_json::Value::Number(value) => output.push_str(&value.to_string()),
+        serde_json::Value::String(value) => {
+            output.push_str(&serde_json::to_string(value).expect("JSON string serializes"));
+        }
+        serde_json::Value::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                diagnostic_canonical_json(value, output);
+            }
+            output.push(']');
+        }
+        serde_json::Value::Object(values) => {
+            output.push('{');
+            let mut entries: Vec<_> = values.iter().collect();
+            entries.sort_by_key(|(key, _)| *key);
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                output.push_str(&serde_json::to_string(key).expect("JSON object key serializes"));
+                output.push(':');
+                diagnostic_canonical_json(value, output);
+            }
+            output.push('}');
+        }
+    }
+}
+
 fn diagnostic_bundle_checksum(bundle: &DiagnosticBundle) -> String {
     let mut content = bundle.clone();
     content.manifest.bundle_sha256.clear();
-    diagnostic_sha256(&serde_json::to_vec(&content).expect("diagnostic bundle serializes"))
+    // Hash the same float representation that crosses the JSON wire. The
+    // `Value` serializer widens f32 values before formatting, while the normal
+    // JSON serializer emits the shortest f32 round-trip representation.
+    let wire = serde_json::to_vec(&content).expect("diagnostic bundle serializes");
+    let value: serde_json::Value =
+        serde_json::from_slice(&wire).expect("serialized diagnostic bundle is JSON");
+    let mut canonical = String::new();
+    diagnostic_canonical_json(&value, &mut canonical);
+    diagnostic_sha256(canonical.as_bytes())
 }
 
 fn finalize_diagnostic_bundle(mut bundle: DiagnosticBundle) -> DiagnosticBundle {
