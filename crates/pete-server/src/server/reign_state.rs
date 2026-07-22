@@ -43,6 +43,7 @@ pub const HTTP_ENDPOINTS: &[&str] = &[
     "/api/observatory/snapshot",
     "/api/observatory/events/ws",
     "/api/observatory/provenance/{id}",
+    "/api/observatory/authority",
     "/view/observatory",
     "/view/3d",
     "/view/capture-scene",
