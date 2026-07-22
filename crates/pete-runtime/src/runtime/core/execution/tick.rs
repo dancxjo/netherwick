@@ -1371,6 +1371,7 @@ where
             .remember(&now.world, executed_goal_behavior);
         let mut brain_events = frame_domain_brain_events(&frame);
         link_forebrain_ingress_to_evidence(&mut exchange_events, &brain_events);
+        link_safety_veto_experiences_to_gate(&mut brain_events, &authority_events);
         brain_events.extend(exchange_events);
         brain_events.extend(authority_events);
         debug_assert!(no_higher_brain_motion_authority(&brain_events));

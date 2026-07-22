@@ -96,6 +96,26 @@ fn link_forebrain_ingress_to_evidence(
     }
 }
 
+fn link_safety_veto_experiences_to_gate(
+    frame_events: &mut [BrainEvent],
+    authority_events: &[BrainEvent],
+) {
+    let Some(gate) = authority_events
+        .iter()
+        .find(|event| event.event_type == BrainEventType::GateDecision)
+    else {
+        return;
+    };
+    for event in frame_events.iter_mut().filter(|event| {
+        event.event_type == BrainEventType::BeliefUpdate && event.kind == "safety.veto"
+    }) {
+        event.links.parents.push(TypedEventRef::new(
+            gate.event_id.clone(),
+            BrainEventType::GateDecision,
+        ));
+    }
+}
+
 fn higher_brain_request_event(frame_id: Uuid, t_ms: TimeMs) -> BrainEvent {
     let snapshot_ref = frame_id.to_string();
     let mut event = BrainEvent::historical(
