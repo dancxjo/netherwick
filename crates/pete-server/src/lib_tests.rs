@@ -7,3 +7,4 @@ include!("lib_tests/observatory_source.rs");
 include!("lib_tests/observatory_ui.rs");
 include!("lib_tests/observatory_graph.rs");
 include!("lib_tests/observatory_authority.rs");
+include!("lib_tests/observatory_calibration.rs");

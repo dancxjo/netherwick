@@ -67,6 +67,10 @@ pub fn live_view_router(state: LiveViewState) -> Router {
             "/api/observatory/authority",
             get(get_observatory_authority),
         )
+        .route(
+            "/api/observatory/calibration",
+            get(get_observatory_calibration),
+        )
         .nest_service(
             "/static",
             ServeDir::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("static")),
