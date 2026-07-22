@@ -213,6 +213,28 @@ fn charger_visible(now: &Now) -> bool {
     }) || charger_signal_scores(now).1 >= 0.5
 }
 
+fn compact_behavior_run_inputs(
+    records: &mut [ErasedBehaviorRunRecord],
+    frame_id: Uuid,
+    t_ms: TimeMs,
+) {
+    for record in records {
+        let Some(input) = record.input_json.as_object_mut() else {
+            continue;
+        };
+        if input.remove("now").is_some() {
+            input.insert(
+                "now_ref".into(),
+                serde_json::json!({
+                    "frame_id": frame_id,
+                    "t_ms": t_ms,
+                    "locator": format!("ledger-frame://{frame_id}/now"),
+                }),
+            );
+        }
+    }
+}
+
 fn execute_event_script_typescript<I>(script: &str, input: &I) -> Result<EventScriptOutput>
 where
     I: Serialize,

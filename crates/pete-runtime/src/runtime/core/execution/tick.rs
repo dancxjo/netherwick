@@ -1309,6 +1309,7 @@ where
             ));
         }
 
+        compact_behavior_run_inputs(&mut behavior_runs, frame_id, now.t_ms);
         self.last_behavior_runs = behavior_runs.clone();
         let mut frame = ExperienceFrame {
             id: frame_id,

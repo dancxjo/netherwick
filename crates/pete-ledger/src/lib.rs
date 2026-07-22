@@ -338,6 +338,130 @@ impl LedgerReader for JsonlLedger {
     }
 }
 
+/// A loss-bounded ledger for long-running validation. It uses the production
+/// ledger contracts while retaining a declared rolling replay window instead
+/// of allowing diagnostic artifacts to consume the host filesystem.
+#[derive(Clone, Debug)]
+pub struct RollingLedger {
+    root: PathBuf,
+    max_frames: usize,
+    max_transitions: usize,
+}
+
+impl RollingLedger {
+    pub fn new(root: impl Into<PathBuf>, max_frames: usize, max_transitions: usize) -> Self {
+        Self {
+            root: root.into(),
+            max_frames: max_frames.max(1),
+            max_transitions: max_transitions.max(1),
+        }
+    }
+
+    fn frames_dir(&self) -> PathBuf {
+        self.root.join("rolling").join("frames")
+    }
+
+    fn transitions_dir(&self) -> PathBuf {
+        self.root.join("rolling").join("transitions")
+    }
+
+    async fn write_bounded<T: Serialize>(
+        directory: &Path,
+        filename: String,
+        maximum: usize,
+        value: &T,
+    ) -> Result<()> {
+        tokio::fs::create_dir_all(directory).await?;
+        let final_path = directory.join(filename);
+        let temporary_path = final_path.with_extension("json.tmp");
+        tokio::fs::write(&temporary_path, serde_json::to_vec(value)?).await?;
+        tokio::fs::rename(temporary_path, final_path).await?;
+
+        let mut entries = tokio::fs::read_dir(directory).await?;
+        let mut paths = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        let remove_count = paths.len().saturating_sub(maximum);
+        for path in paths.into_iter().take(remove_count) {
+            tokio::fs::remove_file(path).await?;
+        }
+        Ok(())
+    }
+
+    async fn read_frames(&self) -> Result<Vec<ExperienceFrame>> {
+        let directory = self.frames_dir();
+        if !directory.exists() {
+            return Ok(Vec::new());
+        }
+        let mut entries = tokio::fs::read_dir(directory).await?;
+        let mut paths = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            paths.push(entry.path());
+        }
+        paths.sort();
+        let mut frames = Vec::with_capacity(paths.len());
+        for path in paths {
+            frames.push(serde_json::from_slice(&tokio::fs::read(path).await?)?);
+        }
+        Ok(frames)
+    }
+
+    pub async fn frames(&self) -> Result<Vec<ExperienceFrame>> {
+        self.read_frames().await
+    }
+}
+
+#[async_trait]
+impl LedgerWriter for RollingLedger {
+    async fn append(&self, frame: &ExperienceFrame) -> Result<()> {
+        Self::write_bounded(
+            &self.frames_dir(),
+            format!("frame-{:020}-{}.json", frame.t_ms, frame.id),
+            self.max_frames,
+            frame,
+        )
+        .await
+    }
+
+    async fn append_transition(&self, transition: &ExperienceTransition) -> Result<()> {
+        Self::write_bounded(
+            &self.transitions_dir(),
+            format!(
+                "transition-{:020}-{}.json",
+                transition.created_at_ms, transition.id
+            ),
+            self.max_transitions,
+            transition,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl LedgerReader for RollingLedger {
+    async fn recent(&self, limit: usize) -> Result<Vec<ExperienceFrame>> {
+        let mut frames = self.read_frames().await?;
+        if frames.len() > limit {
+            frames.drain(0..frames.len() - limit);
+        }
+        Ok(frames)
+    }
+
+    async fn range(&self, start_ms: u64, end_ms: u64) -> Result<Vec<ExperienceFrame>> {
+        Ok(self
+            .read_frames()
+            .await?
+            .into_iter()
+            .filter(|frame| frame.t_ms >= start_ms && frame.t_ms <= end_ms)
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,6 +471,48 @@ mod tests {
         VectorEmbedding,
     };
     use serde_json::json;
+
+    fn blank_frame(t_ms: u64) -> ExperienceFrame {
+        ExperienceFrame {
+            id: Uuid::new_v4(),
+            t_ms,
+            now: Now::blank(t_ms, BodySense::default()),
+            sensations: Vec::new(),
+            impressions: Vec::new(),
+            experiences: Vec::new(),
+            z: None,
+            chosen_action: None,
+            conscious_command: None,
+            reign_input: None,
+            reign_outcome: None,
+            predicted_futures: Vec::new(),
+            behavior_runs: Vec::new(),
+            actual_next: None,
+            reward: Reward::default(),
+            surprise: SurpriseSense::default(),
+            memory_recall: Vec::new(),
+            recollections: Vec::new(),
+            llm_teaching: Vec::new(),
+            counterfactuals: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rolling_ledger_retains_only_the_declared_replay_window() {
+        let root = std::env::temp_dir().join(format!("pete-rolling-ledger-{}", Uuid::new_v4()));
+        let ledger = RollingLedger::new(&root, 2, 2);
+        for t_ms in [100, 200, 300] {
+            ledger.append(&blank_frame(t_ms)).await.unwrap();
+        }
+        let frames = ledger.frames().await.unwrap();
+        assert_eq!(
+            frames.iter().map(|frame| frame.t_ms).collect::<Vec<_>>(),
+            vec![200, 300]
+        );
+        assert_eq!(std::fs::read_dir(ledger.frames_dir()).unwrap().count(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn transition_builder_pairs_second_frame_with_first() {
