@@ -206,6 +206,62 @@ fn partial_capture_keeps_declared_gaps_and_round_trips_for_offline_replay() {
 }
 
 #[test]
+fn verified_bundle_populates_the_same_server_history_and_snapshot_ui_contract() {
+    let first =
+        BrainEvent::from_now_snapshot("snapshot-1", &blank_now(100), 1_000, Some("clock-a".into()));
+    let second =
+        BrainEvent::from_now_snapshot("snapshot-2", &blank_now(200), 1_100, Some("clock-a".into()));
+    let bundle = test_diagnostic_bundle(
+        vec![
+            SequencedBrainEvent {
+                sequence: 4,
+                event: first,
+            },
+            SequencedBrainEvent {
+                sequence: 8,
+                event: second,
+            },
+        ],
+        vec![
+            diagnostic_snapshot("snapshot-1", 100),
+            diagnostic_snapshot("snapshot-2", 200),
+        ],
+        vec![],
+        DiagnosticAssetPolicy::ManifestOnly,
+    );
+
+    let state = LiveViewState::from_diagnostic_bundle(bundle).unwrap();
+    let history = state
+        .observatory()
+        .query(&BrainEventQuery::default())
+        .unwrap();
+
+    assert_eq!(history.records.len(), 4);
+    assert_eq!(
+        state
+            .observatory_now_at_or_before(150)
+            .unwrap()
+            .selected
+            .snapshot_id,
+        "snapshot-1"
+    );
+    assert_eq!(state.session().unwrap().mode, "diagnostic-replay");
+}
+
+#[test]
+fn invalid_bundle_cannot_start_replay_server_state() {
+    let mut bundle = test_diagnostic_bundle(
+        vec![],
+        vec![diagnostic_snapshot("snapshot-1", 100)],
+        vec![],
+        DiagnosticAssetPolicy::ManifestOnly,
+    );
+    bundle.manifest.source_id = "tampered".into();
+
+    assert!(LiveViewState::from_diagnostic_bundle(bundle).is_err());
+}
+
+#[test]
 fn comparison_separates_value_from_trust_and_epoch_changes() {
     let mut left = diagnostic_snapshot("left", 100);
     left.now.extensions.insert(
@@ -303,6 +359,7 @@ fn observatory_diagnostic_ui_exports_verifies_and_compares_selected_times() {
         "/api/observatory/diagnostic-verify",
         "/api/observatory/compare?",
         "name.startsWith('compare')?selectedOccurredMs():selectedObservedMs()",
+        "REPLAY · INSPECTING",
     ] {
         assert!(OBSERVATORY_PAGE.contains(marker), "missing {marker}");
     }

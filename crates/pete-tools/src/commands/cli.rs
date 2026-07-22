@@ -30,6 +30,7 @@ enum Command {
     WhisperTranscribe(WhisperTranscribeArgs),
     HardwareEnv(HardwareEnvArgs),
     Replay,
+    ObservatoryReplay(ObservatoryReplayArgs),
     CaptureSim(CaptureSimArgs),
     CaptureReal(CaptureRealArgs),
     CaptureAssets(CaptureAssetsArgs),
@@ -77,6 +78,7 @@ async fn main() -> Result<()> {
         Command::InspectCapture(args) => inspect_capture(args).await,
         Command::ReplayCapture(args) => replay_capture(args).await,
         Command::ReplayCounterfactual(args) => replay_counterfactual(args).await,
+        Command::ObservatoryReplay(args) => observatory_replay(args).await,
         Command::InspectLedger(args) => inspect_ledger(args).await,
         Command::PoseGraphReport(args) => run_pose_graph_report(args).await,
         Command::GeometryDebug(args) => run_geometry_debug(args).await,
@@ -98,6 +100,29 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+#[derive(Debug, Parser)]
+struct ObservatoryReplayArgs {
+    #[arg(long)]
+    bundle: PathBuf,
+    #[arg(long, default_value = "127.0.0.1:8788")]
+    addr: SocketAddr,
+}
+
+async fn observatory_replay(args: ObservatoryReplayArgs) -> Result<()> {
+    let bytes = fs::read(&args.bundle)
+        .with_context(|| format!("reading diagnostic bundle {}", args.bundle.display()))?;
+    let bundle: pete_server::DiagnosticBundle = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing diagnostic bundle {}", args.bundle.display()))?;
+    let state = LiveViewState::from_diagnostic_bundle(bundle).map_err(anyhow::Error::msg)?;
+    println!(
+        "Verified diagnostic replay: http://{}/view/observatory",
+        args.addr
+    );
+    println!("Read-only replay server; no robot control authority is available.");
+    pete_server::serve_live_view(args.addr, state).await?;
+    Ok(())
 }
 
 #[derive(Debug, Parser)]

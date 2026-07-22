@@ -379,7 +379,7 @@ fn build_diagnostic_bundle(input: DiagnosticBundleBuild<'_>) -> DiagnosticBundle
     })
 }
 
-fn verify_diagnostic_bundle(bundle: &DiagnosticBundle) -> DiagnosticVerificationReport {
+pub fn verify_diagnostic_bundle(bundle: &DiagnosticBundle) -> DiagnosticVerificationReport {
     let bundle_checksum_valid = diagnostic_bundle_checksum(bundle) == bundle.manifest.bundle_sha256;
     let mut invalid_asset_checksums = Vec::new();
     let mut manifest_ids = BTreeSet::new();
@@ -409,6 +409,67 @@ fn verify_diagnostic_bundle(bundle: &DiagnosticBundle) -> DiagnosticVerification
         missing_references: missing_references.into_iter().collect(),
         declared_gaps: bundle.drops.gaps.len(),
         partial: bundle.manifest.partial || !bundle.drops.gaps.is_empty(),
+    }
+}
+
+impl LiveViewState {
+    pub fn from_diagnostic_bundle(bundle: DiagnosticBundle) -> Result<Self, String> {
+        let verification = verify_diagnostic_bundle(&bundle);
+        if !verification.replayable {
+            return Err(format!(
+                "diagnostic bundle failed verification: checksum_valid={} invalid_assets={}",
+                verification.bundle_checksum_valid,
+                verification.invalid_asset_checksums.join(",")
+            ));
+        }
+        let history_capacity = bundle.events.len().max(1);
+        let hub = BrainEventHub::new(BrainEventHubConfig {
+            history_capacity,
+            max_query_limit: history_capacity.max(MAX_OBSERVATORY_QUERY_LIMIT),
+            ..Default::default()
+        });
+        let newest_sequence = bundle
+            .events
+            .iter()
+            .map(|event| event.sequence)
+            .max()
+            .unwrap_or(0);
+        hub.shared
+            .counters
+            .next_sequence
+            .store(newest_sequence, Ordering::Release);
+        *hub.shared
+            .history
+            .lock()
+            .map_err(|_| "diagnostic replay history lock poisoned".to_string())? = HistoryState {
+            events: bundle.events.into(),
+        };
+        let state = Self {
+            observatory: hub,
+            observatory_now: Arc::new(Mutex::new(bundle.snapshots.into())),
+            ..Self::default()
+        };
+        state.observatory_snapshot_sequence.store(
+            state
+                .observatory_now
+                .lock()
+                .map_err(|_| "diagnostic replay snapshot lock poisoned".to_string())?
+                .len() as u64,
+            Ordering::Release,
+        );
+        state.update_session(SceneSession {
+            mode: "diagnostic-replay".into(),
+            scenario: None,
+            seed: None,
+            source: bundle.manifest.source_id,
+            tick_ms: None,
+            control_state: Some("read-only".into()),
+            control_detail: Some("verified diagnostic bundle; no control authority".into()),
+            safety_class: None,
+            independent_watchdog: None,
+            motion_surface: None,
+        });
+        Ok(state)
     }
 }
 

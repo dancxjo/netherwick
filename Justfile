@@ -80,6 +80,8 @@ servers:
     cargo run -q -p xtask -- servers
 live-server:
     cargo run -q -p xtask -- live-server
+observatory-replay bundle addr="127.0.0.1:8788":
+    cargo run -q -p pete-tools -- observatory-replay --bundle "{{bundle}}" --addr "{{addr}}"
 server-logs service="pete-live":
     cargo run -q -p xtask -- server-logs "{{service}}"
 stop-servers:

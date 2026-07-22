@@ -37,3 +37,15 @@ Endpoints:
 - `GET /api/observatory/diagnostic-export?from_ms=...&to_ms=...&asset_policy=redact_sensitive`
 - `POST /api/observatory/diagnostic-verify`
 - `GET /api/observatory/compare?left_ms=...&right_ms=...`
+
+Serve a verified exported bundle through the same read-only Observatory UI:
+
+```bash
+just observatory-replay pete-diagnostic-START-END.json
+```
+
+Then open `http://127.0.0.1:8788/view/observatory`. The loader refuses an
+invalid overall or embedded-asset checksum before binding the server. Original
+event IDs, sequences, clock epochs, typed sequence gaps, snapshots, trust, and
+artifact identities populate the same API and page; replay mode exposes no
+Reign/control router.
