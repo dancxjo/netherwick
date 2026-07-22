@@ -228,6 +228,8 @@ fn observatory_health_ui_separates_truth_dimensions_and_links_alerts() {
         "capture / disk",
         "No recorded health threshold alert at this time.",
         "browser reconnects in this page session",
+        "physical mode unknown",
+        "tick / queues / drops / health not reported",
         "/api/observatory/component-health?at_ms=",
         "button.onclick=()=>selectEvent(alert.event_id)",
     ] {
