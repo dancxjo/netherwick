@@ -38,7 +38,10 @@ async fn run_sim(args: SimArgs) -> Result<()> {
     let motors = scenario.motors;
     let mut runner = SimRunner::new(runtime, world, motors);
     if args.live {
-        let live_state = LiveViewState::new().with_virtual_retina(true);
+        let live_state = LiveViewState::new_with_durable_observatory(
+            LiveViewState::durable_observatory_path("sim"),
+        )?
+        .with_virtual_retina(true);
         let initial_snapshot = runner.world.snapshot().await?;
         live_state.update(initial_snapshot);
         live_state.update_inline_learning(inline_learning.clone());

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -64,6 +64,7 @@ include!("server/retina.rs");
 include!("server/scene.rs");
 include!("server/reign.rs");
 include!("server/observatory.rs");
+include!("server/observatory_durable.rs");
 include!("server/observatory_source.rs");
 include!("server/observatory_graph.rs");
 include!("server/observatory_authority.rs");

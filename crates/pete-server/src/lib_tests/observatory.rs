@@ -27,6 +27,253 @@ async fn wait_for_observatory_sequence(hub: &BrainEventHub, sequence: u64) {
     .expect("observatory worker did not drain in time");
 }
 
+async fn wait_for_durable_sequence(hub: &BrainEventHub, sequence: u64) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let health = hub.health();
+            if health.last_durable_sequence == Some(sequence)
+                && health.durable_writer_backlog == 0
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("durable writer did not flush in time");
+}
+
+fn durable_test_config(name: &str) -> (PathBuf, BrainEventDurabilityConfig) {
+    let directory = std::env::temp_dir().join(format!(
+        "pete-observatory-{name}-{}",
+        Uuid::new_v4()
+    ));
+    let path = directory.join("critical-events.jsonl");
+    (directory, BrainEventDurabilityConfig::new(path))
+}
+
+#[tokio::test]
+async fn durable_critical_history_survives_restart_and_deduplicates_event_identity() {
+    let (directory, durability) = durable_test_config("restart");
+    let config = BrainEventHubConfig {
+        ingress_capacity: 16,
+        history_capacity: 2,
+        ..Default::default()
+    };
+    let hub = BrainEventHub::new_with_durability(config, durability.clone()).unwrap();
+    assert!(hub.start());
+    let events = (1..=5)
+        .map(|id| observatory_event(id, BrainEventType::Command, LossPolicy::LossIntolerant))
+        .collect::<Vec<_>>();
+    for event in &events {
+        assert_eq!(hub.publish(event.clone()).unwrap(), PublishOutcome::Queued);
+    }
+    wait_for_durable_sequence(&hub, 5).await;
+    hub.shutdown().await;
+
+    let restarted = BrainEventHub::new_with_durability(config, durability).unwrap();
+    let response = restarted.query(&BrainEventQuery::default()).unwrap();
+    let recovered = response
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            BrainEventStreamRecord::Event { envelope } => Some(envelope.sequence),
+            BrainEventStreamRecord::Gap { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(recovered, vec![1, 2, 3, 4, 5]);
+    let recovered_events = response
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            BrainEventStreamRecord::Event { envelope } => Some(&envelope.event),
+            BrainEventStreamRecord::Gap { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(recovered_events, events.iter().collect::<Vec<_>>());
+    assert_eq!(response.health.durable_recovered_records, 5);
+    assert_eq!(
+        restarted.publish(events[2].clone()).unwrap(),
+        PublishOutcome::Duplicate
+    );
+    assert!(restarted.start());
+    tokio::task::yield_now().await;
+    assert_eq!(restarted.health().newest_sequence, Some(5));
+    restarted.shutdown().await;
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn durable_recovery_repairs_a_truncated_tail_and_declares_the_gap() {
+    use std::io::Write;
+
+    let (directory, durability) = durable_test_config("truncated");
+    let hub = BrainEventHub::new_with_durability(Default::default(), durability.clone()).unwrap();
+    assert!(hub.start());
+    for id in 1..=3 {
+        hub.publish(observatory_event(
+            id,
+            BrainEventType::GateDecision,
+            LossPolicy::LossIntolerant,
+        ))
+        .unwrap();
+    }
+    wait_for_durable_sequence(&hub, 3).await;
+    hub.shutdown().await;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&durability.path)
+        .unwrap()
+        .write_all(br#"{"format_version":1,"envelope":{"sequence":4"#)
+        .unwrap();
+
+    let recovered = BrainEventHub::new_with_durability(Default::default(), durability).unwrap();
+    let health = recovered.health();
+    assert_eq!(health.last_durable_sequence, Some(3));
+    assert_eq!(health.durability_gaps, 1);
+    let events = recovered.query(&BrainEventQuery::default()).unwrap();
+    assert_eq!(
+        events
+            .records
+            .iter()
+            .filter(|record| matches!(record, BrainEventStreamRecord::Event { .. }))
+            .count(),
+        3
+    );
+    recovered.shutdown().await;
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn durable_writer_failure_is_visible_without_unbounding_live_history() {
+    let (directory, mut durability) = durable_test_config("failure");
+    durability.writer_queue_capacity = 4;
+    durability.injected_failure_after_records = Some(0);
+    let hub = BrainEventHub::new_with_durability(
+        BrainEventHubConfig {
+            ingress_capacity: 512,
+            history_capacity: 32,
+            ..Default::default()
+        },
+        durability,
+    )
+    .unwrap();
+    assert!(hub.start());
+    let started = std::time::Instant::now();
+    for id in 1..=200 {
+        hub.publish(observatory_event(
+            id,
+            BrainEventType::Outcome,
+            LossPolicy::LossIntolerant,
+        ))
+        .unwrap();
+    }
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    wait_for_observatory_sequence(&hub, 200).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while hub.health().durable_writer_backlog != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let health = hub.health();
+    assert_eq!(health.history_depth, 32);
+    assert!(health.durable_write_failures > 0);
+    assert_eq!(health.durable_write_failures, health.durability_gaps);
+    assert_eq!(health.last_durable_sequence, None);
+    hub.shutdown().await;
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn durable_rotation_bounds_disk_and_reports_expired_sequences() {
+    let (directory, mut durability) = durable_test_config("rotation");
+    durability.max_segment_bytes = 1;
+    durability.retained_segments = 2;
+    let hub = BrainEventHub::new_with_durability(
+        BrainEventHubConfig {
+            ingress_capacity: 16,
+            history_capacity: 2,
+            ..Default::default()
+        },
+        durability,
+    )
+    .unwrap();
+    assert!(hub.start());
+    for id in 1..=5 {
+        hub.publish(observatory_event(
+            id,
+            BrainEventType::Command,
+            LossPolicy::LossIntolerant,
+        ))
+        .unwrap();
+    }
+    wait_for_durable_sequence(&hub, 5).await;
+    let response = hub.query(&BrainEventQuery::default()).unwrap();
+    let sequences = response
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            BrainEventStreamRecord::Event { envelope } => Some(envelope.sequence),
+            BrainEventStreamRecord::Gap { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sequences, vec![3, 4, 5]);
+    assert!(response.records.iter().any(|record| matches!(
+        record,
+        BrainEventStreamRecord::Gap { gap }
+            if gap.from_sequence == 1 && gap.to_sequence == 2
+    )));
+    assert_eq!(response.health.durable_rotations, 4);
+    hub.shutdown().await;
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn diagnostic_export_query_merges_live_and_durable_history_without_duplicates() {
+    let (directory, durability) = durable_test_config("export-merge");
+    let hub = BrainEventHub::new_with_durability(
+        BrainEventHubConfig {
+            ingress_capacity: 16,
+            history_capacity: 2,
+            ..Default::default()
+        },
+        durability,
+    )
+    .unwrap();
+    assert!(hub.start());
+    for id in 1..=5 {
+        hub.publish(observatory_event(
+            id,
+            BrainEventType::Outcome,
+            LossPolicy::LossIntolerant,
+        ))
+        .unwrap();
+    }
+    wait_for_durable_sequence(&hub, 5).await;
+    let (events, gaps, partial) = diagnostic_query_events(&hub, 0, 100).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5]
+    );
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.event.event_id.clone())
+            .collect::<HashSet<_>>()
+            .len(),
+        5
+    );
+    assert!(gaps.is_empty());
+    assert!(!partial);
+    hub.shutdown().await;
+    fs::remove_dir_all(directory).unwrap();
+}
+
 #[tokio::test]
 async fn observatory_assigns_monotonic_sequences_and_reconnects_exactly() {
     let hub = BrainEventHub::new(BrainEventHubConfig {

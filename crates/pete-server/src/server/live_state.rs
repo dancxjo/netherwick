@@ -67,6 +67,22 @@ impl LiveViewState {
         Self::default()
     }
 
+    pub fn new_with_durable_observatory(path: impl Into<PathBuf>) -> io::Result<Self> {
+        let mut state = Self::default();
+        state.observatory = BrainEventHub::new_with_durability(
+            BrainEventHubConfig::default(),
+            BrainEventDurabilityConfig::new(path),
+        )?;
+        Ok(state)
+    }
+
+    pub fn durable_observatory_path(source: &str) -> PathBuf {
+        let directory = std::env::var_os("PETE_OBSERVATORY_HISTORY_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("data/observatory"));
+        directory.join(format!("{source}-critical-events.jsonl"))
+    }
+
     pub fn observatory(&self) -> BrainEventHub {
         self.observatory.clone()
     }

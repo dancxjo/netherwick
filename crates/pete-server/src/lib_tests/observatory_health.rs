@@ -196,6 +196,10 @@ fn transport_health_preserves_server_retention_and_viewer_loss_domains() {
             history_expired: 3,
             history_coalesced: 4,
             client_lag_gaps: 5,
+            durability_enabled: true,
+            durable_write_failures: 6,
+            last_durable_sequence: Some(42),
+            durability_gaps: 7,
             ..Default::default()
         },
         &LiveTrainingStatus::default(),
@@ -210,6 +214,13 @@ fn transport_health_preserves_server_retention_and_viewer_loss_domains() {
     assert_eq!(row.metrics.history_expired, Some(3));
     assert_eq!(row.metrics.history_coalesced, Some(4));
     assert_eq!(row.metrics.client_lag_gaps, Some(5));
+    assert_eq!(row.metrics.durable_write_failures, Some(6));
+    assert_eq!(row.metrics.last_durable_sequence, Some(42));
+    assert_eq!(row.metrics.durability_gaps, Some(7));
+    assert!(row
+        .latest_error
+        .as_deref()
+        .is_some_and(|error| error.contains("durable observatory history")));
 }
 
 #[test]

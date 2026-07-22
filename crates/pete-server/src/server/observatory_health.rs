@@ -63,6 +63,9 @@ pub struct ComponentHealthMetrics {
     pub history_expired: Option<u64>,
     pub history_coalesced: Option<u64>,
     pub client_lag_gaps: Option<u64>,
+    pub durable_write_failures: Option<u64>,
+    pub last_durable_sequence: Option<u64>,
+    pub durability_gaps: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -408,6 +411,7 @@ fn capture_health_row(training: &LiveTrainingStatus) -> ComponentHealthRow {
 
 fn transport_health_row(health: &BrainEventTransportHealth) -> ComponentHealthRow {
     let server_loss = health.ingress_dropped_telemetry + health.ingress_rejected_critical;
+    let durability_failed = health.durable_write_failures > 0 || health.durability_gaps > 0;
     ComponentHealthRow {
         id: "observatory.transport".into(),
         group: "ui transport".into(),
@@ -419,7 +423,7 @@ fn transport_health_row(health: &BrainEventTransportHealth) -> ComponentHealthRo
         } else {
             ComponentAvailability::Unavailable
         },
-        health: if !health.running || health.ingress_rejected_critical > 0 {
+        health: if !health.running || health.ingress_rejected_critical > 0 || durability_failed {
             ComponentHealthState::Failed
         } else if health.ingress_dropped_telemetry > 0 {
             ComponentHealthState::Degraded
@@ -445,17 +449,36 @@ fn transport_health_row(health: &BrainEventTransportHealth) -> ComponentHealthRo
             history_expired: Some(health.history_expired),
             history_coalesced: Some(health.history_coalesced),
             client_lag_gaps: Some(health.client_lag_gaps),
+            writer_backlog: health
+                .durability_enabled
+                .then_some(health.durable_writer_backlog as u64),
+            durable_write_failures: health
+                .durability_enabled
+                .then_some(health.durable_write_failures),
+            last_durable_sequence: health.last_durable_sequence,
+            durability_gaps: health
+                .durability_enabled
+                .then_some(health.durability_gaps),
             ..Default::default()
         },
         artifacts: Vec::new(),
         candidate_state: None,
         rollback_state: None,
-        latest_error: (server_loss > 0).then(|| {
-            format!(
-                "observatory server rejected {} critical and dropped {} telemetry events",
-                health.ingress_rejected_critical, health.ingress_dropped_telemetry
-            )
-        }),
+        latest_error: if durability_failed {
+            Some(format!(
+                "durable observatory history has {} write failures and {} declared gaps; last durable sequence {:?}",
+                health.durable_write_failures,
+                health.durability_gaps,
+                health.last_durable_sequence
+            ))
+        } else {
+            (server_loss > 0).then(|| {
+                format!(
+                    "observatory server rejected {} critical and dropped {} telemetry events",
+                    health.ingress_rejected_critical, health.ingress_dropped_telemetry
+                )
+            })
+        },
         event_id: None,
     }
 }

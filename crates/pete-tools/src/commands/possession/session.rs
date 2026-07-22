@@ -333,11 +333,16 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
     }
 
     let reign_queue = std::sync::Arc::new(std::sync::Mutex::new(ReignQueue::default()));
-    let live_state = args.dashboard.map(|_| {
+    let live_state = args
+        .dashboard
+        .map(|_| -> anyhow::Result<LiveViewState> {
+            let live_state = LiveViewState::new_with_durable_observatory(
+                LiveViewState::durable_observatory_path("real-robot"),
+            )?;
         let live_state = if robot_mode == RobotMode::Slow {
-            LiveViewState::new().with_real_slow_hardware_control()
+                live_state.with_real_slow_hardware_control()
         } else {
-            LiveViewState::new()
+                live_state
         };
         live_state.update_session(SceneSession {
             mode: match robot_mode {
@@ -369,8 +374,9 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
             objects: Vec::new(),
             sensor_calibration: Some(real_robot_depth_calibration_from_env()),
         });
-        live_state
-    });
+            Ok(live_state)
+        })
+        .transpose()?;
 
     if let (Some(addr), Some(live_state)) = (args.dashboard, live_state.clone()) {
         let server_state = live_state.clone();

@@ -64,6 +64,7 @@ pub enum PublishOutcome {
     Queued,
     CoalescedPendingTelemetry,
     DroppedTelemetry,
+    Duplicate,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -182,6 +183,13 @@ pub struct BrainEventTransportHealth {
     pub history_expired: u64,
     pub history_expired_critical: u64,
     pub client_lag_gaps: u64,
+    pub durability_enabled: bool,
+    pub durable_writer_backlog: usize,
+    pub durable_write_failures: u64,
+    pub last_durable_sequence: Option<u64>,
+    pub durability_gaps: u64,
+    pub durable_recovered_records: u64,
+    pub durable_rotations: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -345,6 +353,7 @@ struct ObservatoryShared {
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     external_handles: AtomicUsize,
     counters: ObservatoryCounters,
+    durable: Option<Arc<DurableBrainEventStore>>,
 }
 
 pub struct BrainEventHub {
@@ -379,21 +388,50 @@ impl Drop for BrainEventHub {
 
 impl BrainEventHub {
     pub fn new(config: BrainEventHubConfig) -> Self {
+        Self::from_parts(config, None, Vec::new())
+    }
+
+    pub fn new_with_durability(
+        config: BrainEventHubConfig,
+        durability: BrainEventDurabilityConfig,
+    ) -> io::Result<Self> {
+        let (durable, recovered) = DurableBrainEventStore::open(durability)?;
+        Ok(Self::from_parts(config, Some(Arc::new(durable)), recovered))
+    }
+
+    fn from_parts(
+        config: BrainEventHubConfig,
+        durable: Option<Arc<DurableBrainEventStore>>,
+        recovered: Vec<SequencedBrainEvent>,
+    ) -> Self {
         let config = config.normalized();
         let (events_tx, _) = tokio::sync::broadcast::channel(config.broadcast_capacity);
-        Self {
-            shared: Arc::new(ObservatoryShared {
+        let newest_sequence = recovered
+            .iter()
+            .map(|event| event.sequence)
+            .max()
+            .unwrap_or(0);
+        let retained_start = recovered.len().saturating_sub(config.history_capacity);
+        let shared = Arc::new(ObservatoryShared {
                 config,
                 ingress: Mutex::new(IngressState::default()),
-                history: Mutex::new(HistoryState::default()),
+                history: Mutex::new(HistoryState {
+                    events: recovered[retained_start..].iter().cloned().collect(),
+                    replacements: BTreeMap::new(),
+                }),
                 events_tx,
                 notify: tokio::sync::Notify::new(),
                 closed: AtomicBool::new(false),
                 worker: Mutex::new(None),
                 external_handles: AtomicUsize::new(1),
                 counters: ObservatoryCounters::default(),
-            }),
-        }
+                durable,
+            });
+        shared
+            .counters
+            .next_sequence
+            .store(newest_sequence, Ordering::Release);
+        Self { shared }
     }
 
     pub fn start(&self) -> bool {
@@ -425,6 +463,18 @@ impl BrainEventHub {
             .map_err(|error| BrainEventPublishError::InvalidEvent(error.to_string()))?;
         let loss_intolerant = event.requires_loss_intolerant_delivery()
             || matches!(event.loss_policy, LossPolicy::LossIntolerant);
+        let durable_claimed = if loss_intolerant {
+            if let Some(durable) = &self.shared.durable {
+                if !durable.claim_event_id(&event.event_id) {
+                    return Ok(PublishOutcome::Duplicate);
+                }
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         let coalescing_key = match &event.loss_policy {
             LossPolicy::Coalescible { key } => Some(key.clone()),
             LossPolicy::LossIntolerant => None,
@@ -469,6 +519,11 @@ impl BrainEventHub {
                             .counters
                             .ingress_rejected_critical
                             .fetch_add(1, Ordering::Relaxed);
+                        if durable_claimed {
+                            if let Some(durable) = &self.shared.durable {
+                                durable.release_event_id(&event.event_id);
+                            }
+                        }
                         return Err(BrainEventPublishError::CriticalQueueFull);
                     }
                 }
@@ -495,15 +550,30 @@ impl BrainEventHub {
             .history
             .lock()
             .map_err(|_| BrainEventQueryError::new("history lock poisoned"))?;
+        let replacements = history.replacements.clone();
+        let mut combined: BTreeMap<u64, SequencedBrainEvent> = history
+            .events
+            .iter()
+            .cloned()
+            .map(|event| (event.sequence, event))
+            .collect();
+        drop(history);
+        if let Some(durable) = &self.shared.durable {
+            for event in durable.read_events().map_err(|error| {
+                BrainEventQueryError::new(format!("durable history unavailable: {error}"))
+            })? {
+                combined.entry(event.sequence).or_insert(event);
+            }
+        }
         let mut records = Vec::new();
         let mut expected = after.saturating_add(1);
         let mut next_cursor = after;
         let mut matched = 0;
-        for envelope in history.events.iter().filter(|event| event.sequence > after) {
+        for envelope in combined.values().filter(|event| event.sequence > after) {
             if envelope.sequence > expected {
                 append_history_discontinuities(
                     &mut records,
-                    &history.replacements,
+                    &replacements,
                     expected,
                     envelope.sequence - 1,
                 );
@@ -520,7 +590,6 @@ impl BrainEventHub {
                 }
             }
         }
-        drop(history);
         Ok(BrainEventHistoryResponse {
             records,
             next_cursor,
@@ -600,6 +669,37 @@ impl BrainEventHub {
                 .history_expired_critical
                 .load(Ordering::Relaxed),
             client_lag_gaps: self.shared.counters.client_lag_gaps.load(Ordering::Relaxed),
+            durability_enabled: self.shared.durable.is_some(),
+            durable_writer_backlog: self
+                .shared
+                .durable
+                .as_ref()
+                .map_or(0, |durable| durable.backlog()),
+            durable_write_failures: self
+                .shared
+                .durable
+                .as_ref()
+                .map_or(0, |durable| durable.write_failures()),
+            last_durable_sequence: self
+                .shared
+                .durable
+                .as_ref()
+                .and_then(|durable| durable.last_durable_sequence()),
+            durability_gaps: self
+                .shared
+                .durable
+                .as_ref()
+                .map_or(0, |durable| durable.gaps()),
+            durable_recovered_records: self
+                .shared
+                .durable
+                .as_ref()
+                .map_or(0, |durable| durable.recovered_records()),
+            durable_rotations: self
+                .shared
+                .durable
+                .as_ref()
+                .map_or(0, |durable| durable.rotations()),
         }
     }
 
@@ -620,6 +720,9 @@ impl BrainEventHub {
             .and_then(|mut worker| worker.take());
         if let Some(worker) = worker {
             let _ = worker.await;
+        }
+        if let Some(durable) = &self.shared.durable {
+            durable.shutdown();
         }
     }
 
@@ -644,6 +747,9 @@ async fn run_observatory_worker(shared: Arc<ObservatoryShared>) {
         }
         shared.notify.notified().await;
     }
+    if let Some(durable) = &shared.durable {
+        durable.close();
+    }
 }
 
 fn retain_brain_event(shared: &ObservatoryShared, event: BrainEvent) {
@@ -653,6 +759,9 @@ fn retain_brain_event(shared: &ObservatoryShared, event: BrainEvent) {
         .fetch_add(1, Ordering::Relaxed)
         .saturating_add(1);
     let envelope = SequencedBrainEvent { sequence, event };
+    if let Some(durable) = &shared.durable {
+        durable.enqueue(envelope.clone());
+    }
     if let Ok(mut history) = shared.history.lock() {
         if let LossPolicy::Coalescible { key } = &envelope.event.loss_policy {
             if let Some(position) = history.events.iter().position(|prior| {

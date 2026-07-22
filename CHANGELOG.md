@@ -6,6 +6,13 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Ready: Persist loss-intolerant Observatory events in an append-only,
+  checksummed, rotating critical-event log outside the runtime tick, recover
+  valid records after restart or a truncated tail, deduplicate stable event
+  identities, merge durable and live history for queries/export/replay, and
+  expose writer backlog, failures, durable sequence, rotations, and declared
+  durability gaps without blocking physical control.
+
 - Ready: Author canonical loss-intolerant calibration transitions at the Kinect,
   IMU, locomotion, and per-stream latency estimator boundaries, preserving
   prior/new state, epochs, per-degree observability and uncertainty, evidence
