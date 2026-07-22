@@ -7,6 +7,7 @@ fn shadow_test_args(output: PathBuf) -> ShadowFlightArgs {
         clock: ShadowClockMode::Accelerated,
         speed: 1_000.0,
         higher_brain: ShadowHigherBrainMode::Disabled,
+        allow_substitutions: Vec::new(),
         pause_at: Vec::new(),
         faults: vec!["1:wheel_drop".into()],
         output,
@@ -20,6 +21,7 @@ async fn seeded_shadow_flight_is_reproducible_complete_and_transport_isolated() 
     let right_args = shadow_test_args(root.join("right"));
     let advisory_args = ShadowFlightArgs {
         higher_brain: ShadowHigherBrainMode::AdvisoryStub,
+        allow_substitutions: vec!["higher_brain".into()],
         output: root.join("advisory"),
         ..shadow_test_args(root.join("unused"))
     };
@@ -36,6 +38,7 @@ async fn seeded_shadow_flight_is_reproducible_complete_and_transport_isolated() 
     assert!(left_summary.safety_gate_events > 0);
     assert_eq!(left_summary.higher_brain_authority_violations, 0);
     assert_eq!(advisory_summary.higher_brain_authority_violations, 0);
+    assert!(advisory_summary.higher_brain_advice_responses > 0);
     assert_eq!(
         left_summary.local_authority_sha256,
         advisory_summary.local_authority_sha256,
@@ -52,7 +55,27 @@ async fn seeded_shadow_flight_is_reproducible_complete_and_transport_isolated() 
     assert!(fs::read_to_string(left_args.output.join("input-frames.jsonl"))
         .unwrap()
         .contains("wheel_drop"));
+    let advisory_events = fs::read_to_string(advisory_args.output.join("events.jsonl")).unwrap();
+    assert!(advisory_events.contains("shadow higher-brain advice was produced"));
 
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn required_higher_brain_substitution_fails_without_explicit_authorization() {
+    let root = std::env::temp_dir().join(format!("pete-shadow-substitution-{}", Uuid::new_v4()));
+    let args = ShadowFlightArgs {
+        higher_brain: ShadowHigherBrainMode::AdvisoryStub,
+        output: root.clone(),
+        ..shadow_test_args(root.clone())
+    };
+    let error = run_shadow_flight_command(args).await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("required production component higher_brain is substituted"));
+    let failure: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("failure.json")).unwrap()).unwrap();
+    assert_eq!(failure["status"], "failed");
     fs::remove_dir_all(root).unwrap();
 }
 

@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -17,6 +19,47 @@ pub use pete_cockpit_protocol::{
 };
 
 pub type Result<T> = std::result::Result<T, CockpitError>;
+
+static PHYSICAL_ACTUATOR_TRANSPORT_DENIALS: AtomicUsize = AtomicUsize::new(0);
+
+struct PhysicalActuatorTransportDenial;
+
+impl PhysicalActuatorTransportDenial {
+    fn enter() -> Self {
+        PHYSICAL_ACTUATOR_TRANSPORT_DENIALS.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for PhysicalActuatorTransportDenial {
+    fn drop(&mut self) {
+        PHYSICAL_ACTUATOR_TRANSPORT_DENIALS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Execute a future under a process-wide fail-closed prohibition on physical
+/// actuator transports. Every built-in UART and network cockpit checks this
+/// policy before opening, binding, resolving, or connecting a transport.
+pub async fn with_physical_actuator_transports_denied<F: Future>(future: F) -> F::Output {
+    let _denial = PhysicalActuatorTransportDenial::enter();
+    future.await
+}
+
+/// Whether the current process is inside a fail-closed physical transport
+/// scope. Intended for audit manifests and invariant assertions.
+pub fn physical_actuator_transports_are_denied() -> bool {
+    PHYSICAL_ACTUATOR_TRANSPORT_DENIALS.load(Ordering::SeqCst) != 0
+}
+
+fn ensure_physical_actuator_transport_allowed(kind: &str) -> Result<()> {
+    if !physical_actuator_transports_are_denied() {
+        Ok(())
+    } else {
+        Err(CockpitError::Policy(format!(
+            "physical actuator transport {kind} is prohibited in this execution scope"
+        )))
+    }
+}
 
 // The public API stays in this namespace; each include owns one conceptual area.
 include!("cockpit/interface.rs");

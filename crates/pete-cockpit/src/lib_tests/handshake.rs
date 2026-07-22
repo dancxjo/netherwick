@@ -199,6 +199,30 @@ fn hello() -> HandshakeHello {
     HandshakeHello::motherbrain("pete-motherbrain-test")
 }
 
+#[test]
+fn physical_transport_denial_blocks_every_builtin_real_connector_before_open() {
+    let _denial = PhysicalActuatorTransportDenial::enter();
+
+    let uart = UartCockpit::connect("/definitely/not/a/serial/device")
+        .err()
+        .unwrap();
+    assert!(matches!(uart, CockpitError::Policy(message) if message.contains("uart")));
+
+    let udp = UdpCockpit::connect("127.0.0.1:9".parse().unwrap())
+        .err()
+        .unwrap();
+    assert!(matches!(udp, CockpitError::Policy(message) if message.contains("udp")));
+
+    let websocket = WebSocketCockpit::connect_url("ws://127.0.0.1:9/control")
+        .err()
+        .unwrap();
+    assert!(matches!(websocket, CockpitError::Policy(message) if message.contains("websocket")));
+
+    let mut http = HttpCockpit::connect("invalid.invalid:9");
+    let http = http.handshake(hello()).unwrap_err();
+    assert!(matches!(http, CockpitError::Policy(message) if message.contains("http")));
+}
+
 fn conformance_caps() -> CockpitCapabilities {
     SimCockpit::new().get_capabilities().unwrap()
 }

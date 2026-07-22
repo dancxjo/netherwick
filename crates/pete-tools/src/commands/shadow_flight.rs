@@ -30,26 +30,54 @@ impl pete_llm::LlmAgent for ShadowLlmAgent {
 
     async fn combobulate(
         &mut self,
-        _now: &Now,
+        now: &Now,
         _impressions: &[pete_experience::Impression],
         _embodied: Option<&pete_experience::EmbodiedContext>,
         _z: &pete_experience::ExperienceLatent,
         _futures: &[pete_experience::FuturePrediction],
         _recall_summary: &str,
     ) -> Result<Option<pete_llm::Combobulation>> {
-        Ok(None)
+        Ok(self.advisory.then(|| pete_llm::Combobulation {
+            summary: format!(
+                "shadow advisory at {} ms: preserve local safety authority and inspect the next transition",
+                now.t_ms
+            ),
+            confidence: 0.73,
+        }))
     }
 
     async fn maybe_tick(
         &mut self,
-        _now: &Now,
+        now: &Now,
         _embodied: Option<&pete_experience::EmbodiedContext>,
         _z: &pete_experience::ExperienceLatent,
         _futures: &[pete_experience::FuturePrediction],
         _recall_summary: &str,
         _awareness_summary: Option<&str>,
     ) -> Result<pete_llm::LlmTickResult> {
-        Ok(pete_llm::LlmTickResult::default())
+        if !self.advisory {
+            return Ok(pete_llm::LlmTickResult::default());
+        }
+        let summary = format!(
+            "advisory fixture observed transition at {} ms; local conductor remains authoritative",
+            now.t_ms
+        );
+        Ok(pete_llm::LlmTickResult {
+            sense: pete_now::LlmSense {
+                schema_version: 1,
+                command_summary: Some(summary.clone()),
+                critique: Some("do not bypass the local safety gate".into()),
+                confidence: 0.71,
+            },
+            decision: Some(pete_llm::LlmDecision {
+                summary,
+                critique: Some("advisory evidence only".into()),
+                confidence: 0.71,
+                memory_notes: vec!["shadow higher-brain advice was produced".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
     }
 
     async fn scientific_review(
@@ -94,6 +122,10 @@ struct ShadowFlightArgs {
     speed: f64,
     #[arg(long, value_enum, default_value = "disabled")]
     higher_brain: ShadowHigherBrainMode,
+    /// Explicitly authorize a named required component test double. The only
+    /// currently supported name is `higher_brain`.
+    #[arg(long = "allow-substitution", value_delimiter = ',')]
+    allow_substitutions: Vec<String>,
     #[arg(long, value_delimiter = ',')]
     pause_at: Vec<u64>,
     /// Deterministic simulator fault in `tick:kind` form. Supported kinds are
@@ -132,6 +164,7 @@ struct ShadowFlightSummary {
     simulated_outcomes: u64,
     outcome_feedback_frames: u64,
     inline_learning_samples_observed: u64,
+    higher_brain_advice_responses: u64,
     higher_brain_authority_violations: u64,
     local_authority_sha256: String,
     safety_gate_events: u64,
@@ -374,6 +407,15 @@ fn append_replay_outcomes(tick: &mut RuntimeTick) {
 }
 
 async fn run_shadow_flight(args: &ShadowFlightArgs) -> Result<(ShadowFlightManifest, ShadowFlightSummary)> {
+    pete_cockpit::with_physical_actuator_transports_denied(run_shadow_flight_inner(args)).await
+}
+
+async fn run_shadow_flight_inner(
+    args: &ShadowFlightArgs,
+) -> Result<(ShadowFlightManifest, ShadowFlightSummary)> {
+    if !pete_cockpit::physical_actuator_transports_are_denied() {
+        anyhow::bail!("shadow flight requires the fail-closed physical actuator transport scope");
+    }
     if !args.speed.is_finite() || args.speed <= 0.0 {
         anyhow::bail!("--speed must be finite and greater than zero");
     }
@@ -381,6 +423,21 @@ async fn run_shadow_flight(args: &ShadowFlightArgs) -> Result<(ShadowFlightManif
         && args.input.is_none()
     {
         anyhow::bail!("--input is required for capture and ledger shadow-flight sources");
+    }
+    for component in &args.allow_substitutions {
+        if component != "higher_brain" {
+            anyhow::bail!("unknown --allow-substitution component {component:?}");
+        }
+    }
+    if args.higher_brain == ShadowHigherBrainMode::AdvisoryStub
+        && !args
+            .allow_substitutions
+            .iter()
+            .any(|component| component == "higher_brain")
+    {
+        anyhow::bail!(
+            "required production component higher_brain is substituted by advisory_stub; rerun with --allow-substitution higher_brain only for an explicitly authorized test-double run"
+        );
     }
     fs::create_dir_all(&args.output)?;
     let ledger_path = args.output.join("ledger");
@@ -415,6 +472,7 @@ async fn run_shadow_flight(args: &ShadowFlightArgs) -> Result<(ShadowFlightManif
                     }),
                 )
                 .await?;
+                tokio::task::yield_now().await;
                 let (canonical, frame_id, frame_t_ms, (outcome_feedback_event_ids, inline_learning_samples_observed)) =
                     observed.context("production simulator emitted no tick")?;
                 shadow_clock_wait(
@@ -569,6 +627,13 @@ async fn run_shadow_flight(args: &ShadowFlightArgs) -> Result<(ShadowFlightManif
             .iter()
             .map(|input| input.inline_learning_samples_observed as u64)
             .sum(),
+        higher_brain_advice_responses: events
+            .iter()
+            .filter(|record| {
+                record.event.kind == "brain.exchange.higher_to_mother.response"
+                    && record.event.disposition == EventDisposition::Accepted
+            })
+            .count() as u64,
         higher_brain_authority_violations: events.iter().filter(|record| {
             matches!(record.event.producer.brain, Brain::Forebrain | Brain::HigherBrain)
                 && !matches!(record.event.authority, AuthoritySignificance::None | AuthoritySignificance::Advisory)
@@ -580,6 +645,11 @@ async fn run_shadow_flight(args: &ShadowFlightArgs) -> Result<(ShadowFlightManif
     };
     if !summary.full_causal_chain_observed || summary.simulated_outcomes == 0 || summary.safety_gate_events == 0 || summary.higher_brain_authority_violations != 0 {
         anyhow::bail!("shadow flight did not preserve the complete safe causal path: {summary:?}");
+    }
+    if args.higher_brain == ShadowHigherBrainMode::AdvisoryStub
+        && summary.higher_brain_advice_responses == 0
+    {
+        anyhow::bail!("advisory higher-brain test double produced no accepted advisory response");
     }
     let summary_bytes = serde_json::to_vec_pretty(&summary)?;
     fs::write(args.output.join("input-frames.jsonl"), &input_bytes)?;
@@ -602,8 +672,10 @@ async fn run_shadow_flight(args: &ShadowFlightArgs) -> Result<(ShadowFlightManif
         completed_ticks: summary.ticks_completed,
         production_components: vec!["pete_runtime::MinimalRuntime".into(), "pete_conductor::SimpleConductor".into(), "pete_autonomic::SimpleSafety".into(), "pete_runtime::SimRunner".into(), "pete_server::LiveViewState::runtime_tick_brain_events".into(), "pete_ledger::JsonlLedger".into(), "pete_memory::DurableExperienceStore".into()],
         substitutions: match args.higher_brain {
-            ShadowHigherBrainMode::Disabled => vec!["higher brain explicitly disabled".into()],
-            ShadowHigherBrainMode::AdvisoryStub => vec!["higher brain replaced by deterministic advisory-only stub".into()],
+            ShadowHigherBrainMode::Disabled => Vec::new(),
+            ShadowHigherBrainMode::AdvisoryStub => vec![
+                "higher_brain: production provider replaced by explicitly authorized deterministic advisory-only test double".into(),
+            ],
         },
         actuator_transport: "in_process_simulator_only".into(),
         network_required: false,

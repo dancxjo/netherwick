@@ -74,6 +74,7 @@ impl UartCockpit {
     }
 
     pub fn connect_with_config(config: UartCockpitConfig) -> Result<Self> {
+        ensure_physical_actuator_transport_allowed("uart")?;
         let mut port = serialport::new(config.path.to_string_lossy(), config.baud_rate)
             .timeout(config.timeout)
             .open()?;

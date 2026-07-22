@@ -26,6 +26,7 @@ impl HttpCockpit {
     }
 
     fn post(&mut self, path: &str, body: &str) -> Result<String> {
+        ensure_physical_actuator_transport_allowed("http")?;
         let addr = self
             .host
             .to_socket_addrs()?
@@ -135,6 +136,7 @@ pub struct WebSocketCockpit {
 
 impl WebSocketCockpit {
     pub fn connect_url(url: &str) -> Result<Self> {
+        ensure_physical_actuator_transport_allowed("websocket")?;
         let (socket, _) = connect(url)?;
         Ok(Self {
             socket,
@@ -329,6 +331,7 @@ pub struct UdpCockpit {
 
 impl UdpCockpit {
     pub fn connect(brainstem: SocketAddr) -> Result<Self> {
+        ensure_physical_actuator_transport_allowed("udp")?;
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         let timeout = Duration::from_millis(750);
         socket.connect(brainstem)?;
