@@ -1,4 +1,5 @@
 pub fn live_view_router(state: LiveViewState) -> Router {
+    state.observatory.start();
     Router::new()
         .route("/", get(live_view_page))
         .route("/now", get(get_live_now))
@@ -46,6 +47,9 @@ pub fn live_view_router(state: LiveViewState) -> Router {
         .route("/view/inline-learning", post(post_inline_learning))
         .route("/view/calibration", post(post_calibration))
         .route("/memory/entities", get(get_entity_memory))
+        .route("/api/observatory/history", get(get_observatory_history))
+        .route("/api/observatory/health", get(get_observatory_health))
+        .route("/api/observatory/events/ws", get(get_observatory_events_ws))
         .nest_service(
             "/static",
             ServeDir::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("static")),

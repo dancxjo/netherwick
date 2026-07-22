@@ -1,6 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, io};
@@ -21,6 +22,10 @@ use pete_actions::{
 use pete_behaviors::{BehaviorNodeState, BehaviorNodeUpdate, BehaviorRegime};
 use pete_cockpit::{MotionCommand, MotorCommand};
 use pete_core::TimeMs;
+use pete_events::{
+    AuthoritySignificance, Brain, BrainEvent, BrainEventId, BrainEventPayload, BrainEventType,
+    EventDisposition, EventTimes, LossPolicy, ProducerIdentity, TrustState,
+};
 use pete_experience::EmbodiedContext;
 use pete_map::{
     orientation_from_imu, project_beam_endpoint, LocalMap, LocalWorldBelief, MapObservation,
@@ -56,6 +61,7 @@ include!("server/map.rs");
 include!("server/retina.rs");
 include!("server/scene.rs");
 include!("server/reign.rs");
+include!("server/observatory.rs");
 
 const REIGN_PAGE: &str = include_str!("web/reign.html");
 const COGNITIVE_VIEW_PAGE: &str = include_str!("web/cognitive.html");

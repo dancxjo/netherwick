@@ -16,6 +16,7 @@ pete-body = { path = "../pete-body" }
 pete-cockpit = { path = "../pete-cockpit" }
 pete-core = { path = "../pete-core" }
 pete-experience = { path = "../pete-experience" }
+pete-events = { path = "../pete-events" }
 pete-llm = { path = "../pete-llm" }
 pete-map = { path = "../pete-map" }
 pete-memory = { path = "../pete-memory" }

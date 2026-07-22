@@ -18,6 +18,7 @@ pub struct LiveViewState {
     pub retina_height: u32,
     pub retina_fps: f32,
     retina_state: Arc<Mutex<RetinaState>>,
+    observatory: BrainEventHub,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -52,6 +53,7 @@ impl Default for LiveViewState {
             retina_height: 90,
             retina_fps: 5.0,
             retina_state: Arc::new(Mutex::new(RetinaState::default())),
+            observatory: BrainEventHub::new(BrainEventHubConfig::default()),
         }
     }
 }
@@ -59,6 +61,17 @@ impl Default for LiveViewState {
 impl LiveViewState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn observatory(&self) -> BrainEventHub {
+        self.observatory.clone()
+    }
+
+    pub fn publish_brain_event(
+        &self,
+        event: BrainEvent,
+    ) -> Result<PublishOutcome, BrainEventPublishError> {
+        self.observatory.publish(event)
     }
 
     pub fn with_real_slow_hardware_control(self) -> Self {
