@@ -31,6 +31,22 @@ fn accepted_event(id: &str, event_type: BrainEventType, component: &str, t_ms: u
 }
 
 #[test]
+fn experience_summary_impression_links_to_its_parent_belief_update() {
+    let experience_id = test_id(10);
+    let impression = Impression::new("experience.template", "Summary.", Vec::new(), 100, 101)
+        .for_experience(experience_id);
+    let event = BrainEvent::from(&impression);
+
+    assert_eq!(
+        event.links.parents,
+        vec![TypedEventRef::new(
+            BrainEventId::experience(experience_id),
+            BrainEventType::BeliefUpdate,
+        )]
+    );
+}
+
+#[test]
 fn representative_sensor_to_outcome_chain_round_trips_with_typed_links() {
     let mut sensation = Sensation::primary(
         Modality::Touch,

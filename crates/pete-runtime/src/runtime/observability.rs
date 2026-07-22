@@ -75,6 +75,27 @@ fn forebrain_ingress_event(now: &Now, frame_id: Uuid) -> BrainEvent {
     event
 }
 
+fn link_forebrain_ingress_to_evidence(
+    exchange_events: &mut [BrainEvent],
+    frame_events: &[BrainEvent],
+) {
+    let evidence = frame_events
+        .iter()
+        .filter(|event| event.event_type == BrainEventType::Evidence)
+        .filter(|event| {
+            event.kind.starts_with("vision.")
+                || event.producer.component == "object.features"
+                || event.producer.component == "eye.frame"
+        })
+        .map(|event| TypedEventRef::new(event.event_id.clone(), BrainEventType::Evidence))
+        .collect::<Vec<_>>();
+    for event in exchange_events.iter_mut().filter(|event| {
+        event.kind.starts_with("brain.exchange.fore_to_mother.")
+    }) {
+        event.links.parents.clone_from(&evidence);
+    }
+}
+
 fn higher_brain_request_event(frame_id: Uuid, t_ms: TimeMs) -> BrainEvent {
     let snapshot_ref = frame_id.to_string();
     let mut event = BrainEvent::historical(

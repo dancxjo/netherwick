@@ -905,6 +905,12 @@ impl From<&Impression> for BrainEvent {
                 BrainEventType::Evidence,
             ));
         }
+        if let Some(experience_id) = impression.experience_id {
+            event.links.parents.push(TypedEventRef::new(
+                BrainEventId::experience(experience_id),
+                BrainEventType::BeliefUpdate,
+            ));
+        }
         event.references.experience_id = impression.experience_id.map(|id| id.to_string());
         event.payload = compact_payload_or_reference(
             &event_id,
