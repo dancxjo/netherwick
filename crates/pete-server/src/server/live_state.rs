@@ -161,6 +161,8 @@ impl LiveViewState {
 
     pub fn update_with_runtime_map(&self, snapshot: WorldSnapshot, runtime_map: Option<&LocalMap>) {
         let now = snapshot.to_now(snapshot.body.last_update_ms);
+        let mut retained_now = now.clone();
+        strip_observatory_heavy_payloads(&mut retained_now);
         let snapshot_sequence = self
             .observatory_snapshot_sequence
             .fetch_add(1, Ordering::Relaxed)
@@ -219,7 +221,7 @@ impl LiveViewState {
                 }
                 history.push_back(ObservatoryNowSnapshot {
                     snapshot_id: snapshot_id.clone(),
-                    now: now.clone(),
+                    now: retained_now,
                 });
             }
         }
