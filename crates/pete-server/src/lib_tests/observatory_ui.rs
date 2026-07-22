@@ -28,6 +28,9 @@ fn observatory_page_virtualizes_and_keeps_ingesting_while_paused() {
         "if(state.paused)",
         "ws.onmessage=message=>ingest",
         "transport_gap",
+        "inline(e).reason === 'coalesced'",
+        "unavailable gap",
+        "event.replaced",
         "sessionStorage",
     ] {
         assert!(OBSERVATORY_PAGE.contains(behavior), "missing {behavior}");
