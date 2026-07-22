@@ -15,7 +15,8 @@ The output directory contains:
 - `manifest.json`, including the exact source, production components, transport
   isolation, timing mode, artifact checksums, and any explicit substitutions;
 - `input-frames.jsonl`, preserving immutable input identity, runtime frame ID,
-  timestamps, clock metadata, and injected faults;
+  timestamps, clock metadata, injected faults, and the exact prior outcome IDs
+  consumed by the transition's memory and inline-learning path;
 - `events.jsonl`, the same canonical `BrainEvent` records published by the live
   adapter, including simulator-authored dispatch and motion outcomes;
 - `summary.json`, with causal-stage counts, safety gates, outcome counts, and
@@ -29,11 +30,19 @@ authority. A failed CLI run writes `failure.json` and still states that no
 physical transport was opened.
 
 `--higher-brain disabled` is the offline default. `--higher-brain
-advisory-stub` exercises the production asynchronous higher-cognition boundary
-with a deterministic, network-free advisory provider. Reports hash local gate
+advisory-stub --allow-substitution higher_brain` explicitly authorizes and
+records a deterministic, network-free test double that produces a substantive
+interpretation and decision through the production asynchronous
+higher-cognition boundary. Without that named authorization the run fails
+before creating output. Reports hash local gate
 and command authority separately; tests require that hash to remain identical
 with the provider enabled or disabled and reject any higher-brain gate or
 command authority.
+
+Every shadow-flight run is enclosed in the cockpit crate's process-wide
+physical-transport denial scope. UART, UDP, WebSocket, and HTTP cockpit paths
+all check this scope before opening, binding, resolving, or connecting. This is
+the enforced boundary behind the manifest's simulator-only transport claim.
 
 ## Sources and time control
 
