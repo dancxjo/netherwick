@@ -20,6 +20,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_stream::{self as stream, Stream};
 use uuid::Uuid;
 
+mod adversarial;
+pub use adversarial::*;
+
 pub const CAPTURE_SCHEMA_VERSION: u32 = 2;
 pub const CAPTURE_QUEUE_CAPACITY: usize = 4;
 const ASSET_LATE_AFTER_MS: u64 = 1_000;

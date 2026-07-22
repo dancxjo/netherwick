@@ -21,6 +21,7 @@ uuid.workspace = true
 pete-body = { path = "../pete-body" }
 pete-core = { path = "../pete-core" }
 pete-experience = { path = "../pete-experience" }
+pete-events = { path = "../pete-events" }
 pete-ledger = { path = "../pete-ledger" }
 pete-now = { path = "../pete-now" }
 pete-perception = { path = "../pete-perception" }
