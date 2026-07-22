@@ -611,4 +611,16 @@ async fn llm_action_is_discarded_before_safety_and_cockpit() {
                 "LlmAdvisoryAction: provider suggested Go { intensity: 0.3, duration_ms: 700 }; discarded at advisory boundary",
             )
         }));
+    let discarded = tick
+        .brain_events
+        .iter()
+        .find(|event| event.kind == "brain.exchange.higher_to_mother.action_discarded")
+        .expect("provider motion advice must have a canonical discarded event");
+    assert_eq!(discarded.disposition, EventDisposition::Rejected);
+    assert_eq!(discarded.authority, AuthoritySignificance::Advisory);
+    assert!(discarded
+        .links
+        .parents
+        .iter()
+        .any(|parent| parent.event_type == BrainEventType::Interpretation));
 }

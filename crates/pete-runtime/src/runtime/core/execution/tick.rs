@@ -388,6 +388,18 @@ where
             ..LlmActionProposal::default()
         };
         if let Some(advisory) = llm_advisory_action.as_ref() {
+            if let Some(response_event_id) = exchange_events
+                .iter()
+                .find(|event| event.kind == "brain.exchange.higher_to_mother.response")
+                .map(|event| event.event_id.clone())
+            {
+                exchange_events.push(higher_brain_advisory_action_discarded_event(
+                    frame_id,
+                    now.t_ms,
+                    response_event_id,
+                    advisory,
+                ));
+            }
             notes.push(format!(
                 "LlmAdvisoryAction: provider suggested {:?}; discarded at advisory boundary (input_snapshot_ref={})",
                 advisory.action, advisory.input_snapshot_ref
@@ -570,7 +582,7 @@ where
             serde_json::to_value(&goal_cycle)?,
         );
         let mut action_value_candidates =
-            action_value_candidate_actions(&proposals, reign_action.as_ref(), &llm_tick);
+            action_value_candidate_actions(&proposals, reign_action.as_ref());
 
         let conductor_memory =
             memory_for_navigation_with_map_trust(now.memory.clone(), corrected_map_trust);

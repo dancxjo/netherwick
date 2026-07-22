@@ -924,18 +924,10 @@ fn anticipated_surface_collision_risk(now: &Now) -> f32 {
 fn action_value_candidate_actions(
     proposals: &[ActionPrimitive],
     reign_action: Option<&ActionPrimitive>,
-    llm_tick: &LlmTickResult,
 ) -> Vec<ActionPrimitive> {
     let mut candidates = default_candidate_actions();
     if let Some(action) = reign_action {
         push_unique_action(&mut candidates, action.clone());
-    }
-    if let Some(action) = llm_tick
-        .conscious_command
-        .as_ref()
-        .and_then(|cmd| cmd.action.clone())
-    {
-        push_unique_action(&mut candidates, action);
     }
     for action in proposals {
         push_unique_action(&mut candidates, action.clone());
@@ -976,4 +968,3 @@ fn push_unique_action(actions: &mut Vec<ActionPrimitive>, action: ActionPrimitiv
         actions.push(action);
     }
 }
-

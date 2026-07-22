@@ -25,9 +25,16 @@ async fn seeded_shadow_flight_is_reproducible_complete_and_transport_isolated() 
         output: root.join("advisory"),
         ..shadow_test_args(root.join("unused"))
     };
+    let adversarial_args = ShadowFlightArgs {
+        higher_brain: ShadowHigherBrainMode::AdversarialMotion,
+        allow_substitutions: vec!["higher_brain".into()],
+        output: root.join("adversarial-motion"),
+        ..shadow_test_args(root.join("unused-adversarial"))
+    };
     let (left_manifest, left_summary) = run_shadow_flight(&left_args).await.unwrap();
     let (right_manifest, right_summary) = run_shadow_flight(&right_args).await.unwrap();
     let (_, advisory_summary) = run_shadow_flight(&advisory_args).await.unwrap();
+    let (_, adversarial_summary) = run_shadow_flight(&adversarial_args).await.unwrap();
 
     assert_eq!(left_manifest.events_sha256, right_manifest.events_sha256);
     assert_eq!(left_summary.event_type_counts, right_summary.event_type_counts);
@@ -38,12 +45,19 @@ async fn seeded_shadow_flight_is_reproducible_complete_and_transport_isolated() 
     assert!(left_summary.safety_gate_events > 0);
     assert_eq!(left_summary.higher_brain_authority_violations, 0);
     assert_eq!(advisory_summary.higher_brain_authority_violations, 0);
+    assert_eq!(adversarial_summary.higher_brain_authority_violations, 0);
     assert!(advisory_summary.higher_brain_advice_responses > 0);
     assert_eq!(
         left_summary.local_authority_sha256,
         advisory_summary.local_authority_sha256,
         "enabling advisory higher cognition must not change local gate or command authority"
     );
+    assert_eq!(
+        left_summary.local_authority_sha256,
+        adversarial_summary.local_authority_sha256,
+        "direct-motion provider instructions must not enter local authority"
+    );
+    assert!(adversarial_summary.higher_brain_advisory_actions_discarded > 0);
     assert_eq!(left_manifest.actuator_transport, "in_process_simulator_only");
     assert!(!left_manifest.network_required);
     assert!(!left_manifest.physical_hardware_required);
@@ -57,6 +71,10 @@ async fn seeded_shadow_flight_is_reproducible_complete_and_transport_isolated() 
         .contains("wheel_drop"));
     let advisory_events = fs::read_to_string(advisory_args.output.join("events.jsonl")).unwrap();
     assert!(advisory_events.contains("shadow higher-brain advice was produced"));
+    let adversarial_events =
+        fs::read_to_string(adversarial_args.output.join("events.jsonl")).unwrap();
+    assert!(adversarial_events.contains("DIRECT MOTION"));
+    assert!(adversarial_events.contains("action_discarded"));
     let canonical = fs::read_to_string(left_args.output.join("events.jsonl"))
         .unwrap()
         .lines()

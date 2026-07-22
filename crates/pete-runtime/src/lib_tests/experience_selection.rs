@@ -517,7 +517,7 @@ fn scoring_prefers_charger_when_charge_value_is_high() {
 
 #[test]
 fn charger_approach_is_a_default_action_value_candidate() {
-    let candidates = action_value_candidate_actions(&[], None, &LlmTickResult::default());
+    let candidates = action_value_candidate_actions(&[], None);
 
     assert!(candidates.contains(&ActionPrimitive::Approach {
         target: ApproachTarget::Charger

@@ -170,6 +170,35 @@ fn higher_brain_response_event(
     event
 }
 
+fn higher_brain_advisory_action_discarded_event(
+    frame_id: Uuid,
+    t_ms: TimeMs,
+    response_event_id: BrainEventId,
+    advisory: &pete_actions::LlmAdvisoryAction,
+) -> BrainEvent {
+    let mut event = BrainEvent::historical(
+        BrainEventId::from_domain("higher-brain-action-discarded", frame_id),
+        BrainEventType::GateDecision,
+        ProducerIdentity::new(Brain::Motherbrain, "cognition.advisory_boundary"),
+        EventTimes::observed(t_ms, t_ms),
+    );
+    event.kind = "brain.exchange.higher_to_mother.action_discarded".into();
+    event.references.frame_id = Some(frame_id.to_string());
+    event.links.parents.push(TypedEventRef::new(
+        response_event_id,
+        BrainEventType::Interpretation,
+    ));
+    event.disposition = EventDisposition::Rejected;
+    event.authority = AuthoritySignificance::Advisory;
+    event.payload = BrainEventPayload::inline(serde_json::json!({
+        "action": advisory.action,
+        "source": advisory.source,
+        "input_snapshot_ref": advisory.input_snapshot_ref,
+        "reason": "discarded at advisory boundary; no executable proposal was created",
+    }));
+    event
+}
+
 fn bounded_runtime_payload(
     event_id: &BrainEventId,
     payload: serde_json::Value,

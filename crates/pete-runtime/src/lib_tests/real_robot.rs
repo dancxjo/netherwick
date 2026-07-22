@@ -361,7 +361,10 @@ fn brainstem_clock_handles_wrap_reboot_reconnect_and_future_samples() {
         20_100,
     );
     assert!(rebooted.clock_epoch_changed);
-    assert_eq!(rebooted.imu.as_ref().map(ImuSense::source_epoch), Some(1));
+    assert_eq!(
+        rebooted.imu.as_ref().and_then(ImuSense::source_epoch),
+        Some(1)
+    );
 
     mapper.mark_reconnect();
     let reconnected = observe_brainstem_fixture(
@@ -373,7 +376,7 @@ fn brainstem_clock_handles_wrap_reboot_reconnect_and_future_samples() {
     );
     assert!(reconnected.clock_epoch_changed);
     assert_eq!(
-        reconnected.imu.as_ref().map(ImuSense::source_epoch),
+        reconnected.imu.as_ref().and_then(ImuSense::source_epoch),
         Some(2)
     );
 
