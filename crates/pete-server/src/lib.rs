@@ -58,6 +58,7 @@ use uuid::Uuid;
 include!("server/reign_state.rs");
 include!("server/live_state.rs");
 include!("server/models.rs");
+include!("server/observatory_security.rs");
 include!("server/router.rs");
 include!("server/map.rs");
 include!("server/retina.rs");

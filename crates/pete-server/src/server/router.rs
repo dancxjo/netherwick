@@ -1,4 +1,8 @@
 pub fn live_view_router(state: LiveViewState) -> Router {
+    secured_live_view_router(live_view_routes(state.clone()), state)
+}
+
+fn live_view_routes(state: LiveViewState) -> Router {
     state.observatory.start();
     Router::new()
         .route("/", get(live_view_page))
@@ -80,7 +84,7 @@ pub fn live_view_router(state: LiveViewState) -> Router {
         .route(
             "/api/observatory/diagnostic-verify",
             post(post_observatory_diagnostic_verify)
-                .layer(DefaultBodyLimit::max(128 * 1024 * 1024)),
+                .layer(DefaultBodyLimit::max(MAX_DIAGNOSTIC_VERIFY_BYTES)),
         )
         .route("/api/observatory/compare", get(get_observatory_compare))
         .nest_service(
@@ -90,7 +94,15 @@ pub fn live_view_router(state: LiveViewState) -> Router {
         .with_state(state)
 }
 
+fn secured_live_view_router(router: Router, state: LiveViewState) -> Router {
+    router.layer(axum::middleware::from_fn_with_state(
+        state,
+        observatory_security_middleware,
+    ))
+}
+
 pub async fn serve_live_view(addr: SocketAddr, state: LiveViewState) -> std::io::Result<()> {
+    state.configure_observatory_binding(addr, false)?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, live_view_router(state)).await
 }
@@ -100,8 +112,12 @@ pub async fn serve_live_view_with_reign(
     live_state: LiveViewState,
     reign_state: ReignServerState,
 ) -> std::io::Result<()> {
+    live_state.configure_observatory_binding(addr, false)?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    let router = live_view_router(live_state).merge(reign_router(reign_state));
+    let router = secured_live_view_router(
+        live_view_routes(live_state.clone()).merge(reign_router(reign_state)),
+        live_state,
+    );
     axum::serve(listener, router).await
 }
 
@@ -111,6 +127,7 @@ pub async fn serve_live_view_tls(
     cert_path: impl AsRef<Path>,
     key_path: impl AsRef<Path>,
 ) -> std::io::Result<()> {
+    state.configure_observatory_binding(addr, true)?;
     install_rustls_crypto_provider();
     let config = RustlsConfig::from_pem_file(cert_path, key_path).await?;
     axum_server::bind_rustls(addr, config)
@@ -126,9 +143,13 @@ pub async fn serve_live_view_with_reign_tls(
     cert_path: impl AsRef<Path>,
     key_path: impl AsRef<Path>,
 ) -> std::io::Result<()> {
+    live_state.configure_observatory_binding(addr, true)?;
     install_rustls_crypto_provider();
     let config = RustlsConfig::from_pem_file(cert_path, key_path).await?;
-    let router = live_view_router(live_state).merge(reign_router(reign_state));
+    let router = secured_live_view_router(
+        live_view_routes(live_state.clone()).merge(reign_router(reign_state)),
+        live_state,
+    );
     axum_server::bind_rustls(addr, config)
         .serve(router.into_make_service())
         .await

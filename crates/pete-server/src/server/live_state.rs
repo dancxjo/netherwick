@@ -24,6 +24,7 @@ pub struct LiveViewState {
     diagnostic_session_uuid: Arc<String>,
     diagnostic_session_created_at_ms: u64,
     diagnostic_replay_identity: Arc<Mutex<Option<DiagnosticSessionIdentity>>>,
+    observatory_security: Arc<ObservatorySecurityPolicy>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -64,6 +65,7 @@ impl Default for LiveViewState {
             diagnostic_session_uuid: Arc::new(format!("session:{}", Uuid::new_v4())),
             diagnostic_session_created_at_ms: wall_now_ms(),
             diagnostic_replay_identity: Arc::new(Mutex::new(None)),
+            observatory_security: Arc::new(ObservatorySecurityPolicy::from_env()),
         }
     }
 }

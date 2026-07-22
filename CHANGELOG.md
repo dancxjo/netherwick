@@ -6,6 +6,13 @@ All notable changes are grouped by date.
 
 ### Added
 
+- Ready: Fail Observatory network exposure closed: dashboard/replay binds remain
+  loopback-trusted by default, non-loopback binds require TLS (or an explicit
+  trusted TLS proxy) plus bearer authentication, read and control credentials
+  are separate, HTTP/WebSocket origins are checked, expensive endpoints are
+  body/rate bounded, and secret-free loss-intolerant access-rejection events
+  plus an endpoint/data inventory make the policy auditable.
+
 - Ready: Bind diagnostic bundle v2 checksums to a session identity manifest
   covering robot/hardware, host and brainstem boots, session, software/build,
   firmware, active-configuration digest, clock epochs, sensor/providers,
