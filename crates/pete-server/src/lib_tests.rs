@@ -10,3 +10,4 @@ include!("lib_tests/observatory_authority.rs");
 include!("lib_tests/observatory_calibration.rs");
 include!("lib_tests/observatory_spatial.rs");
 include!("lib_tests/observatory_health.rs");
+include!("lib_tests/observatory_diagnostics.rs");

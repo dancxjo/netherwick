@@ -73,6 +73,16 @@ pub fn live_view_router(state: LiveViewState) -> Router {
             "/api/observatory/component-health",
             get(get_observatory_component_health),
         )
+        .route(
+            "/api/observatory/diagnostic-export",
+            get(get_observatory_diagnostic_export),
+        )
+        .route(
+            "/api/observatory/diagnostic-verify",
+            post(post_observatory_diagnostic_verify)
+                .layer(DefaultBodyLimit::max(128 * 1024 * 1024)),
+        )
+        .route("/api/observatory/compare", get(get_observatory_compare))
         .nest_service(
             "/static",
             ServeDir::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("static")),
