@@ -428,6 +428,7 @@ where
             }),
             EventDisposition::Unavailable,
         );
+        queue_actuator_outcome_feedback(&mut self.runtime, &tick);
         self.tick_count = self.tick_count.saturating_add(1);
         Ok((snapshot, tick))
     }
@@ -482,6 +483,7 @@ where
                     &snapshot,
                     EventDisposition::Accepted,
                 );
+                queue_actuator_outcome_feedback(&mut self.runtime, &tick);
                 self.tick_count = self.tick_count.saturating_add(1);
                 return Ok((snapshot, tick));
             }
@@ -553,6 +555,7 @@ where
                     &snapshot,
                     EventDisposition::Accepted,
                 );
+                queue_actuator_outcome_feedback(&mut self.runtime, &tick);
                 self.tick_count = self.tick_count.saturating_add(1);
                 return Ok((snapshot, tick));
             }
@@ -620,6 +623,7 @@ where
                         &current_imu,
                     );
                 }
+                queue_actuator_outcome_feedback(&mut self.runtime, &tick);
                 self.tick_count = self.tick_count.saturating_add(1);
                 return Ok((snapshot, tick));
             }
@@ -869,6 +873,7 @@ where
                 &current_imu,
             );
         }
+        queue_actuator_outcome_feedback(&mut self.runtime, &tick);
         self.tick_count = self.tick_count.saturating_add(1);
         Ok((snapshot, tick))
     }

@@ -410,6 +410,24 @@ pub fn append_motion_response(
     tick.brain_events.push(event);
 }
 
+/// Queue actuator-boundary outcomes for consumption by the next production
+/// tick, before its ledger, memory, transition, and inline-learning writes.
+pub fn queue_actuator_outcome_feedback(
+    runtime: &mut impl RuntimeLoop,
+    tick: &RuntimeTick,
+) -> usize {
+    let outcomes = tick
+        .brain_events
+        .iter()
+        .filter_map(ActuatorOutcomeFeedback::from_event)
+        .collect::<Vec<_>>();
+    let count = outcomes.len();
+    for outcome in outcomes {
+        runtime.observe_actuator_outcome(outcome);
+    }
+    count
+}
+
 fn append_real_robot_dispatch_outcome(
     tick: &mut RuntimeTick,
     snapshot: &WorldSnapshot,

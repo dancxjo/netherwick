@@ -48,6 +48,7 @@ where
             last_active_control: None,
             cognition,
             next_frame_id: None,
+            pending_actuator_outcomes: Vec::new(),
         }
     }
 
@@ -93,6 +94,7 @@ where
             last_active_control: None,
             cognition,
             next_frame_id: None,
+            pending_actuator_outcomes: Vec::new(),
         }
     }
 

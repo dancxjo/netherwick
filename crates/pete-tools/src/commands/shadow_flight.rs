@@ -112,6 +112,8 @@ struct ShadowInputFrameProvenance {
     t_ms: u64,
     clock_epochs: serde_json::Value,
     faults: Vec<String>,
+    outcome_feedback_event_ids: Vec<String>,
+    inline_learning_samples_observed: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -128,6 +130,8 @@ struct ShadowFlightSummary {
     event_type_counts: BTreeMap<String, u64>,
     full_causal_chain_observed: bool,
     simulated_outcomes: u64,
+    outcome_feedback_frames: u64,
+    inline_learning_samples_observed: u64,
     higher_brain_authority_violations: u64,
     local_authority_sha256: String,
     safety_gate_events: u64,
@@ -182,6 +186,27 @@ fn shadow_runtime(ledger: &Path, higher_brain: ShadowHigherBrainMode) -> ShadowR
         },
     )
     .with_nudge_policy(NudgePolicy::virtual_default())
+    .with_inline_learning(InlineLearningConfig {
+        mode: InlineLearningMode::WorldOutcome,
+        behaviors: InlineLearningBehaviors::default(),
+        max_train_steps_per_tick: 1,
+    })
+}
+
+fn shadow_tick_learning_provenance(tick: &RuntimeTick) -> (Vec<String>, usize) {
+    let feedback = tick
+        .frame
+        .now
+        .extensions
+        .get("actuator.outcome_feedback")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|outcome| outcome.get("event_id"))
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect();
+    (feedback, tick.inline_learning.samples_observed)
 }
 
 fn shadow_frame_uuid(identity: &str) -> Uuid {
@@ -385,11 +410,12 @@ async fn run_shadow_flight(args: &ShadowFlightArgs) -> Result<(ShadowFlightManif
                             LiveViewState::runtime_tick_brain_events(snapshot, tick),
                             tick.frame.id,
                             tick.frame.t_ms,
+                            shadow_tick_learning_provenance(tick),
                         ));
                     }),
                 )
                 .await?;
-                let (canonical, frame_id, frame_t_ms) =
+                let (canonical, frame_id, frame_t_ms, (outcome_feedback_event_ids, inline_learning_samples_observed)) =
                     observed.context("production simulator emitted no tick")?;
                 shadow_clock_wait(
                     args.clock,
@@ -411,6 +437,8 @@ async fn run_shadow_flight(args: &ShadowFlightArgs) -> Result<(ShadowFlightManif
                         t_ms: frame_t_ms,
                         clock_epochs: serde_json::json!({"simulator": effective_seed}),
                         faults,
+                        outcome_feedback_event_ids,
+                        inline_learning_samples_observed,
                     },
                     &mut events,
                     &mut inputs,
@@ -437,6 +465,9 @@ async fn run_shadow_flight(args: &ShadowFlightArgs) -> Result<(ShadowFlightManif
                 )
                 .await?;
                 append_replay_outcomes(&mut tick);
+                pete_runtime::queue_actuator_outcome_feedback(&mut runtime, &tick);
+                let (outcome_feedback_event_ids, inline_learning_samples_observed) =
+                    shadow_tick_learning_provenance(&tick);
                 shadow_clock_wait(args.clock, args.speed, prior_ms, record.t_ms, args.pause_at.contains(&record.index)).await?;
                 prior_ms = Some(record.t_ms);
                 record_shadow_tick(
@@ -449,6 +480,8 @@ async fn run_shadow_flight(args: &ShadowFlightArgs) -> Result<(ShadowFlightManif
                         t_ms: record.t_ms,
                         clock_epochs: record.stream_metadata.unwrap_or(serde_json::Value::Null),
                         faults: Vec::new(),
+                        outcome_feedback_event_ids,
+                        inline_learning_samples_observed,
                     },
                     &mut events,
                     &mut inputs,
@@ -476,6 +509,9 @@ async fn run_shadow_flight(args: &ShadowFlightArgs) -> Result<(ShadowFlightManif
                 )
                 .await?;
                 append_replay_outcomes(&mut tick);
+                pete_runtime::queue_actuator_outcome_feedback(&mut runtime, &tick);
+                let (outcome_feedback_event_ids, inline_learning_samples_observed) =
+                    shadow_tick_learning_provenance(&tick);
                 shadow_clock_wait(args.clock, args.speed, prior_ms, frame.t_ms, args.pause_at.contains(&(index as u64))).await?;
                 prior_ms = Some(frame.t_ms);
                 record_shadow_tick(
@@ -488,6 +524,8 @@ async fn run_shadow_flight(args: &ShadowFlightArgs) -> Result<(ShadowFlightManif
                         t_ms: frame.t_ms,
                         clock_epochs,
                         faults: Vec::new(),
+                        outcome_feedback_event_ids,
+                        inline_learning_samples_observed,
                     },
                     &mut events,
                     &mut inputs,
@@ -523,6 +561,14 @@ async fn run_shadow_flight(args: &ShadowFlightArgs) -> Result<(ShadowFlightManif
         canonical_events: events.len() as u64,
         full_causal_chain_observed: chain.iter().all(|kind| event_type_counts.contains_key(*kind)),
         simulated_outcomes: *event_type_counts.get("outcome").unwrap_or(&0),
+        outcome_feedback_frames: inputs
+            .iter()
+            .filter(|input| !input.outcome_feedback_event_ids.is_empty())
+            .count() as u64,
+        inline_learning_samples_observed: inputs
+            .iter()
+            .map(|input| input.inline_learning_samples_observed as u64)
+            .sum(),
         higher_brain_authority_violations: events.iter().filter(|record| {
             matches!(record.event.producer.brain, Brain::Forebrain | Brain::HigherBrain)
                 && !matches!(record.event.authority, AuthoritySignificance::None | AuthoritySignificance::Advisory)

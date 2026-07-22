@@ -552,6 +552,7 @@ where
                 }),
                 dispatch_disposition,
             );
+            queue_actuator_outcome_feedback(&mut self.runtime, &tick);
             after_snapshot
                 .extensions
                 .retain(|extension| extension.name != "sim.stuck");

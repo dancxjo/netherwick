@@ -14,6 +14,12 @@ where
         mut futures: Vec<FuturePrediction>,
     ) -> Result<RuntimeTick> {
         let frame_id = self.next_frame_id.take().unwrap_or_else(Uuid::new_v4);
+        if !self.pending_actuator_outcomes.is_empty() {
+            now.extensions.insert(
+                "actuator.outcome_feedback".to_string(),
+                serde_json::to_value(std::mem::take(&mut self.pending_actuator_outcomes))?,
+            );
+        }
         let mut exchange_events = Vec::new();
         let mut authority_events = Vec::new();
         now.extensions.insert(

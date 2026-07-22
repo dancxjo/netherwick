@@ -14,6 +14,36 @@ pub struct RuntimeTick {
     pub brain_events: Vec<BrainEvent>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ActuatorOutcomeFeedback {
+    pub event_id: BrainEventId,
+    pub command_frame_id: Option<String>,
+    pub kind: String,
+    pub disposition: EventDisposition,
+    pub occurred_at_ms: TimeMs,
+    pub observed_at_ms: TimeMs,
+    pub payload: BrainEventPayload,
+}
+
+impl ActuatorOutcomeFeedback {
+    pub fn from_event(event: &BrainEvent) -> Option<Self> {
+        (event.event_type == BrainEventType::Outcome
+            && matches!(
+                event.kind.as_str(),
+                "actuator.dispatch_outcome" | "motion.response"
+            ))
+        .then(|| Self {
+            event_id: event.event_id.clone(),
+            command_frame_id: event.references.command_ids.first().cloned(),
+            kind: event.kind.clone(),
+            disposition: event.disposition,
+            occurred_at_ms: event.times.occurred.t_ms,
+            observed_at_ms: event.times.observed.t_ms,
+            payload: event.payload.clone(),
+        })
+    }
+}
+
 #[async_trait::async_trait]
 pub trait RuntimeLoop {
     async fn tick(
@@ -28,6 +58,8 @@ pub trait RuntimeLoop {
     }
 
     fn observe_skill_status(&mut self, _status: &SkillStatus) {}
+
+    fn observe_actuator_outcome(&mut self, _outcome: ActuatorOutcomeFeedback) {}
 
     fn canonical_map(&self) -> Option<LocalMap> {
         None
@@ -55,6 +87,10 @@ where
 
     fn observe_skill_status(&mut self, status: &SkillStatus) {
         self.goal_system.observe_skill_status(status);
+    }
+
+    fn observe_actuator_outcome(&mut self, outcome: ActuatorOutcomeFeedback) {
+        self.pending_actuator_outcomes.push(outcome);
     }
 
     fn canonical_map(&self) -> Option<LocalMap> {

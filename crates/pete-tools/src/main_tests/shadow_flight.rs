@@ -31,6 +31,8 @@ async fn seeded_shadow_flight_is_reproducible_complete_and_transport_isolated() 
     assert_eq!(left_summary.event_type_counts, right_summary.event_type_counts);
     assert!(left_summary.full_causal_chain_observed);
     assert!(left_summary.simulated_outcomes > 0);
+    assert!(left_summary.outcome_feedback_frames > 0);
+    assert!(left_summary.inline_learning_samples_observed > 0);
     assert!(left_summary.safety_gate_events > 0);
     assert_eq!(left_summary.higher_brain_authority_violations, 0);
     assert_eq!(advisory_summary.higher_brain_authority_violations, 0);
@@ -67,11 +69,17 @@ async fn capture_shadow_replay_uses_capture_identity_and_simulated_outcomes() {
         .append_snapshot(100, snapshot, Vec::new())
         .await
         .unwrap();
+    let mut next_snapshot = WorldSnapshot::default();
+    next_snapshot.body.last_update_ms = 200;
+    writer
+        .append_snapshot(200, next_snapshot, Vec::new())
+        .await
+        .unwrap();
     let capture_manifest = writer.finish().await.unwrap();
     let args = ShadowFlightArgs {
         source: ShadowFlightSource::Capture,
         input: Some(capture),
-        ticks: 1,
+        ticks: 2,
         faults: Vec::new(),
         output: root.join("replay"),
         ..shadow_test_args(root.join("unused"))
@@ -80,6 +88,16 @@ async fn capture_shadow_replay_uses_capture_identity_and_simulated_outcomes() {
     assert_eq!(manifest.source_identity, format!("capture:{}", capture_manifest.id));
     assert!(summary.simulated_outcomes > 0);
     assert!(summary.full_causal_chain_observed);
+    assert_eq!(summary.outcome_feedback_frames, 1);
+    assert!(summary.inline_learning_samples_observed > 0);
+    let inputs = fs::read_to_string(args.output.join("input-frames.jsonl")).unwrap();
+    let provenance = inputs
+        .lines()
+        .map(|line| serde_json::from_str::<ShadowInputFrameProvenance>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(provenance[0].outcome_feedback_event_ids.is_empty());
+    assert_eq!(provenance[1].outcome_feedback_event_ids.len(), 2);
+    assert!(provenance[1].inline_learning_samples_observed > 0);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -98,14 +116,20 @@ async fn ledger_shadow_replay_preserves_original_frame_identity_and_provenance()
     let (manifest, summary) = run_shadow_flight(&ledger_args).await.unwrap();
     assert_eq!(manifest.source, ShadowFlightSource::Ledger);
     assert_eq!(summary.ticks_completed, 2);
+    assert_eq!(summary.outcome_feedback_frames, 1);
+    assert!(summary.inline_learning_samples_observed > 0);
 
     let inputs = fs::read_to_string(ledger_args.output.join("input-frames.jsonl")).unwrap();
-    for line in inputs.lines() {
+    for (index, line) in inputs.lines().enumerate() {
         let provenance: ShadowInputFrameProvenance = serde_json::from_str(line).unwrap();
         assert_eq!(
             provenance.input_frame_id,
             format!("ledger-frame:{}", provenance.runtime_frame_id)
         );
+        if index == 1 {
+            assert_eq!(provenance.outcome_feedback_event_ids.len(), 2);
+            assert!(provenance.inline_learning_samples_observed > 0);
+        }
     }
     fs::remove_dir_all(root).unwrap();
 }
