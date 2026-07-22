@@ -64,6 +64,7 @@ include!("server/scene.rs");
 include!("server/reign.rs");
 include!("server/observatory.rs");
 include!("server/observatory_source.rs");
+include!("server/observatory_graph.rs");
 
 const REIGN_PAGE: &str = include_str!("web/reign.html");
 const COGNITIVE_VIEW_PAGE: &str = include_str!("web/cognitive.html");
