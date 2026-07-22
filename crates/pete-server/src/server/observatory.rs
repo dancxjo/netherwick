@@ -252,9 +252,7 @@ impl BrainEventQuery {
             .event_type
             .is_none_or(|event_type| event.event_type == event_type)
             && self.kind.as_ref().is_none_or(|kind| event.kind == *kind)
-            && self
-                .brain
-                .is_none_or(|brain| event.producer.brain == brain)
+            && self.brain.is_none_or(|brain| event.producer.brain == brain)
             && self
                 .component
                 .as_ref()
@@ -264,9 +262,10 @@ impl BrainEventQuery {
                     if data.get("modality").and_then(serde_json::Value::as_str) == Some(modality))
             })
             && self.model.as_ref().is_none_or(|model| {
-                event.artifacts.iter().any(|artifact| {
-                    artifact.kind == ArtifactKind::Model && artifact.id == *model
-                })
+                event
+                    .artifacts
+                    .iter()
+                    .any(|artifact| artifact.kind == ArtifactKind::Model && artifact.id == *model)
             })
             && contains_filter(&event.calibration_epochs, self.calibration_epoch.as_ref())
             && self
@@ -276,9 +275,7 @@ impl BrainEventQuery {
             && contains_filter(&event.references.entity_ids, self.entity.as_ref())
             && contains_filter(&event.references.goal_ids, self.goal.as_ref())
             && contains_filter(&event.references.command_ids, self.command.as_ref())
-            && self
-                .trust
-                .is_none_or(|trust| event.quality.trust == trust)
+            && self.trust.is_none_or(|trust| event.quality.trust == trust)
             && self
                 .disposition
                 .is_none_or(|disposition| event.disposition == disposition)
@@ -365,9 +362,7 @@ impl std::fmt::Debug for BrainEventHub {
 
 impl Clone for BrainEventHub {
     fn clone(&self) -> Self {
-        self.shared
-            .external_handles
-            .fetch_add(1, Ordering::Relaxed);
+        self.shared.external_handles.fetch_add(1, Ordering::Relaxed);
         Self {
             shared: Arc::clone(&self.shared),
         }
@@ -376,12 +371,7 @@ impl Clone for BrainEventHub {
 
 impl Drop for BrainEventHub {
     fn drop(&mut self) {
-        if self
-            .shared
-            .external_handles
-            .fetch_sub(1, Ordering::AcqRel)
-            == 1
-        {
+        if self.shared.external_handles.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.close();
         }
     }
@@ -426,10 +416,7 @@ impl BrainEventHub {
         true
     }
 
-    pub fn publish(
-        &self,
-        event: BrainEvent,
-    ) -> Result<PublishOutcome, BrainEventPublishError> {
+    pub fn publish(&self, event: BrainEvent) -> Result<PublishOutcome, BrainEventPublishError> {
         if self.shared.closed.load(Ordering::Acquire) {
             return Err(BrainEventPublishError::Closed);
         }
@@ -443,11 +430,10 @@ impl BrainEventHub {
             LossPolicy::LossIntolerant => None,
         };
         let outcome = {
-            let mut ingress = self
-                .shared
-                .ingress
-                .lock()
-                .map_err(|_| BrainEventPublishError::Internal("ingress lock poisoned".into()))?;
+            let mut ingress =
+                self.shared.ingress.lock().map_err(|_| {
+                    BrainEventPublishError::Internal("ingress lock poisoned".into())
+                })?;
             if let Some(key) = coalescing_key.as_deref() {
                 if let Some(pending) = ingress.queue.iter_mut().find(|pending| {
                     matches!(&pending.loss_policy, LossPolicy::Coalescible { key: pending_key } if pending_key == key)
@@ -470,11 +456,9 @@ impl BrainEventHub {
                 }
             } else {
                 if ingress.queue.len() >= self.shared.config.ingress_capacity {
-                    if let Some(position) = ingress
-                        .queue
-                        .iter()
-                        .position(|pending| matches!(pending.loss_policy, LossPolicy::Coalescible { .. }))
-                    {
+                    if let Some(position) = ingress.queue.iter().position(|pending| {
+                        matches!(pending.loss_policy, LossPolicy::Coalescible { .. })
+                    }) {
                         ingress.queue.remove(position);
                         self.shared
                             .counters
@@ -609,21 +593,13 @@ impl BrainEventHub {
                 .counters
                 .history_coalesced
                 .load(Ordering::Relaxed),
-            history_expired: self
-                .shared
-                .counters
-                .history_expired
-                .load(Ordering::Relaxed),
+            history_expired: self.shared.counters.history_expired.load(Ordering::Relaxed),
             history_expired_critical: self
                 .shared
                 .counters
                 .history_expired_critical
                 .load(Ordering::Relaxed),
-            client_lag_gaps: self
-                .shared
-                .counters
-                .client_lag_gaps
-                .load(Ordering::Relaxed),
+            client_lag_gaps: self.shared.counters.client_lag_gaps.load(Ordering::Relaxed),
         }
     }
 
@@ -729,10 +705,13 @@ fn append_history_discontinuities(
     from_sequence: u64,
     to_sequence: u64,
 ) {
-    let mut retention_start = None;
-    for sequence in from_sequence..=to_sequence {
-        if let Some(replacement_sequence) = replacements.get(&sequence).copied() {
-            if let Some(start) = retention_start.take() {
+    if from_sequence > to_sequence {
+        return;
+    }
+    let mut retention_start = Some(from_sequence);
+    for (&sequence, &replacement_sequence) in replacements.range(from_sequence..=to_sequence) {
+        if let Some(start) = retention_start.take() {
+            if start < sequence {
                 records.push(BrainEventStreamRecord::Gap {
                     gap: BrainEventSequenceGap::new(
                         start,
@@ -741,14 +720,13 @@ fn append_history_discontinuities(
                     ),
                 });
             }
-            records.push(BrainEventStreamRecord::Gap {
-                gap: BrainEventSequenceGap::coalesced(sequence, replacement_sequence),
-            });
-        } else if retention_start.is_none() {
-            retention_start = Some(sequence);
         }
+        records.push(BrainEventStreamRecord::Gap {
+            gap: BrainEventSequenceGap::coalesced(sequence, replacement_sequence),
+        });
+        retention_start = sequence.checked_add(1);
     }
-    if let Some(start) = retention_start {
+    if let Some(start) = retention_start.filter(|start| *start <= to_sequence) {
         records.push(BrainEventStreamRecord::Gap {
             gap: BrainEventSequenceGap::new(
                 start,
@@ -783,7 +761,11 @@ impl ObservatoryHttpError {
 
 impl IntoResponse for ObservatoryHttpError {
     fn into_response(self) -> axum::response::Response {
-        (self.status, Json(serde_json::json!({ "error": self.message }))).into_response()
+        (
+            self.status,
+            Json(serde_json::json!({ "error": self.message })),
+        )
+            .into_response()
     }
 }
 

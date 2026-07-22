@@ -50,6 +50,10 @@ pub struct ObservatorySourceHistoryResponse {
 pub struct ObservatorySourceEvent {
     pub envelope: SequencedBrainEvent,
     pub lane: ObservatoryEventLane,
+    /// Source-global stable ordering key used for lossless pagination across
+    /// recorded and reprocessed lanes whose domain sequences may overlap.
+    #[serde(default)]
+    pub source_order: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,7 +121,9 @@ impl BrainEventSource for LiveBrainEventSource {
         &self,
         query: &ObservatorySourceQuery,
     ) -> Result<ObservatorySourceHistoryResponse, BrainEventQueryError> {
-        query.event.validate(self.hub.shared.config.max_query_limit)?;
+        query
+            .event
+            .validate(self.hub.shared.config.max_query_limit)?;
         let health = self.hub.health();
         if query.lane == ObservatoryEventLaneSelector::Reprocessed {
             return Ok(ObservatorySourceHistoryResponse {
@@ -134,6 +140,7 @@ impl BrainEventSource for LiveBrainEventSource {
             match record {
                 BrainEventStreamRecord::Event { envelope } => {
                     events.push(ObservatorySourceEvent {
+                        source_order: envelope.sequence,
                         envelope,
                         lane: ObservatoryEventLane::Recorded,
                     });
@@ -154,18 +161,16 @@ impl BrainEventSource for LiveBrainEventSource {
         let mut after_sequence = None;
         loop {
             let Ok(page) = self.hub.query(&BrainEventQuery {
-                    after_sequence,
-                    event_type: Some(BrainEventType::Snapshot),
-                    limit: Some(self.hub.shared.config.max_query_limit),
-                    ..BrainEventQuery::default()
-                }) else {
+                after_sequence,
+                event_type: Some(BrainEventType::Snapshot),
+                limit: Some(self.hub.shared.config.max_query_limit),
+                ..BrainEventQuery::default()
+            }) else {
                 break;
             };
             let prior_cursor = after_sequence.unwrap_or(0);
             snapshots.extend(page.records.iter().filter_map(|record| match record {
-                BrainEventStreamRecord::Event { envelope } => {
-                    snapshot_from_event(&envelope.event)
-                }
+                BrainEventStreamRecord::Event { envelope } => snapshot_from_event(&envelope.event),
                 BrainEventStreamRecord::Gap { .. } => None,
             }));
             if page.next_cursor <= prior_cursor {
@@ -222,9 +227,11 @@ impl ReplayBrainEventSource {
     ) -> Self {
         let events = events
             .into_iter()
-            .map(|envelope| ObservatorySourceEvent {
+            .enumerate()
+            .map(|(index, envelope)| ObservatorySourceEvent {
                 envelope,
                 lane: ObservatoryEventLane::Recorded,
+                source_order: index as u64 + 1,
             })
             .collect::<Vec<_>>();
         let snapshots = snapshots_from_source_events(&events);
@@ -275,6 +282,7 @@ impl ReplayBrainEventSource {
                 t_ms: frame.t_ms,
             });
             events.push(ObservatorySourceEvent {
+                source_order: sequence,
                 envelope: SequencedBrainEvent {
                     sequence,
                     event: snapshot_event,
@@ -308,6 +316,7 @@ impl ReplayBrainEventSource {
                 event.loss_policy = LossPolicy::LossIntolerant;
                 sequence = sequence.saturating_add(1);
                 events.push(ObservatorySourceEvent {
+                    source_order: sequence,
                     envelope: SequencedBrainEvent { sequence, event },
                     lane: ObservatoryEventLane::Recorded,
                 });
@@ -347,8 +356,9 @@ impl ReplayBrainEventSource {
                 lane: ObservatoryEventLane::Reprocessed {
                     model_id: model_id.clone(),
                 },
+                source_order: 0,
             }));
-        self.events.sort_by_key(|event| event.envelope.sequence);
+        refresh_replay_source_order(&mut self.events);
     }
 
     pub fn events(&self) -> &[ObservatorySourceEvent] {
@@ -371,29 +381,34 @@ impl BrainEventSource for ReplayBrainEventSource {
             .as_deref()
             .is_some_and(|model| model.trim().is_empty())
         {
-            return Err(BrainEventQueryError::new("lane_model filter cannot be empty"));
+            return Err(BrainEventQueryError::new(
+                "lane_model filter cannot be empty",
+            ));
         }
         let after = query.event.after_sequence.unwrap_or(0);
-        let limit = query
-            .event
-            .limit
-            .unwrap_or(DEFAULT_OBSERVATORY_QUERY_LIMIT);
+        let after_domain_sequence = self
+            .events
+            .iter()
+            .find(|event| event.source_order == after)
+            .map(|event| event.envelope.sequence)
+            .unwrap_or(0);
+        let limit = query.event.limit.unwrap_or(DEFAULT_OBSERVATORY_QUERY_LIMIT);
         let mut events = Vec::new();
         let mut next_cursor = after;
         let mut matches = 0;
-        let gaps =
-            self.gaps
-                .iter()
-                .filter(|gap| gap.to_sequence > after)
-                .cloned()
-                .collect();
+        let gaps = self
+            .gaps
+            .iter()
+            .filter(|gap| gap.to_sequence > after_domain_sequence)
+            .cloned()
+            .collect();
         for event in self
             .events
             .iter()
             .filter(|event| lane_matches(&event.lane, query.lane, query.lane_model.as_deref()))
-            .filter(|event| event.envelope.sequence > after)
+            .filter(|event| event.source_order > after)
         {
-            next_cursor = event.envelope.sequence;
+            next_cursor = event.source_order;
             if query.event.matches(&event.envelope.event) {
                 events.push(event.clone());
                 matches += 1;
@@ -411,8 +426,8 @@ impl BrainEventSource for ReplayBrainEventSource {
                 closed: false,
                 history_capacity: self.events.len(),
                 history_depth: self.events.len(),
-                oldest_sequence: self.events.first().map(|event| event.envelope.sequence),
-                newest_sequence: self.events.last().map(|event| event.envelope.sequence),
+                oldest_sequence: self.events.first().map(|event| event.source_order),
+                newest_sequence: self.events.last().map(|event| event.source_order),
                 ..BrainEventTransportHealth::default()
             },
         })
@@ -448,6 +463,31 @@ impl BrainEventSource for ReplayBrainEventSource {
 
     fn subscribe(&self) -> Option<tokio::sync::broadcast::Receiver<SequencedBrainEvent>> {
         None
+    }
+}
+
+fn refresh_replay_source_order(events: &mut [ObservatorySourceEvent]) {
+    events.sort_by(|left, right| {
+        left.envelope
+            .sequence
+            .cmp(&right.envelope.sequence)
+            .then_with(|| replay_lane_key(&left.lane).cmp(&replay_lane_key(&right.lane)))
+            .then_with(|| {
+                left.envelope
+                    .event
+                    .event_id
+                    .cmp(&right.envelope.event.event_id)
+            })
+    });
+    for (index, event) in events.iter_mut().enumerate() {
+        event.source_order = index as u64 + 1;
+    }
+}
+
+fn replay_lane_key(lane: &ObservatoryEventLane) -> (u8, &str) {
+    match lane {
+        ObservatoryEventLane::Recorded => (0, ""),
+        ObservatoryEventLane::Reprocessed { model_id } => (1, model_id.as_str()),
     }
 }
 
@@ -547,13 +587,9 @@ impl ObservatoryNavigationState {
         if snapshots.is_empty() {
             return;
         }
-        let selected = self.selected_time_ms.unwrap_or_else(|| {
-            if direction < 0 {
-                u64::MAX
-            } else {
-                0
-            }
-        });
+        let selected =
+            self.selected_time_ms
+                .unwrap_or_else(|| if direction < 0 { u64::MAX } else { 0 });
         let target = if direction < 0 {
             snapshots
                 .iter()

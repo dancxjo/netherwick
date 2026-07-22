@@ -107,8 +107,14 @@ fn clock_epoch_resets_remain_recorded_not_reordered() {
         .collect::<Vec<_>>();
     assert_eq!(events[0].sequence, 1);
     assert_eq!(events[1].sequence, 2);
-    assert_eq!(events[0].event.times.occurred.clock_epoch.as_deref(), Some("boot-a"));
-    assert_eq!(events[1].event.times.occurred.clock_epoch.as_deref(), Some("boot-b"));
+    assert_eq!(
+        events[0].event.times.occurred.clock_epoch.as_deref(),
+        Some("boot-a")
+    );
+    assert_eq!(
+        events[1].event.times.occurred.clock_epoch.as_deref(),
+        Some("boot-b")
+    );
 }
 
 #[test]
@@ -129,7 +135,10 @@ fn candidate_model_events_stay_in_a_separate_lane() {
     let recorded_query = source.query(&ObservatorySourceQuery::default()).unwrap();
     assert_eq!(recorded_query.events.len(), 1);
     assert_eq!(recorded_query.events[0].envelope, recorded);
-    assert_eq!(recorded_query.events[0].lane, ObservatoryEventLane::Recorded);
+    assert_eq!(
+        recorded_query.events[0].lane,
+        ObservatoryEventLane::Recorded
+    );
 
     let candidate_query = source
         .query(&ObservatorySourceQuery {
@@ -149,6 +158,64 @@ fn candidate_model_events_stay_in_a_separate_lane() {
 }
 
 #[test]
+fn all_lane_pagination_keeps_events_that_share_a_domain_sequence() {
+    let recorded = source_snapshot(42, 100, "boot-a");
+    let mut candidate_a = source_snapshot(42, 100, "boot-a");
+    candidate_a.event.event_id = BrainEventId::from_domain("candidate-a", 42);
+    let mut candidate_b = source_snapshot(42, 100, "boot-a");
+    candidate_b.event.event_id = BrainEventId::from_domain("candidate-b", 42);
+    let mut source = replay_source(vec![recorded.clone()]);
+    source.add_reprocessed_lane("model-b", vec![candidate_b.clone()]);
+    source.add_reprocessed_lane("model-a", vec![candidate_a.clone()]);
+
+    let mut after = None;
+    let mut pages = Vec::new();
+    loop {
+        let response = source
+            .query(&ObservatorySourceQuery {
+                event: BrainEventQuery {
+                    after_sequence: after,
+                    limit: Some(1),
+                    ..BrainEventQuery::default()
+                },
+                lane: ObservatoryEventLaneSelector::All,
+                ..ObservatorySourceQuery::default()
+            })
+            .unwrap();
+        if response.events.is_empty() {
+            break;
+        }
+        assert_eq!(response.events.len(), 1);
+        assert!(after.is_none_or(|cursor| response.next_cursor > cursor));
+        after = Some(response.next_cursor);
+        pages.push(response.events[0].clone());
+    }
+
+    assert_eq!(pages.len(), 3);
+    assert_eq!(
+        pages
+            .iter()
+            .map(|event| event.source_order)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert!(pages.iter().all(|event| event.envelope.sequence == 42));
+    assert_eq!(pages[0].lane, ObservatoryEventLane::Recorded);
+    assert_eq!(
+        pages[1].lane,
+        ObservatoryEventLane::Reprocessed {
+            model_id: "model-a".to_string()
+        }
+    );
+    assert_eq!(
+        pages[2].lane,
+        ObservatoryEventLane::Reprocessed {
+            model_id: "model-b".to_string()
+        }
+    );
+}
+
+#[test]
 fn incomplete_source_reports_gaps_without_hiding_available_history() {
     let mut source = replay_source(vec![source_snapshot(3, 300, "boot-a")]);
     source.gaps.push(BrainEventSequenceGap::new(
@@ -161,10 +228,7 @@ fn incomplete_source_reports_gaps_without_hiding_available_history() {
     assert!(!health.complete);
     assert_eq!(health.gaps[0].from_sequence, 1);
     let response = source.query(&ObservatorySourceQuery::default()).unwrap();
-    assert_eq!(
-        response.events.len(),
-        1
-    );
+    assert_eq!(response.events.len(), 1);
     assert_eq!(response.gaps.len(), 1);
 }
 

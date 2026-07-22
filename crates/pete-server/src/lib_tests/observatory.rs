@@ -1,8 +1,4 @@
-fn observatory_event(
-    id: u64,
-    event_type: BrainEventType,
-    loss_policy: LossPolicy,
-) -> BrainEvent {
+fn observatory_event(id: u64, event_type: BrainEventType, loss_policy: LossPolicy) -> BrainEvent {
     let mut event = BrainEvent::historical(
         BrainEventId::from_domain("test", id),
         event_type,
@@ -17,7 +13,11 @@ fn observatory_event(
 async fn wait_for_observatory_sequence(hub: &BrainEventHub, sequence: u64) {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if hub.health().newest_sequence.is_some_and(|value| value >= sequence) {
+            if hub
+                .health()
+                .newest_sequence
+                .is_some_and(|value| value >= sequence)
+            {
                 return;
             }
             tokio::task::yield_now().await;
@@ -123,11 +123,7 @@ async fn telemetry_overflow_cannot_displace_a_loss_intolerant_event() {
         ))
         .unwrap();
     }
-    let command = observatory_event(
-        3,
-        BrainEventType::Command,
-        LossPolicy::LossIntolerant,
-    );
+    let command = observatory_event(3, BrainEventType::Command, LossPolicy::LossIntolerant);
     let command_id = command.event_id.clone();
     assert_eq!(hub.publish(command).unwrap(), PublishOutcome::Queued);
     assert_eq!(hub.health().ingress_dropped_telemetry, 1);
@@ -222,6 +218,53 @@ async fn retained_telemetry_replacement_is_not_reported_as_data_loss() {
     hub.shutdown().await;
 }
 
+#[test]
+fn history_discontinuity_reconstruction_is_bounded_by_replacement_tombstones() {
+    let replacements = BTreeMap::from([(10, 11), (20, 21)]);
+    let mut records = Vec::new();
+
+    append_history_discontinuities(&mut records, &replacements, 1, u64::MAX);
+
+    let gaps = records
+        .into_iter()
+        .map(|record| match record {
+            BrainEventStreamRecord::Gap { gap } => gap,
+            BrainEventStreamRecord::Event { .. } => panic!("expected only discontinuities"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(gaps.len(), 5);
+    assert_eq!(
+        (gaps[0].from_sequence, gaps[0].to_sequence, gaps[0].reason),
+        (1, 9, SequenceGapReason::RetentionExpired)
+    );
+    assert_eq!(
+        (
+            gaps[1].from_sequence,
+            gaps[1].to_sequence,
+            gaps[1].reason,
+            gaps[1].replacement_sequence,
+        ),
+        (10, 10, SequenceGapReason::Coalesced, Some(11))
+    );
+    assert_eq!(
+        (gaps[2].from_sequence, gaps[2].to_sequence, gaps[2].reason),
+        (11, 19, SequenceGapReason::RetentionExpired)
+    );
+    assert_eq!(
+        (
+            gaps[3].from_sequence,
+            gaps[3].to_sequence,
+            gaps[3].reason,
+            gaps[3].replacement_sequence,
+        ),
+        (20, 20, SequenceGapReason::Coalesced, Some(21))
+    );
+    assert_eq!(
+        (gaps[4].from_sequence, gaps[4].to_sequence, gaps[4].reason),
+        (21, u64::MAX, SequenceGapReason::RetentionExpired)
+    );
+}
+
 #[tokio::test]
 async fn stalled_broadcast_client_never_backpressures_history_ingestion() {
     let hub = BrainEventHub::new(BrainEventHubConfig {
@@ -294,7 +337,10 @@ async fn history_filters_cover_every_query_dimension() {
     matching.references.snapshot_id = Some("snapshot-50".to_string());
     matching.references.entity_ids.push("person-1".to_string());
     matching.references.goal_ids.push("greet-1".to_string());
-    matching.references.command_ids.push("command-1".to_string());
+    matching
+        .references
+        .command_ids
+        .push("command-1".to_string());
     matching.quality.trust = TrustState::Trusted;
     matching.disposition = EventDisposition::Accepted;
     hub.publish(matching).unwrap();
