@@ -18,10 +18,21 @@ The output directory contains:
   timestamps, clock metadata, injected faults, and the exact prior outcome IDs
   consumed by the transition's memory and inline-learning path;
 - `events.jsonl`, the same canonical `BrainEvent` records published by the live
-  adapter, including simulator-authored dispatch and motion outcomes;
+  adapter, including simulator-authored dispatch and motion outcomes. Long runs
+  retain a declared rolling tail while full-run counts and authority hashes are
+  accumulated incrementally;
 - `summary.json`, with causal-stage counts, safety gates, outcome counts, and
   higher-brain authority violations;
 - `ledger/`, written by the normal runtime memory and learning path.
+
+The default rolling replay window retains 64 production-ledger frames and
+transitions, 100,000 canonical events, and 10,000 input provenance records.
+`--ledger-retained-frames`, `--ledger-retained-transitions`,
+`--retained-events`, and `--retained-input-frames` make those limits explicit.
+The manifest reports both retained and dropped counts, so bounded soak output
+never presents a truncated history as complete. Behavior-run inputs reference
+their enclosing immutable ledger frame instead of embedding the same `Now`
+snapshot once per candidate.
 
 The run fails unless it observes the complete
 Evidence → Interpretation → Belief → Proposal → Gate → Command → Outcome path,

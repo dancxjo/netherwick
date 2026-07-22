@@ -4,6 +4,10 @@ fn shadow_test_args(output: PathBuf) -> ShadowFlightArgs {
         input: None,
         seed: 7,
         ticks: 2,
+        ledger_retained_frames: 64,
+        ledger_retained_transitions: 64,
+        retained_events: 100_000,
+        retained_input_frames: 10_000,
         clock: ShadowClockMode::Accelerated,
         speed: 1_000.0,
         higher_brain: ShadowHigherBrainMode::Disabled,
@@ -92,6 +96,25 @@ async fn seeded_shadow_flight_is_reproducible_complete_and_transport_isolated() 
         &["test://shadow-flight".into()],
     );
     assert!(certification.passed, "{:#?}", certification.gates);
+    let ledger_frames = RollingLedger::new(left_args.output.join("ledger"), 64, 64)
+        .frames()
+        .await
+        .unwrap();
+    assert!(ledger_frames.iter().flat_map(|frame| &frame.behavior_runs).all(
+        |run| run.input_json.get("now").is_none()
+    ));
+    assert!(ledger_frames
+        .iter()
+        .flat_map(|frame| &frame.behavior_runs)
+        .any(|run| run.input_json.get("now_ref").is_some()));
+    let serialized_ledger_bytes = ledger_frames
+        .iter()
+        .map(|frame| serde_json::to_vec(frame).unwrap().len())
+        .sum::<usize>();
+    assert!(
+        serialized_ledger_bytes < 4 * 1024 * 1024,
+        "two compacted ledger frames used {serialized_ledger_bytes} bytes"
+    );
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -111,6 +134,37 @@ async fn required_higher_brain_substitution_fails_without_explicit_authorization
     let failure: serde_json::Value =
         serde_json::from_slice(&fs::read(root.join("failure.json")).unwrap()).unwrap();
     assert_eq!(failure["status"], "failed");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn sustained_artifacts_use_declared_rolling_replay_windows() {
+    let root = std::env::temp_dir().join(format!("pete-shadow-rolling-{}", Uuid::new_v4()));
+    let args = ShadowFlightArgs {
+        ticks: 3,
+        ledger_retained_frames: 1,
+        ledger_retained_transitions: 1,
+        retained_events: 10,
+        retained_input_frames: 1,
+        faults: Vec::new(),
+        output: root.clone(),
+        ..shadow_test_args(root.clone())
+    };
+    let (manifest, summary) = run_shadow_flight(&args).await.unwrap();
+    assert_eq!(summary.ticks_completed, 3);
+    assert_eq!(manifest.retained_event_records, 10);
+    assert!(manifest.dropped_event_records > 0);
+    assert_eq!(manifest.retained_input_frames, 1);
+    assert_eq!(manifest.dropped_input_frames, 2);
+    assert_eq!(fs::read_to_string(root.join("events.jsonl")).unwrap().lines().count(), 10);
+    assert_eq!(
+        RollingLedger::new(root.join("ledger"), usize::MAX, usize::MAX)
+            .frames()
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     fs::remove_dir_all(root).unwrap();
 }
 

@@ -23,7 +23,9 @@ use pete_cockpit::{
 use pete_conductor::{
     Conductor, ConductorInput, GoalProgressReport, SimpleConductor, StrategyProgressResponse,
 };
-use pete_ledger::{ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter};
+use pete_ledger::{
+    ExperienceFrame, ExperienceTransition, JsonlLedger, LedgerReader, LedgerWriter, RollingLedger,
+};
 use pete_llm::{ConfiguredLlmAgent, LiveImageEnricher, LlmConfig, LlmProvider};
 use pete_map::{
     observation_from_now, transform_point_to_world, LocalMap, LoopClosureCandidateInput,

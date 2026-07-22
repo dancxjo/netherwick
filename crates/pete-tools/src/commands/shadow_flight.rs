@@ -128,6 +128,16 @@ struct ShadowFlightArgs {
     seed: u64,
     #[arg(long, default_value_t = 1_000)]
     ticks: usize,
+    /// Rolling production-ledger replay window. Long runs retain their most
+    /// recent failure context without unbounded filesystem growth.
+    #[arg(long, default_value_t = 64)]
+    ledger_retained_frames: usize,
+    #[arg(long, default_value_t = 64)]
+    ledger_retained_transitions: usize,
+    #[arg(long, default_value_t = 100_000)]
+    retained_events: usize,
+    #[arg(long, default_value_t = 10_000)]
+    retained_input_frames: usize,
     #[arg(long, value_enum, default_value = "accelerated")]
     clock: ShadowClockMode,
     #[arg(long, default_value_t = 100.0)]
@@ -202,6 +212,14 @@ struct ShadowFlightManifest {
     network_required: bool,
     physical_hardware_required: bool,
     lidar_required: bool,
+    ledger_retained_frames: usize,
+    ledger_retained_transitions: usize,
+    event_retention_limit: usize,
+    input_retention_limit: usize,
+    retained_event_records: usize,
+    dropped_event_records: u64,
+    retained_input_frames: usize,
+    dropped_input_frames: u64,
     input_frames_path: String,
     events_path: String,
     summary_path: String,
@@ -211,7 +229,7 @@ struct ShadowFlightManifest {
 }
 
 type ShadowRuntime = MinimalRuntime<
-    JsonlLedger,
+    RollingLedger,
     DurableExperienceStore,
     DurableExperienceStore,
     SimpleConductor,
@@ -219,10 +237,89 @@ type ShadowRuntime = MinimalRuntime<
     ShadowLlmAgent,
 >;
 
-fn shadow_runtime(ledger: &Path, higher_brain: ShadowHigherBrainMode) -> ShadowRuntime {
+struct ShadowRunAggregate {
+    ticks_completed: u64,
+    canonical_events: u64,
+    event_type_counts: BTreeMap<String, u64>,
+    outcome_feedback_frames: u64,
+    inline_learning_samples_observed: u64,
+    higher_brain_authority_violations: u64,
+    higher_brain_advice_responses: u64,
+    higher_brain_advisory_actions_discarded: u64,
+    local_authority: Sha256,
+}
+
+impl Default for ShadowRunAggregate {
+    fn default() -> Self {
+        Self {
+            ticks_completed: 0,
+            canonical_events: 0,
+            event_type_counts: BTreeMap::new(),
+            outcome_feedback_frames: 0,
+            inline_learning_samples_observed: 0,
+            higher_brain_authority_violations: 0,
+            higher_brain_advice_responses: 0,
+            higher_brain_advisory_actions_discarded: 0,
+            local_authority: Sha256::new(),
+        }
+    }
+}
+
+impl ShadowRunAggregate {
+    fn observe_input(&mut self, input: &ShadowInputFrameProvenance) {
+        self.ticks_completed += 1;
+        self.outcome_feedback_frames +=
+            u64::from(!input.outcome_feedback_event_ids.is_empty());
+        self.inline_learning_samples_observed += input.inline_learning_samples_observed as u64;
+    }
+
+    fn observe_event(&mut self, event: &BrainEvent) -> Result<()> {
+        self.canonical_events += 1;
+        *self
+            .event_type_counts
+            .entry(event.event_type.as_str().to_string())
+            .or_insert(0) += 1;
+        if matches!(event.producer.brain, Brain::Forebrain | Brain::HigherBrain)
+            && !matches!(
+                event.authority,
+                AuthoritySignificance::None | AuthoritySignificance::Advisory
+            )
+        {
+            self.higher_brain_authority_violations += 1;
+        }
+        if event.kind == "brain.exchange.higher_to_mother.response"
+            && event.disposition == EventDisposition::Accepted
+        {
+            self.higher_brain_advice_responses += 1;
+        }
+        if event.kind == "brain.exchange.higher_to_mother.action_discarded"
+            && event.disposition == EventDisposition::Rejected
+            && event.authority == AuthoritySignificance::Advisory
+        {
+            self.higher_brain_advisory_actions_discarded += 1;
+        }
+        if matches!(
+            event.authority,
+            AuthoritySignificance::Gate | AuthoritySignificance::Command
+        ) && !matches!(event.producer.brain, Brain::Forebrain | Brain::HigherBrain)
+        {
+            self.local_authority
+                .update(serde_json::to_vec(event)?);
+            self.local_authority.update(b"\n");
+        }
+        Ok(())
+    }
+}
+
+fn shadow_runtime(
+    ledger: &Path,
+    higher_brain: ShadowHigherBrainMode,
+    retained_frames: usize,
+    retained_transitions: usize,
+) -> ShadowRuntime {
     let memory = DurableExperienceStore::new(InMemoryExperienceStore::new());
     MinimalRuntime::with_default_events(
-        JsonlLedger::new(ledger),
+        RollingLedger::new(ledger, retained_frames, retained_transitions),
         memory.clone(),
         memory,
         SimpleConductor::default(),
@@ -325,8 +422,11 @@ fn record_shadow_tick(
     snapshot: &WorldSnapshot,
     tick: &RuntimeTick,
     input: ShadowInputFrameProvenance,
-    events: &mut Vec<ShadowEventRecord>,
-    inputs: &mut Vec<ShadowInputFrameProvenance>,
+    events: &mut VecDeque<ShadowEventRecord>,
+    inputs: &mut VecDeque<ShadowInputFrameProvenance>,
+    aggregate: &mut ShadowRunAggregate,
+    retained_events: usize,
+    retained_inputs: usize,
 ) -> Result<()> {
     let canonical = LiveViewState::runtime_tick_brain_events(snapshot, tick);
     record_shadow_events(
@@ -336,6 +436,9 @@ fn record_shadow_tick(
         input,
         events,
         inputs,
+        aggregate,
+        retained_events,
+        retained_inputs,
     )
 }
 
@@ -344,19 +447,30 @@ fn record_shadow_events(
     frame_id: Uuid,
     t_ms: u64,
     input: ShadowInputFrameProvenance,
-    events: &mut Vec<ShadowEventRecord>,
-    inputs: &mut Vec<ShadowInputFrameProvenance>,
+    events: &mut VecDeque<ShadowEventRecord>,
+    inputs: &mut VecDeque<ShadowInputFrameProvenance>,
+    aggregate: &mut ShadowRunAggregate,
+    retained_events: usize,
+    retained_inputs: usize,
 ) -> Result<()> {
     canonical.extend(shadow_brainstem_events(frame_id, t_ms));
     for event in canonical {
         event.validate().map_err(anyhow::Error::msg)?;
-        events.push(ShadowEventRecord {
-            sequence: events.len() as u64 + 1,
+        aggregate.observe_event(&event)?;
+        events.push_back(ShadowEventRecord {
+            sequence: aggregate.canonical_events,
             input_frame_id: input.input_frame_id.clone(),
             event,
         });
+        if events.len() > retained_events {
+            events.pop_front();
+        }
     }
-    inputs.push(input);
+    aggregate.observe_input(&input);
+    inputs.push_back(input);
+    if inputs.len() > retained_inputs {
+        inputs.pop_front();
+    }
     Ok(())
 }
 
@@ -430,6 +544,12 @@ async fn run_shadow_flight_inner(
     if !args.speed.is_finite() || args.speed <= 0.0 {
         anyhow::bail!("--speed must be finite and greater than zero");
     }
+    if args.ledger_retained_frames == 0 || args.ledger_retained_transitions == 0 {
+        anyhow::bail!("rolling ledger retention counts must be greater than zero");
+    }
+    if args.retained_events == 0 || args.retained_input_frames == 0 {
+        anyhow::bail!("rolling event and input retention counts must be greater than zero");
+    }
     if matches!(args.source, ShadowFlightSource::Capture | ShadowFlightSource::Ledger)
         && args.input.is_none()
     {
@@ -452,8 +572,9 @@ async fn run_shadow_flight_inner(
     }
     fs::create_dir_all(&args.output)?;
     let ledger_path = args.output.join("ledger");
-    let mut inputs = Vec::new();
-    let mut events = Vec::new();
+    let mut inputs = VecDeque::new();
+    let mut events = VecDeque::new();
+    let mut aggregate = ShadowRunAggregate::default();
     let mut prior_ms = None;
     let source_identity;
 
@@ -461,7 +582,12 @@ async fn run_shadow_flight_inner(
         ShadowFlightSource::Fixture | ShadowFlightSource::Seeded => {
             let effective_seed = if args.source == ShadowFlightSource::Fixture { 7 } else { args.seed };
             source_identity = format!("seeded:mixed-room:{effective_seed}");
-            let runtime = shadow_runtime(&ledger_path, args.higher_brain);
+            let runtime = shadow_runtime(
+                &ledger_path,
+                args.higher_brain,
+                args.ledger_retained_frames,
+                args.ledger_retained_transitions,
+            );
             let scenario = build_scenario(ScenarioConfig::new(ScenarioKind::MixedRoom, effective_seed));
             let mut runner = SimRunner::new(runtime, scenario.world, scenario.motors);
             for index in 0..args.ticks {
@@ -511,6 +637,9 @@ async fn run_shadow_flight_inner(
                     },
                     &mut events,
                     &mut inputs,
+                    &mut aggregate,
+                    args.retained_events,
+                    args.retained_input_frames,
                 )?;
             }
         }
@@ -519,7 +648,12 @@ async fn run_shadow_flight_inner(
             let reader = CaptureReader::open(input).await?;
             source_identity = format!("capture:{}", reader.manifest().id);
             let frames = reader.read_frames().await?;
-            let mut runtime = shadow_runtime(&ledger_path, args.higher_brain);
+            let mut runtime = shadow_runtime(
+                &ledger_path,
+                args.higher_brain,
+                args.ledger_retained_frames,
+                args.ledger_retained_transitions,
+            );
             for record in frames.into_iter().take(args.ticks) {
                 let input_frame_id = format!("{}:{}", source_identity, record.index);
                 let runtime_frame_id = shadow_frame_uuid(&input_frame_id);
@@ -554,15 +688,28 @@ async fn run_shadow_flight_inner(
                     },
                     &mut events,
                     &mut inputs,
+                    &mut aggregate,
+                    args.retained_events,
+                    args.retained_input_frames,
                 )?;
             }
         }
         ShadowFlightSource::Ledger => {
             let input = args.input.as_ref().expect("validated ledger input");
             source_identity = format!("ledger:{}", input.display());
-            let source_ledger = JsonlLedger::new(input);
-            let frames = source_ledger.frames().await?;
-            let mut runtime = shadow_runtime(&ledger_path, args.higher_brain);
+            let frames = if input.join("rolling").exists() {
+                RollingLedger::new(input, usize::MAX, usize::MAX)
+                    .frames()
+                    .await?
+            } else {
+                JsonlLedger::new(input).frames().await?
+            };
+            let mut runtime = shadow_runtime(
+                &ledger_path,
+                args.higher_brain,
+                args.ledger_retained_frames,
+                args.ledger_retained_transitions,
+            );
             for (index, frame) in frames.into_iter().take(args.ticks).enumerate() {
                 let input_frame_id = format!("ledger-frame:{}", frame.id);
                 runtime.set_next_frame_id(frame.id);
@@ -598,6 +745,9 @@ async fn run_shadow_flight_inner(
                     },
                     &mut events,
                     &mut inputs,
+                    &mut aggregate,
+                    args.retained_events,
+                    args.retained_input_frames,
                 )?;
             }
         }
@@ -606,58 +756,20 @@ async fn run_shadow_flight_inner(
     let input_bytes = inputs.iter().map(serde_json::to_string).collect::<std::result::Result<Vec<_>, _>>()?.join("\n") + "\n";
     let event_bytes = events.iter().map(serde_json::to_string).collect::<std::result::Result<Vec<_>, _>>()?.join("\n") + "\n";
     let hash = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
-    let event_type_counts = events.iter().fold(BTreeMap::new(), |mut counts, record| {
-        *counts.entry(record.event.event_type.as_str().to_string()).or_insert(0) += 1;
-        counts
-    });
-    let local_authority_bytes = events
-        .iter()
-        .filter(|record| {
-            matches!(
-                record.event.authority,
-                AuthoritySignificance::Gate | AuthoritySignificance::Command
-            ) && !matches!(
-                record.event.producer.brain,
-                Brain::Forebrain | Brain::HigherBrain
-            )
-        })
-        .map(|record| serde_json::to_string(&record.event))
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .join("\n");
+    let event_type_counts = aggregate.event_type_counts.clone();
     let chain = ["evidence", "interpretation", "belief_update", "proposal", "gate_decision", "command", "outcome"];
     let summary = ShadowFlightSummary {
-        ticks_completed: inputs.len() as u64,
-        canonical_events: events.len() as u64,
+        ticks_completed: aggregate.ticks_completed,
+        canonical_events: aggregate.canonical_events,
         full_causal_chain_observed: chain.iter().all(|kind| event_type_counts.contains_key(*kind)),
         simulated_outcomes: *event_type_counts.get("outcome").unwrap_or(&0),
-        outcome_feedback_frames: inputs
-            .iter()
-            .filter(|input| !input.outcome_feedback_event_ids.is_empty())
-            .count() as u64,
-        inline_learning_samples_observed: inputs
-            .iter()
-            .map(|input| input.inline_learning_samples_observed as u64)
-            .sum(),
-        higher_brain_advice_responses: events
-            .iter()
-            .filter(|record| {
-                record.event.kind == "brain.exchange.higher_to_mother.response"
-                    && record.event.disposition == EventDisposition::Accepted
-            })
-            .count() as u64,
-        higher_brain_advisory_actions_discarded: events
-            .iter()
-            .filter(|record| {
-                record.event.kind == "brain.exchange.higher_to_mother.action_discarded"
-                    && record.event.disposition == EventDisposition::Rejected
-                    && record.event.authority == AuthoritySignificance::Advisory
-            })
-            .count() as u64,
-        higher_brain_authority_violations: events.iter().filter(|record| {
-            matches!(record.event.producer.brain, Brain::Forebrain | Brain::HigherBrain)
-                && !matches!(record.event.authority, AuthoritySignificance::None | AuthoritySignificance::Advisory)
-        }).count() as u64,
-        local_authority_sha256: hash(local_authority_bytes.as_bytes()),
+        outcome_feedback_frames: aggregate.outcome_feedback_frames,
+        inline_learning_samples_observed: aggregate.inline_learning_samples_observed,
+        higher_brain_advice_responses: aggregate.higher_brain_advice_responses,
+        higher_brain_advisory_actions_discarded: aggregate
+            .higher_brain_advisory_actions_discarded,
+        higher_brain_authority_violations: aggregate.higher_brain_authority_violations,
+        local_authority_sha256: format!("{:x}", aggregate.local_authority.clone().finalize()),
         safety_gate_events: *event_type_counts.get("gate_decision").unwrap_or(&0),
         event_type_counts,
         events_sha256: hash(event_bytes.as_bytes()),
@@ -680,7 +792,7 @@ async fn run_shadow_flight_inner(
     fs::write(args.output.join("events.jsonl"), &event_bytes)?;
     fs::write(args.output.join("summary.json"), &summary_bytes)?;
     let manifest = ShadowFlightManifest {
-        schema_version: 1,
+        schema_version: 2,
         status: "complete".into(),
         source: args.source,
         source_identity,
@@ -694,7 +806,7 @@ async fn run_shadow_flight_inner(
         speed: args.speed,
         requested_ticks: args.ticks,
         completed_ticks: summary.ticks_completed,
-        production_components: vec!["pete_runtime::MinimalRuntime".into(), "pete_conductor::SimpleConductor".into(), "pete_autonomic::SimpleSafety".into(), "pete_runtime::SimRunner".into(), "pete_server::LiveViewState::runtime_tick_brain_events".into(), "pete_ledger::JsonlLedger".into(), "pete_memory::DurableExperienceStore".into()],
+        production_components: vec!["pete_runtime::MinimalRuntime".into(), "pete_conductor::SimpleConductor".into(), "pete_autonomic::SimpleSafety".into(), "pete_runtime::SimRunner".into(), "pete_server::LiveViewState::runtime_tick_brain_events".into(), "pete_ledger::RollingLedger".into(), "pete_memory::DurableExperienceStore".into()],
         substitutions: match args.higher_brain {
             ShadowHigherBrainMode::Disabled => Vec::new(),
             ShadowHigherBrainMode::AdvisoryStub | ShadowHigherBrainMode::AdversarialMotion => vec![
@@ -705,6 +817,14 @@ async fn run_shadow_flight_inner(
         network_required: false,
         physical_hardware_required: false,
         lidar_required: false,
+        ledger_retained_frames: args.ledger_retained_frames,
+        ledger_retained_transitions: args.ledger_retained_transitions,
+        event_retention_limit: args.retained_events,
+        input_retention_limit: args.retained_input_frames,
+        retained_event_records: events.len(),
+        dropped_event_records: summary.canonical_events.saturating_sub(events.len() as u64),
+        retained_input_frames: inputs.len(),
+        dropped_input_frames: summary.ticks_completed.saturating_sub(inputs.len() as u64),
         input_frames_path: "input-frames.jsonl".into(),
         events_path: "events.jsonl".into(),
         summary_path: "summary.json".into(),

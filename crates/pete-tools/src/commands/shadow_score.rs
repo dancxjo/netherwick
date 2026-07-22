@@ -40,6 +40,10 @@ fn run_shadow_score(args: ShadowScoreArgs) -> Result<()> {
             "higher_brain_mode": manifest.higher_brain_mode,
             "production_components": manifest.production_components,
             "substitutions": manifest.substitutions,
+            "ledger_retained_frames": manifest.ledger_retained_frames,
+            "ledger_retained_transitions": manifest.ledger_retained_transitions,
+            "event_retention_limit": manifest.event_retention_limit,
+            "input_retention_limit": manifest.input_retention_limit,
         }))?)
     );
     let identity = pete_worldlab::CertificationRunIdentity::deterministic(
