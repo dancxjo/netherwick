@@ -23,9 +23,9 @@ use pete_behaviors::{BehaviorNodeState, BehaviorNodeUpdate, BehaviorRegime};
 use pete_cockpit::{MotionCommand, MotorCommand};
 use pete_core::TimeMs;
 use pete_events::{
-    ArtifactKind, AuthoritySignificance, Brain, BrainEvent, BrainEventId, BrainEventPayload,
-    BrainEventType, EventDisposition, EventTimes, LossPolicy, PayloadReference, ProducerIdentity,
-    TrustState,
+    ArtifactIdentity, ArtifactKind, AuthoritySignificance, Brain, BrainEvent, BrainEventId,
+    BrainEventPayload, BrainEventType, EventDisposition, EventTimes, LossPolicy, PayloadReference,
+    ProducerIdentity, TrustState,
 };
 use pete_experience::EmbodiedContext;
 use pete_map::{
@@ -68,6 +68,7 @@ include!("server/observatory_graph.rs");
 include!("server/observatory_authority.rs");
 include!("server/observatory_calibration.rs");
 include!("server/observatory_spatial.rs");
+include!("server/observatory_health.rs");
 
 const REIGN_PAGE: &str = include_str!("web/reign.html");
 const COGNITIVE_VIEW_PAGE: &str = include_str!("web/cognitive.html");

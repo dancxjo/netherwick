@@ -63,15 +63,16 @@ pub fn live_view_router(state: LiveViewState) -> Router {
             "/api/observatory/provenance/{id}",
             get(get_observatory_provenance),
         )
-        .route(
-            "/api/observatory/authority",
-            get(get_observatory_authority),
-        )
+        .route("/api/observatory/authority", get(get_observatory_authority))
         .route(
             "/api/observatory/calibration",
             get(get_observatory_calibration),
         )
         .route("/api/observatory/spatial", get(get_observatory_spatial))
+        .route(
+            "/api/observatory/component-health",
+            get(get_observatory_component_health),
+        )
         .nest_service(
             "/static",
             ServeDir::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("static")),
