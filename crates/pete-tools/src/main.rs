@@ -96,6 +96,7 @@ include!("commands/models.rs");
 include!("commands/reports.rs");
 include!("commands/vision.rs");
 include!("commands/shadow_flight.rs");
+include!("commands/shadow_score.rs");
 
 #[cfg(test)]
 #[path = "main_tests.rs"]

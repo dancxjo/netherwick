@@ -55,6 +55,7 @@ enum Command {
     EmbodiedEval(EmbodiedEvalArgs),
     VisionEval(VisionEvalArgs),
     ShadowFlight(ShadowFlightArgs),
+    ShadowScore(ShadowScoreArgs),
 }
 
 #[tokio::main]
@@ -97,6 +98,7 @@ async fn main() -> Result<()> {
         Command::EmbodiedEval(args) => run_embodied_eval(args).await,
         Command::VisionEval(args) => run_vision_eval(args).await,
         Command::ShadowFlight(args) => run_shadow_flight_command(args).await,
+        Command::ShadowScore(args) => run_shadow_score(args),
         other => {
             println!("selected command: {:?}", other);
             Ok(())

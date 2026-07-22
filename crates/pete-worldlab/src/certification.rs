@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use pete_events::{Brain, BrainEvent, BrainEventType, EventDisposition};
+use pete_events::{BrainEvent, BrainEventType, EventDisposition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -54,6 +54,8 @@ pub struct CertificationMetric {
     pub confidence: f32,
     pub coverage: f32,
     pub supporting_event_ids: Vec<String>,
+    #[serde(default)]
+    pub missing_evidence_event_ids: Vec<String>,
     pub bundle_references: Vec<String>,
     pub unavailable_reason: Option<String>,
 }
@@ -155,7 +157,7 @@ const METRICS: &[MetricDefinition] = &[
     MetricDefinition {
         name: "queue_loss",
         unit: "events",
-        terms: &["queue", "dropped", "gap"],
+        terms: &["dropped", "transport_gap", "queue.loss"],
         event_type: None,
     },
     MetricDefinition {
@@ -212,6 +214,11 @@ pub fn score_shadow_events(
         let supporting = metric_events(definition, events);
         let metric = if definition.name == "provenance_evidence_completeness" {
             provenance_metric(events, bundle_references)
+        } else if supporting.is_empty()
+            && is_zero_observable_count(definition)
+            && !events.is_empty()
+        {
+            zero_metric(definition, bundle_references)
         } else if supporting.is_empty() {
             unavailable_metric(definition, bundle_references)
         } else {
@@ -245,6 +252,33 @@ pub fn score_shadow_events(
     };
     report.report_sha256 = report_hash(&report);
     report
+}
+
+fn is_zero_observable_count(definition: &MetricDefinition) -> bool {
+    matches!(
+        definition.name,
+        "safety_violations"
+            | "collision_contact_incidence"
+            | "oscillation_indecision_stopping"
+            | "queue_loss"
+            | "higher_brain_distraction"
+            | "higher_brain_resource_cost"
+    )
+}
+
+fn zero_metric(definition: &MetricDefinition, bundles: &[String]) -> CertificationMetric {
+    CertificationMetric {
+        name: definition.name.into(),
+        availability: MetricAvailability::Available,
+        value: Some(0.0),
+        unit: definition.unit.into(),
+        confidence: 1.0,
+        coverage: 1.0,
+        supporting_event_ids: Vec::new(),
+        missing_evidence_event_ids: Vec::new(),
+        bundle_references: bundles.to_vec(),
+        unavailable_reason: None,
+    }
 }
 
 fn metric_events<'a>(
@@ -315,6 +349,7 @@ fn available_metric(
             .iter()
             .map(|event| event.event_id.to_string())
             .collect(),
+        missing_evidence_event_ids: Vec::new(),
         bundle_references: bundle_references.to_vec(),
         unavailable_reason: None,
     }
@@ -329,6 +364,7 @@ fn unavailable_metric(definition: &MetricDefinition, bundles: &[String]) -> Cert
         confidence: 0.0,
         coverage: 0.0,
         supporting_event_ids: Vec::new(),
+        missing_evidence_event_ids: Vec::new(),
         bundle_references: bundles.to_vec(),
         unavailable_reason: Some("no supporting canonical events were present".into()),
     }
@@ -338,7 +374,26 @@ fn provenance_metric(events: &[BrainEvent], bundles: &[String]) -> Certification
     if events.is_empty() {
         return unavailable_metric(&METRICS[10], bundles);
     }
-    let complete = events
+    let relevant = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event_type,
+                BrainEventType::Evidence
+                    | BrainEventType::Interpretation
+                    | BrainEventType::BeliefUpdate
+                    | BrainEventType::Proposal
+                    | BrainEventType::GateDecision
+                    | BrainEventType::Command
+                    | BrainEventType::Outcome
+                    | BrainEventType::CalibrationTransition
+            )
+        })
+        .collect::<Vec<_>>();
+    if relevant.is_empty() {
+        return unavailable_metric(&METRICS[10], bundles);
+    }
+    let complete = relevant
         .iter()
         .filter(|event| {
             event.references.frame_id.is_some()
@@ -349,10 +404,19 @@ fn provenance_metric(events: &[BrainEvent], bundles: &[String]) -> Certification
                     ))
         })
         .collect::<Vec<_>>();
+    let complete_ids = complete
+        .iter()
+        .map(|event| event.event_id.to_string())
+        .collect::<BTreeSet<_>>();
+    let missing_evidence_event_ids = relevant
+        .iter()
+        .map(|event| event.event_id.to_string())
+        .filter(|event_id| !complete_ids.contains(event_id))
+        .collect();
     CertificationMetric {
         name: "provenance_evidence_completeness".into(),
         availability: MetricAvailability::Available,
-        value: Some(complete.len() as f64 / events.len() as f64),
+        value: Some(complete.len() as f64 / relevant.len() as f64),
         unit: "ratio".into(),
         confidence: 1.0,
         coverage: 1.0,
@@ -360,6 +424,7 @@ fn provenance_metric(events: &[BrainEvent], bundles: &[String]) -> Certification
             .iter()
             .map(|event| event.event_id.to_string())
             .collect(),
+        missing_evidence_event_ids,
         bundle_references: bundles.to_vec(),
         unavailable_reason: None,
     }
@@ -410,7 +475,11 @@ fn gate(
         passed,
         threshold,
         observed: measurement.value,
-        supporting_event_ids: measurement.supporting_event_ids.clone(),
+        supporting_event_ids: if passed || measurement.missing_evidence_event_ids.is_empty() {
+            measurement.supporting_event_ids.clone()
+        } else {
+            measurement.missing_evidence_event_ids.clone()
+        },
         failure_reason: (!passed).then(|| {
             measurement
                 .unavailable_reason
@@ -498,7 +567,7 @@ fn report_hash(report: &ShadowCertificationReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pete_events::{BrainEventId, BrainEventPayload, EventTimes, ProducerIdentity};
+    use pete_events::{Brain, BrainEventId, BrainEventPayload, EventTimes, ProducerIdentity};
     use serde_json::json;
 
     fn event(index: u64, kind: &str, event_type: BrainEventType) -> BrainEvent {
@@ -527,10 +596,17 @@ mod tests {
 
     #[test]
     fn scoring_is_deterministic_and_missing_evidence_cannot_pass() {
-        let events = vec![
+        let mut events = vec![
             event(1, "actuator.dispatch_outcome", BrainEventType::Outcome),
             event(2, "motion.response", BrainEventType::Outcome),
         ];
+        let mut ungrounded = event(
+            3,
+            "interpretation.ungrounded",
+            BrainEventType::Interpretation,
+        );
+        ungrounded.links.parents.clear();
+        events.push(ungrounded);
         let left = score_shadow_events(identity("input"), &events, &["bundle://one".into()]);
         let right = score_shadow_events(identity("input"), &events, &["bundle://one".into()]);
         assert_eq!(left, right);

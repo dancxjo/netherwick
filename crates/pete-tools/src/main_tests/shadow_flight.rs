@@ -57,6 +57,23 @@ async fn seeded_shadow_flight_is_reproducible_complete_and_transport_isolated() 
         .contains("wheel_drop"));
     let advisory_events = fs::read_to_string(advisory_args.output.join("events.jsonl")).unwrap();
     assert!(advisory_events.contains("shadow higher-brain advice was produced"));
+    let canonical = fs::read_to_string(left_args.output.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<ShadowEventRecord>(line).unwrap().event)
+        .collect::<Vec<_>>();
+    let certification = pete_worldlab::score_shadow_events(
+        pete_worldlab::CertificationRunIdentity::deterministic(
+            left_manifest.input_frames_sha256.clone(),
+            "test:software",
+            "test:config",
+            left_manifest.source_identity.clone(),
+            left_manifest.seed,
+        ),
+        &canonical,
+        &["test://shadow-flight".into()],
+    );
+    assert!(certification.passed, "{:#?}", certification.gates);
 
     fs::remove_dir_all(root).unwrap();
 }
