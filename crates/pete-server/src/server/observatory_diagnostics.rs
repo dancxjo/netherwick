@@ -241,6 +241,36 @@ fn diagnostic_artifacts(events: &[SequencedBrainEvent]) -> Vec<ArtifactIdentity>
     artifacts.into_values().collect()
 }
 
+fn diagnostic_select_snapshots(
+    snapshots: &[ObservatoryNowSnapshot],
+    events: &[SequencedBrainEvent],
+) -> Vec<ObservatoryNowSnapshot> {
+    let snapshot_ids: BTreeSet<String> = events
+        .iter()
+        .filter_map(|event| event.event.references.snapshot_id.clone())
+        .collect();
+    let occurred_from_ms = events
+        .iter()
+        .map(|event| event.event.times.occurred.t_ms)
+        .min();
+    let occurred_to_ms = events
+        .iter()
+        .map(|event| event.event.times.occurred.t_ms)
+        .max();
+    snapshots
+        .iter()
+        .filter(|snapshot| {
+            snapshot_ids.contains(&snapshot.snapshot_id)
+                || matches!(
+                    (occurred_from_ms, occurred_to_ms),
+                    (Some(from_ms), Some(to_ms))
+                        if snapshot.now.t_ms >= from_ms && snapshot.now.t_ms <= to_ms
+                )
+        })
+        .cloned()
+        .collect()
+}
+
 fn build_diagnostic_bundle(input: DiagnosticBundleBuild<'_>) -> DiagnosticBundle {
     let DiagnosticBundleBuild {
         events,
@@ -566,14 +596,14 @@ async fn get_observatory_diagnostic_export(
     let hub = state.observatory();
     let (events, gaps, partial) = diagnostic_query_events(&hub, query.from_ms, query.to_ms)
         .map_err(|error| ObservatoryHttpError::bad_request(error.to_string()))?;
-    let snapshots = state
+    let retained_snapshots: Vec<ObservatoryNowSnapshot> = state
         .observatory_now
         .lock()
         .expect("observatory Now history mutex poisoned")
         .iter()
-        .filter(|snapshot| snapshot.now.t_ms >= query.from_ms && snapshot.now.t_ms <= query.to_ms)
         .cloned()
         .collect();
+    let snapshots = diagnostic_select_snapshots(&retained_snapshots, &events);
     Ok(Json(build_diagnostic_bundle(DiagnosticBundleBuild {
         events,
         snapshots,

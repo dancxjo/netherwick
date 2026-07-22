@@ -63,6 +63,30 @@ fn diagnostic_export_redacts_sensitive_assets_but_preserves_manifest_identity() 
 }
 
 #[test]
+fn export_links_observed_wall_time_events_to_monotonic_snapshots() {
+    let now = blank_now(4_200);
+    let event = BrainEvent::from_now_snapshot(
+        "snapshot-linked",
+        &now,
+        1_784_683_256_368,
+        Some("sim-clock".into()),
+    );
+    let retained = vec![
+        diagnostic_snapshot("snapshot-old", 4_100),
+        ObservatoryNowSnapshot {
+            snapshot_id: "snapshot-linked".into(),
+            now,
+        },
+    ];
+
+    let selected =
+        diagnostic_select_snapshots(&retained, &[SequencedBrainEvent { sequence: 1, event }]);
+
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].snapshot_id, "snapshot-linked");
+}
+
+#[test]
 fn import_verification_reports_missing_asset_manifest_entries() {
     let mut event = graph_event("audio", BrainEventType::Evidence, 100);
     event.payload = BrainEventPayload::Reference {
@@ -255,6 +279,7 @@ fn observatory_diagnostic_ui_exports_verifies_and_compares_selected_times() {
         "/api/observatory/diagnostic-export?",
         "/api/observatory/diagnostic-verify",
         "/api/observatory/compare?",
+        "name.startsWith('compare')?selectedOccurredMs():selectedObservedMs()",
     ] {
         assert!(OBSERVATORY_PAGE.contains(marker), "missing {marker}");
     }
