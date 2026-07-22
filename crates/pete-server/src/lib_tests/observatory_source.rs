@@ -23,20 +23,53 @@ fn replay_source(events: Vec<SequencedBrainEvent>) -> ReplayBrainEventSource {
 }
 
 #[test]
+fn capture_gap_ends_before_the_present_frame() {
+    let gap = capture_frame_gap(1, 3).expect("indices 1 and 2 are missing");
+    assert_eq!((gap.from_sequence, gap.to_sequence), (1, 2));
+    assert!(capture_frame_gap(3, 3).is_none());
+}
+
+#[tokio::test]
+async fn live_snapshot_discovery_paginates_through_the_newest_snapshot() {
+    let hub = BrainEventHub::new(BrainEventHubConfig {
+        ingress_capacity: 4_096,
+        history_capacity: 4_096,
+        broadcast_capacity: 4,
+        ..BrainEventHubConfig::default()
+    });
+    assert!(hub.start());
+    for sequence in 1..=2_048 {
+        let mut event = source_snapshot(sequence, sequence, "boot-a").event;
+        event.loss_policy = LossPolicy::LossIntolerant;
+        hub.publish(event).unwrap();
+    }
+    wait_for_observatory_sequence(&hub, 2_048).await;
+
+    let source = LiveBrainEventSource::new("live:test", "live test", hub.clone());
+    let snapshots = source.snapshots();
+    assert_eq!(snapshots.len(), 2_048);
+    assert_eq!(snapshots.last().map(|snapshot| snapshot.t_ms), Some(2_048));
+    assert_eq!(
+        source
+            .snapshot_at_or_before(2_048)
+            .map(|snapshot| snapshot.t_ms),
+        Some(2_048)
+    );
+    hub.shutdown().await;
+}
+
+#[test]
 fn recorded_chain_queries_identically_after_replay() {
     let recorded = vec![
         source_snapshot(1, 100, "boot-a"),
         source_snapshot(2, 200, "boot-a"),
     ];
     let source = replay_source(recorded.clone());
-    let response = source.query(&BrainEventQuery::default()).unwrap();
+    let response = source.query(&ObservatorySourceQuery::default()).unwrap();
     let replayed = response
-        .records
+        .events
         .into_iter()
-        .filter_map(|record| match record {
-            BrainEventStreamRecord::Event { envelope } => Some(envelope),
-            BrainEventStreamRecord::Gap { .. } => None,
-        })
+        .map(|event| event.envelope)
         .collect::<Vec<_>>();
     assert_eq!(replayed, recorded);
 }
@@ -66,14 +99,11 @@ fn clock_epoch_resets_remain_recorded_not_reordered() {
         source_snapshot(2, 10, "boot-b"),
     ];
     let source = replay_source(recorded.clone());
-    let response = source.query(&BrainEventQuery::default()).unwrap();
+    let response = source.query(&ObservatorySourceQuery::default()).unwrap();
     let events = response
-        .records
+        .events
         .into_iter()
-        .filter_map(|record| match record {
-            BrainEventStreamRecord::Event { envelope } => Some(envelope),
-            BrainEventStreamRecord::Gap { .. } => None,
-        })
+        .map(|event| event.envelope)
         .collect::<Vec<_>>();
     assert_eq!(events[0].sequence, 1);
     assert_eq!(events[1].sequence, 2);
@@ -96,12 +126,26 @@ fn candidate_model_events_stay_in_a_separate_lane() {
             model_id: "candidate-v2".to_string()
         }
     );
-    let query = source.query(&BrainEventQuery::default()).unwrap();
-    assert_eq!(query.records.len(), 1);
-    assert!(matches!(
-        &query.records[0],
-        BrainEventStreamRecord::Event { envelope } if envelope == &recorded
-    ));
+    let recorded_query = source.query(&ObservatorySourceQuery::default()).unwrap();
+    assert_eq!(recorded_query.events.len(), 1);
+    assert_eq!(recorded_query.events[0].envelope, recorded);
+    assert_eq!(recorded_query.events[0].lane, ObservatoryEventLane::Recorded);
+
+    let candidate_query = source
+        .query(&ObservatorySourceQuery {
+            lane: ObservatoryEventLaneSelector::Reprocessed,
+            lane_model: Some("candidate-v2".into()),
+            ..ObservatorySourceQuery::default()
+        })
+        .unwrap();
+    assert_eq!(candidate_query.events.len(), 1);
+    assert_eq!(candidate_query.events[0].envelope, candidate);
+    assert_eq!(
+        candidate_query.events[0].lane,
+        ObservatoryEventLane::Reprocessed {
+            model_id: "candidate-v2".into()
+        }
+    );
 }
 
 #[test]
@@ -116,15 +160,12 @@ fn incomplete_source_reports_gaps_without_hiding_available_history() {
     let health = source.health();
     assert!(!health.complete);
     assert_eq!(health.gaps[0].from_sequence, 1);
-    let response = source.query(&BrainEventQuery::default()).unwrap();
+    let response = source.query(&ObservatorySourceQuery::default()).unwrap();
     assert_eq!(
-        response
-            .records
-            .iter()
-            .filter(|record| matches!(record, BrainEventStreamRecord::Event { .. }))
-            .count(),
+        response.events.len(),
         1
     );
+    assert_eq!(response.gaps.len(), 1);
 }
 
 #[test]

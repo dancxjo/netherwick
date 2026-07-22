@@ -20,6 +20,32 @@ pub enum ObservatoryEventLane {
     Reprocessed { model_id: String },
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservatoryEventLaneSelector {
+    #[default]
+    Recorded,
+    Reprocessed,
+    All,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ObservatorySourceQuery {
+    #[serde(flatten)]
+    pub event: BrainEventQuery,
+    #[serde(default)]
+    pub lane: ObservatoryEventLaneSelector,
+    pub lane_model: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ObservatorySourceHistoryResponse {
+    pub events: Vec<ObservatorySourceEvent>,
+    pub gaps: Vec<BrainEventSequenceGap>,
+    pub next_cursor: u64,
+    pub health: BrainEventTransportHealth,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ObservatorySourceEvent {
     pub envelope: SequencedBrainEvent,
@@ -54,8 +80,8 @@ pub trait BrainEventSource: Send + Sync {
     fn identity(&self) -> ObservatorySourceIdentity;
     fn query(
         &self,
-        query: &BrainEventQuery,
-    ) -> Result<BrainEventHistoryResponse, BrainEventQueryError>;
+        query: &ObservatorySourceQuery,
+    ) -> Result<ObservatorySourceHistoryResponse, BrainEventQueryError>;
     fn snapshots(&self) -> Vec<ObservatorySnapshotRef>;
     fn snapshot_at_or_before(&self, t_ms: u64) -> Option<ObservatorySnapshotRef>;
     fn asset(&self, id: &str) -> Option<ObservatoryAssetRef>;
@@ -89,22 +115,65 @@ impl BrainEventSource for LiveBrainEventSource {
 
     fn query(
         &self,
-        query: &BrainEventQuery,
-    ) -> Result<BrainEventHistoryResponse, BrainEventQueryError> {
-        self.hub.query(query)
+        query: &ObservatorySourceQuery,
+    ) -> Result<ObservatorySourceHistoryResponse, BrainEventQueryError> {
+        query.event.validate(self.hub.shared.config.max_query_limit)?;
+        let health = self.hub.health();
+        if query.lane == ObservatoryEventLaneSelector::Reprocessed {
+            return Ok(ObservatorySourceHistoryResponse {
+                events: Vec::new(),
+                gaps: Vec::new(),
+                next_cursor: query.event.after_sequence.unwrap_or(0),
+                health,
+            });
+        }
+        let response = self.hub.query(&query.event)?;
+        let mut events = Vec::new();
+        let mut gaps = Vec::new();
+        for record in response.records {
+            match record {
+                BrainEventStreamRecord::Event { envelope } => {
+                    events.push(ObservatorySourceEvent {
+                        envelope,
+                        lane: ObservatoryEventLane::Recorded,
+                    });
+                }
+                BrainEventStreamRecord::Gap { gap } => gaps.push(gap),
+            }
+        }
+        Ok(ObservatorySourceHistoryResponse {
+            events,
+            gaps,
+            next_cursor: response.next_cursor,
+            health: response.health,
+        })
     }
 
     fn snapshots(&self) -> Vec<ObservatorySnapshotRef> {
-        source_snapshots(
-            &self
-                .hub
-                .query(&BrainEventQuery {
+        let mut snapshots = Vec::new();
+        let mut after_sequence = None;
+        loop {
+            let Ok(page) = self.hub.query(&BrainEventQuery {
+                    after_sequence,
                     event_type: Some(BrainEventType::Snapshot),
                     limit: Some(self.hub.shared.config.max_query_limit),
                     ..BrainEventQuery::default()
-                })
-                .ok(),
-        )
+                }) else {
+                break;
+            };
+            let prior_cursor = after_sequence.unwrap_or(0);
+            snapshots.extend(page.records.iter().filter_map(|record| match record {
+                BrainEventStreamRecord::Event { envelope } => {
+                    snapshot_from_event(&envelope.event)
+                }
+                BrainEventStreamRecord::Gap { .. } => None,
+            }));
+            if page.next_cursor <= prior_cursor {
+                break;
+            }
+            after_sequence = Some(page.next_cursor);
+        }
+        snapshots
     }
 
     fn snapshot_at_or_before(&self, t_ms: u64) -> Option<ObservatorySnapshotRef> {
@@ -182,12 +251,8 @@ impl ReplayBrainEventSource {
         let mut previous_t_ms = None;
         let mut sequence = 0_u64;
         for frame in frames {
-            if frame.index > expected_index {
-                gaps.push(BrainEventSequenceGap::new(
-                    expected_index.saturating_add(1),
-                    frame.index,
-                    SequenceGapReason::RetentionExpired,
-                ));
+            if let Some(gap) = capture_frame_gap(expected_index, frame.index) {
+                gaps.push(gap);
             }
             expected_index = frame.index.saturating_add(1);
             if previous_t_ms.is_some_and(|previous| frame.t_ms < previous) {
@@ -298,40 +363,48 @@ impl BrainEventSource for ReplayBrainEventSource {
 
     fn query(
         &self,
-        query: &BrainEventQuery,
-    ) -> Result<BrainEventHistoryResponse, BrainEventQueryError> {
-        query.validate(MAX_OBSERVATORY_QUERY_LIMIT)?;
-        let after = query.after_sequence.unwrap_or(0);
-        let limit = query.limit.unwrap_or(DEFAULT_OBSERVATORY_QUERY_LIMIT);
-        let mut records = Vec::new();
+        query: &ObservatorySourceQuery,
+    ) -> Result<ObservatorySourceHistoryResponse, BrainEventQueryError> {
+        query.event.validate(MAX_OBSERVATORY_QUERY_LIMIT)?;
+        if query
+            .lane_model
+            .as_deref()
+            .is_some_and(|model| model.trim().is_empty())
+        {
+            return Err(BrainEventQueryError::new("lane_model filter cannot be empty"));
+        }
+        let after = query.event.after_sequence.unwrap_or(0);
+        let limit = query
+            .event
+            .limit
+            .unwrap_or(DEFAULT_OBSERVATORY_QUERY_LIMIT);
+        let mut events = Vec::new();
         let mut next_cursor = after;
         let mut matches = 0;
-        records.extend(
+        let gaps =
             self.gaps
                 .iter()
                 .filter(|gap| gap.to_sequence > after)
                 .cloned()
-                .map(|gap| BrainEventStreamRecord::Gap { gap }),
-        );
+                .collect();
         for event in self
             .events
             .iter()
-            .filter(|event| matches!(event.lane, ObservatoryEventLane::Recorded))
+            .filter(|event| lane_matches(&event.lane, query.lane, query.lane_model.as_deref()))
             .filter(|event| event.envelope.sequence > after)
         {
             next_cursor = event.envelope.sequence;
-            if query.matches(&event.envelope.event) {
-                records.push(BrainEventStreamRecord::Event {
-                    envelope: event.envelope.clone(),
-                });
+            if query.event.matches(&event.envelope.event) {
+                events.push(event.clone());
                 matches += 1;
                 if matches >= limit {
                     break;
                 }
             }
         }
-        Ok(BrainEventHistoryResponse {
-            records,
+        Ok(ObservatorySourceHistoryResponse {
+            events,
+            gaps,
             next_cursor,
             health: BrainEventTransportHealth {
                 running: false,
@@ -375,6 +448,34 @@ impl BrainEventSource for ReplayBrainEventSource {
 
     fn subscribe(&self) -> Option<tokio::sync::broadcast::Receiver<SequencedBrainEvent>> {
         None
+    }
+}
+
+fn capture_frame_gap(expected_index: u64, actual_index: u64) -> Option<BrainEventSequenceGap> {
+    (actual_index > expected_index).then(|| {
+        BrainEventSequenceGap::new(
+            expected_index,
+            actual_index - 1,
+            SequenceGapReason::RetentionExpired,
+        )
+    })
+}
+
+fn lane_matches(
+    lane: &ObservatoryEventLane,
+    selector: ObservatoryEventLaneSelector,
+    model: Option<&str>,
+) -> bool {
+    match (selector, lane) {
+        (ObservatoryEventLaneSelector::All, ObservatoryEventLane::Recorded)
+        | (ObservatoryEventLaneSelector::Recorded, ObservatoryEventLane::Recorded) => {
+            model.is_none()
+        }
+        (
+            ObservatoryEventLaneSelector::All | ObservatoryEventLaneSelector::Reprocessed,
+            ObservatoryEventLane::Reprocessed { model_id },
+        ) => model.is_none_or(|model| model_id == model),
+        _ => false,
     }
 }
 
@@ -485,19 +586,6 @@ impl ObservatoryNavigationState {
         self.loop_range_ms = range;
         Ok(())
     }
-}
-
-fn source_snapshots(
-    response: &Option<BrainEventHistoryResponse>,
-) -> Vec<ObservatorySnapshotRef> {
-    response
-        .iter()
-        .flat_map(|response| &response.records)
-        .filter_map(|record| match record {
-            BrainEventStreamRecord::Event { envelope } => snapshot_from_event(&envelope.event),
-            BrainEventStreamRecord::Gap { .. } => None,
-        })
-        .collect()
 }
 
 fn snapshots_from_source_events(events: &[ObservatorySourceEvent]) -> Vec<ObservatorySnapshotRef> {

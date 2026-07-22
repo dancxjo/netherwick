@@ -99,6 +99,7 @@ pub struct SequencedBrainEvent {
 pub enum SequenceGapReason {
     RetentionExpired,
     ClientLagged,
+    Coalesced,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -106,6 +107,8 @@ pub struct BrainEventSequenceGap {
     pub from_sequence: u64,
     pub to_sequence: u64,
     pub reason: SequenceGapReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_sequence: Option<u64>,
     pub event: BrainEvent,
 }
 
@@ -131,8 +134,23 @@ impl BrainEventSequenceGap {
             from_sequence,
             to_sequence,
             reason,
+            replacement_sequence: None,
             event,
         }
+    }
+
+    fn coalesced(sequence: u64, replacement_sequence: u64) -> Self {
+        let mut gap = Self::new(sequence, sequence, SequenceGapReason::Coalesced);
+        gap.replacement_sequence = Some(replacement_sequence);
+        gap.event.kind = "transport.replaced".to_string();
+        gap.event.disposition = EventDisposition::Superseded;
+        gap.event.payload = BrainEventPayload::inline(serde_json::json!({
+            "from_sequence": sequence,
+            "to_sequence": sequence,
+            "reason": SequenceGapReason::Coalesced,
+            "replacement_sequence": replacement_sequence,
+        }));
+        gap
     }
 }
 
@@ -301,6 +319,7 @@ struct IngressState {
 #[derive(Default)]
 struct HistoryState {
     events: VecDeque<SequencedBrainEvent>,
+    replacements: BTreeMap<u64, u64>,
 }
 
 #[derive(Default)]
@@ -496,13 +515,12 @@ impl BrainEventHub {
         let mut matched = 0;
         for envelope in history.events.iter().filter(|event| event.sequence > after) {
             if envelope.sequence > expected {
-                records.push(BrainEventStreamRecord::Gap {
-                    gap: BrainEventSequenceGap::new(
-                        expected,
-                        envelope.sequence - 1,
-                        SequenceGapReason::RetentionExpired,
-                    ),
-                });
+                append_history_discontinuities(
+                    &mut records,
+                    &history.replacements,
+                    expected,
+                    envelope.sequence - 1,
+                );
             }
             expected = envelope.sequence.saturating_add(1);
             next_cursor = envelope.sequence;
@@ -662,7 +680,15 @@ fn retain_brain_event(shared: &ObservatoryShared, event: BrainEvent) {
             if let Some(position) = history.events.iter().position(|prior| {
                 matches!(&prior.event.loss_policy, LossPolicy::Coalescible { key: prior_key } if prior_key == key)
             }) {
-                history.events.remove(position);
+                if let Some(replaced) = history.events.remove(position) {
+                    history.replacements.insert(replaced.sequence, sequence);
+                    while history.replacements.len() > shared.config.history_capacity {
+                        let Some(oldest) = history.replacements.keys().next().copied() else {
+                            break;
+                        };
+                        history.replacements.remove(&oldest);
+                    }
+                }
                 shared
                     .counters
                     .history_coalesced
@@ -693,6 +719,42 @@ fn retain_brain_event(shared: &ObservatoryShared, event: BrainEvent) {
         history.events.push_back(envelope.clone());
     }
     let _ = shared.events_tx.send(envelope);
+}
+
+fn append_history_discontinuities(
+    records: &mut Vec<BrainEventStreamRecord>,
+    replacements: &BTreeMap<u64, u64>,
+    from_sequence: u64,
+    to_sequence: u64,
+) {
+    let mut retention_start = None;
+    for sequence in from_sequence..=to_sequence {
+        if let Some(replacement_sequence) = replacements.get(&sequence).copied() {
+            if let Some(start) = retention_start.take() {
+                records.push(BrainEventStreamRecord::Gap {
+                    gap: BrainEventSequenceGap::new(
+                        start,
+                        sequence - 1,
+                        SequenceGapReason::RetentionExpired,
+                    ),
+                });
+            }
+            records.push(BrainEventStreamRecord::Gap {
+                gap: BrainEventSequenceGap::coalesced(sequence, replacement_sequence),
+            });
+        } else if retention_start.is_none() {
+            retention_start = Some(sequence);
+        }
+    }
+    if let Some(start) = retention_start {
+        records.push(BrainEventStreamRecord::Gap {
+            gap: BrainEventSequenceGap::new(
+                start,
+                to_sequence,
+                SequenceGapReason::RetentionExpired,
+            ),
+        });
+    }
 }
 
 #[derive(Debug)]

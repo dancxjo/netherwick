@@ -443,6 +443,7 @@ impl LiveViewState {
             .lock()
             .map_err(|_| "diagnostic replay history lock poisoned".to_string())? = HistoryState {
             events: bundle.events.into(),
+            replacements: BTreeMap::new(),
         };
         let state = Self {
             observatory: hub,

@@ -180,6 +180,49 @@ async fn pending_and_retained_telemetry_coalesce_by_stable_key() {
 }
 
 #[tokio::test]
+async fn retained_telemetry_replacement_is_not_reported_as_data_loss() {
+    let hub = BrainEventHub::new(BrainEventHubConfig {
+        ingress_capacity: 4,
+        history_capacity: 4,
+        broadcast_capacity: 2,
+        ..BrainEventHubConfig::default()
+    });
+    assert!(hub.start());
+    for id in 1..=2 {
+        hub.publish(observatory_event(
+            id,
+            BrainEventType::Snapshot,
+            LossPolicy::Coalescible {
+                key: "now.current".to_string(),
+            },
+        ))
+        .unwrap();
+        wait_for_observatory_sequence(&hub, id).await;
+    }
+
+    let response = hub.query(&BrainEventQuery::default()).unwrap();
+    let gap = response
+        .records
+        .iter()
+        .find_map(|record| match record {
+            BrainEventStreamRecord::Gap { gap } => Some(gap),
+            BrainEventStreamRecord::Event { .. } => None,
+        })
+        .expect("replacement tombstone should remain queryable");
+    assert_eq!(gap.reason, SequenceGapReason::Coalesced);
+    assert_eq!(gap.replacement_sequence, Some(2));
+    assert_eq!(gap.event.disposition, EventDisposition::Superseded);
+    assert_eq!(response.health.history_coalesced, 1);
+    assert_eq!(response.health.history_expired, 0);
+    assert!(!response.records.iter().any(|record| matches!(
+        record,
+        BrainEventStreamRecord::Gap { gap }
+            if gap.reason == SequenceGapReason::RetentionExpired
+    )));
+    hub.shutdown().await;
+}
+
+#[tokio::test]
 async fn stalled_broadcast_client_never_backpressures_history_ingestion() {
     let hub = BrainEventHub::new(BrainEventHubConfig {
         ingress_capacity: 256,

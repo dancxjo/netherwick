@@ -197,9 +197,9 @@ fn partial_capture_keeps_declared_gaps_and_round_trips_for_offline_replay() {
     assert_eq!(report.declared_gaps, 1);
     assert_eq!(
         replay
-            .query(&BrainEventQuery::default())
+            .query(&ObservatorySourceQuery::default())
             .unwrap()
-            .records
+            .events
             .len(),
         1
     );
