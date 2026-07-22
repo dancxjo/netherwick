@@ -473,8 +473,8 @@ async fn sim_runner_go_and_explore_send_non_stop_motion_and_change_pose() {
                 let outcome = tick
                     .brain_events
                     .iter()
-                    .find(|event| event.kind == "actuator.outcome")
-                    .expect("simulator records the result only after applying motion");
+                    .find(|event| event.kind == "actuator.dispatch_outcome")
+                    .expect("simulator records dispatch only after applying the command");
                 assert_eq!(outcome.producer.brain, Brain::Simulator);
                 assert_eq!(outcome.disposition, EventDisposition::Accepted);
                 assert!(tick.brain_events.iter().any(|event| {
@@ -484,6 +484,18 @@ async fn sim_runner_go_and_explore_send_non_stop_motion_and_change_pose() {
                 assert_eq!(
                     outcome.payload,
                     BrainEventPayload::inline(snapshot.action_debug.clone().unwrap())
+                );
+                let response = tick
+                    .brain_events
+                    .iter()
+                    .find(|event| event.kind == "motion.response")
+                    .expect("simulator records measured motion separately from dispatch");
+                assert_eq!(response.producer.brain, Brain::Simulator);
+                assert_eq!(response.disposition, EventDisposition::Accepted);
+                assert_eq!(
+                    response.links.parents[0].event_id,
+                    outcome.event_id,
+                    "measured response must correlate to dispatch"
                 );
                 assert_unique_locally_ordered_brain_events(&tick.brain_events);
             })

@@ -515,7 +515,12 @@ where
                 );
             }
             after_snapshot.action_debug = Some(action_debug);
-            append_actuator_outcome(
+            let dispatch_disposition = if reset_or_dead {
+                EventDisposition::Rejected
+            } else {
+                EventDisposition::Accepted
+            };
+            append_actuator_dispatch_outcome(
                 &mut tick,
                 Brain::Simulator,
                 "sim.cockpit",
@@ -524,11 +529,28 @@ where
                     .action_debug
                     .clone()
                     .unwrap_or_else(|| serde_json::json!({"outcome": "not reported"})),
-                if reset_or_dead {
-                    EventDisposition::Rejected
-                } else {
-                    EventDisposition::Accepted
-                },
+                dispatch_disposition,
+            );
+            let command_frame_id = tick.frame.id;
+            let command_t_ms = tick.frame.t_ms;
+            append_motion_response(
+                &mut tick,
+                Brain::Simulator,
+                "sim.motion_feedback",
+                command_frame_id,
+                EventTimes::observed(command_t_ms, after_snapshot.body.last_update_ms),
+                serde_json::json!({
+                    "command_id": command_frame_id,
+                    "dispatch_acknowledged": !reset_or_dead,
+                    "encoder_odometry": {
+                        "body_pose_before": pose_json(&body_pose_before),
+                        "body_pose_after": pose_json(&after_snapshot.body),
+                        "movement_delta_m": movement_delta,
+                    },
+                    "imu": null,
+                    "condition": if reset_or_dead { "dispatch_rejected" } else { "simulated_motion_measured" },
+                }),
+                dispatch_disposition,
             );
             after_snapshot
                 .extensions

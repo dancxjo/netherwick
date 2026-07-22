@@ -173,13 +173,8 @@ where
                     .await?;
                 Ok((reflection, tick))
             });
-            let snapshot_ref = now
-                    .extensions
-                    .get("frame_id")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown-frame")
-                    .to_string();
-            let request_event = higher_brain_request_event(frame_id, &snapshot_ref, now.t_ms);
+            let snapshot_ref = frame_id.to_string();
+            let request_event = higher_brain_request_event(frame_id, now.t_ms);
             let request_event_id = request_event.event_id.clone();
             brain_events.push(request_event);
             self.cognition.pending = Some(PendingLlmCognition {

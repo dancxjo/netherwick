@@ -65,6 +65,28 @@ const MOTION_REJECTION_WINDOW_MS: TimeMs = 5_000;
 const MOTION_REJECTION_BASE_BACKOFF_MS: TimeMs = 1_000;
 const MOTION_REJECTION_MAX_BACKOFF_MS: TimeMs = 5_000;
 const MOTION_REJECTION_STUCK_AFTER: u32 = 3;
+const MOTION_RESPONSE_TIMEOUT_MS: TimeMs = 500;
+const MOTION_RESPONSE_QUEUE_CAPACITY: usize = 32;
+const MOTION_RESPONSE_LINEAR_THRESHOLD_M: f32 = 0.005;
+const MOTION_RESPONSE_HEADING_THRESHOLD_RAD: f32 = 0.01;
+const MOTION_RESPONSE_GYRO_THRESHOLD_RAD_S: f32 = 0.08;
+const MOTION_RESPONSE_ACCEL_THRESHOLD_G: f32 = 0.05;
+
+fn vector_norm(values: &[f32]) -> f32 {
+    values.iter().map(|value| value * value).sum::<f32>().sqrt()
+}
+
+fn vector_delta_norm(after: &[f32], before: &[f32]) -> f32 {
+    if after.len() != before.len() || after.is_empty() {
+        return 0.0;
+    }
+    after
+        .iter()
+        .zip(before)
+        .map(|(after, before)| (after - before).powi(2))
+        .sum::<f32>()
+        .sqrt()
+}
 
 #[derive(Clone, Debug)]
 struct PossessionRecoveryDecision {
@@ -115,7 +137,109 @@ where
             imu_arbiter: ImuArbiter::default(),
             last_imu_selection: ImuSelection::default(),
             last_ups_trend_sample: None,
+            pending_motion_evidence: VecDeque::new(),
         }
+    }
+
+    fn remember_motion_dispatch(
+        &mut self,
+        tick: &RuntimeTick,
+        issued_at_ms: TimeMs,
+        issued_motor: MotorCommand,
+        body_before: &BodySense,
+        imu_before: &ImuSense,
+    ) {
+        if self.pending_motion_evidence.len() >= MOTION_RESPONSE_QUEUE_CAPACITY {
+            self.pending_motion_evidence.pop_front();
+        }
+        self.pending_motion_evidence
+            .push_back(PendingMotionEvidence {
+                command_frame_id: tick.frame.id,
+                issued_at_ms,
+                issued_motor,
+                body_before: body_before.clone(),
+                imu_before: imu_before.clone(),
+            });
+    }
+
+    fn append_ready_motion_responses(
+        &mut self,
+        tick: &mut RuntimeTick,
+        observed_at_ms: TimeMs,
+        body_after: &BodySense,
+        imu_after: &ImuSense,
+    ) {
+        let mut waiting = VecDeque::new();
+        while let Some(pending) = self.pending_motion_evidence.pop_front() {
+            let elapsed_ms = observed_at_ms.saturating_sub(pending.issued_at_ms);
+            let dx = body_after.odometry.x_m - pending.body_before.odometry.x_m;
+            let dy = body_after.odometry.y_m - pending.body_before.odometry.y_m;
+            let linear_delta_m = dx.hypot(dy);
+            let heading_delta_rad = normalize_pose_angle(
+                body_after.odometry.heading_rad - pending.body_before.odometry.heading_rad,
+            )
+            .abs();
+            let gyro_rad_s = vector_norm(&imu_after.angular_velocity);
+            let acceleration_delta_g =
+                vector_delta_norm(&imu_after.acceleration, &pending.imu_before.acceleration);
+            let odometry_responded = linear_delta_m >= MOTION_RESPONSE_LINEAR_THRESHOLD_M
+                || heading_delta_rad >= MOTION_RESPONSE_HEADING_THRESHOLD_RAD;
+            let imu_responded = gyro_rad_s >= MOTION_RESPONSE_GYRO_THRESHOLD_RAD_S
+                || acceleration_delta_g >= MOTION_RESPONSE_ACCEL_THRESHOLD_G;
+            let expects_motion = !is_near_zero_motor(pending.issued_motor);
+            let confirmed = if expects_motion {
+                odometry_responded || imu_responded
+            } else {
+                elapsed_ms > 0
+                    && !odometry_responded
+                    && gyro_rad_s < MOTION_RESPONSE_GYRO_THRESHOLD_RAD_S
+            };
+            let timed_out = elapsed_ms >= MOTION_RESPONSE_TIMEOUT_MS;
+            if !confirmed && !timed_out {
+                waiting.push_back(pending);
+                continue;
+            }
+            let condition = if confirmed && expects_motion {
+                "measured_motion_response"
+            } else if confirmed {
+                "measured_stationary_response"
+            } else {
+                "insufficient_response_timeout"
+            };
+            append_motion_response(
+                tick,
+                Brain::Brainstem,
+                "cockpit.motion_feedback",
+                pending.command_frame_id,
+                EventTimes::observed(pending.issued_at_ms, observed_at_ms),
+                serde_json::json!({
+                    "command_id": pending.command_frame_id,
+                    "issued_motor_command": pending.issued_motor,
+                    "brainstem_acknowledged": true,
+                    "encoder_odometry": {
+                        "before": pending.body_before.odometry,
+                        "after": body_after.odometry,
+                        "linear_delta_m": linear_delta_m,
+                        "heading_delta_rad": heading_delta_rad,
+                    },
+                    "imu": {
+                        "source": imu_after.source_id(),
+                        "captured_at_ms": imu_after.captured_at_ms,
+                        "angular_velocity_norm_rad_s": gyro_rad_s,
+                        "acceleration_delta_g": acceleration_delta_g,
+                    },
+                    "elapsed_ms": elapsed_ms,
+                    "timeout_ms": MOTION_RESPONSE_TIMEOUT_MS,
+                    "condition": condition,
+                }),
+                if confirmed {
+                    EventDisposition::Accepted
+                } else {
+                    EventDisposition::Unavailable
+                },
+            );
+        }
+        self.pending_motion_evidence = waiting;
     }
 
     pub fn with_imu_override(mut self, source_override: ImuSourceOverride) -> Self {
@@ -293,7 +417,7 @@ where
         let mut snapshot = self.now_builder.snapshot();
         snapshot.eye = tick.frame.now.eye.clone();
         annotate_snapshot_from_tick(&mut snapshot, &tick);
-        append_actuator_outcome(
+        append_actuator_dispatch_outcome(
             &mut tick,
             Brain::Brainstem,
             "cockpit.read_only",
@@ -353,7 +477,11 @@ where
                 let mut snapshot = self.now_builder.snapshot();
                 snapshot.eye = tick.frame.now.eye.clone();
                 annotate_snapshot_from_tick(&mut snapshot, &tick);
-                append_real_robot_outcome(&mut tick, &snapshot, EventDisposition::Accepted);
+                append_real_robot_dispatch_outcome(
+                    &mut tick,
+                    &snapshot,
+                    EventDisposition::Accepted,
+                );
                 self.tick_count = self.tick_count.saturating_add(1);
                 return Ok((snapshot, tick));
             }
@@ -398,6 +526,7 @@ where
         self.insert_robot_initialization(&mut now);
         self.insert_brainstem_interface(&mut now, &brainstem_events);
         self.possessor_skills.annotate_now(&mut now);
+        let current_imu = now.imu.clone();
 
         now.reign = self.runtime.reign_sense(t_ms)?;
         if let Some(input) = now.reign.latest.clone() {
@@ -410,10 +539,20 @@ where
                     None,
                     &body_before,
                 )?;
+                self.append_ready_motion_responses(
+                    &mut tick,
+                    t_ms,
+                    &body_before,
+                    &current_imu,
+                );
                 let mut snapshot = self.now_builder.snapshot();
                 snapshot.eye = tick.frame.now.eye.clone();
                 annotate_snapshot_from_tick(&mut snapshot, &tick);
-                append_real_robot_outcome(&mut tick, &snapshot, EventDisposition::Accepted);
+                append_real_robot_dispatch_outcome(
+                    &mut tick,
+                    &snapshot,
+                    EventDisposition::Accepted,
+                );
                 self.tick_count = self.tick_count.saturating_add(1);
                 return Ok((snapshot, tick));
             }
@@ -462,10 +601,25 @@ where
                     block_reason,
                     &body_before,
                 )?;
+                self.append_ready_motion_responses(
+                    &mut tick,
+                    t_ms,
+                    &body_before,
+                    &current_imu,
+                );
                 let mut snapshot = self.now_builder.snapshot();
                 snapshot.eye = tick.frame.now.eye.clone();
                 annotate_snapshot_from_tick(&mut snapshot, &tick);
-                append_real_robot_outcome(&mut tick, &snapshot, outcome_disposition);
+                append_real_robot_dispatch_outcome(&mut tick, &snapshot, outcome_disposition);
+                if outcome_disposition == EventDisposition::Accepted {
+                    self.remember_motion_dispatch(
+                        &tick,
+                        snapshot.body.last_update_ms,
+                        final_motor,
+                        &body_before,
+                        &current_imu,
+                    );
+                }
                 self.tick_count = self.tick_count.saturating_add(1);
                 return Ok((snapshot, tick));
             }
@@ -477,6 +631,7 @@ where
             .runtime
             .tick(now.clone(), ExperienceLatent::default(), Vec::new())
             .await?;
+        self.append_ready_motion_responses(&mut tick, t_ms, &body_before, &current_imu);
         let original_chosen_action = tick.chosen_action.clone();
         let chosen_motor = final_motor_from_tick(&tick).clamped(0.05, 0.5);
         let manual_drive = tick
@@ -696,7 +851,7 @@ where
             );
         }
         snapshot.action_debug = Some(action_debug);
-        append_real_robot_outcome(
+        append_real_robot_dispatch_outcome(
             &mut tick,
             &snapshot,
             if block_reason.is_some() {
@@ -705,6 +860,15 @@ where
                 EventDisposition::Accepted
             },
         );
+        if block_reason.is_none() {
+            self.remember_motion_dispatch(
+                &tick,
+                snapshot.body.last_update_ms,
+                reported_robot_motor,
+                &body_before,
+                &current_imu,
+            );
+        }
         self.tick_count = self.tick_count.saturating_add(1);
         Ok((snapshot, tick))
     }

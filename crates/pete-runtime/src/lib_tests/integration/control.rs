@@ -76,6 +76,27 @@ async fn llm_command_is_never_granted_control_authority() {
             "missing production boundary event {kind}"
         );
     }
+    let request = tick
+        .brain_events
+        .iter()
+        .find(|event| event.kind == "brain.exchange.mother_to_higher.request")
+        .unwrap();
+    let frame_id = tick.frame.id.to_string();
+    assert_eq!(request.references.frame_id.as_deref(), Some(frame_id.as_str()));
+    let request_payload = match &request.payload {
+        BrainEventPayload::Inline { data, .. } => data,
+        payload => panic!("expected inline request payload, got {payload:?}"),
+    };
+    assert_eq!(
+        request_payload
+            .get("input_snapshot_ref")
+            .and_then(serde_json::Value::as_str),
+        Some(frame_id.as_str())
+    );
+    assert_eq!(
+        runtime.cognition.pending.as_ref().map(|pending| pending.snapshot_ref.as_str()),
+        Some(frame_id.as_str())
+    );
     assert_unique_locally_ordered_brain_events(&tick.brain_events);
     assert!(no_higher_brain_motion_authority(&tick.brain_events));
 }

@@ -237,7 +237,9 @@ async fn server_forwards_runtime_boundary_events_without_reconstructing_causalit
         "conductor.proposal"
             | "safety.decision"
             | "actuator.command.accepted_by_runtime"
-            | "actuator.outcome"
+            | "actuator.command.safe_substitution"
+            | "actuator.dispatch_outcome"
+            | "motion.response"
     )));
 
     let state = LiveViewState::new();

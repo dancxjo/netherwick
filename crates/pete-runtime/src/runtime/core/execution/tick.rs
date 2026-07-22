@@ -1063,10 +1063,11 @@ where
                 input, outcome, frame_id, now.t_ms,
             ));
         }
-        authority_events.push(accepted_runtime_command_event(
+        authority_events.extend(runtime_command_events(
             frame_id,
             now.t_ms,
             &chosen_action,
+            desired_motor,
             &safety,
         ));
         let control_provenance = if safety.vetoed {

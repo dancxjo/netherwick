@@ -654,4 +654,40 @@ async fn safety_veto_beats_direct_go_reign_at_cliff() {
         MotorCommand::stop()
     );
     assert_eq!(motor_gate["safety_reason"], "cliff");
+    let vetoed = tick
+        .brain_events
+        .iter()
+        .find(|event| event.kind == "actuator.command.vetoed_by_safety")
+        .expect("the requested unsafe command is explicitly vetoed");
+    assert_eq!(vetoed.disposition, EventDisposition::Vetoed);
+    let vetoed_payload = match &vetoed.payload {
+        BrainEventPayload::Inline { data, .. } => data,
+        payload => panic!("expected inline veto payload, got {payload:?}"),
+    };
+    assert_eq!(
+        vetoed_payload.get("requested_action"),
+        Some(
+            &serde_json::to_value(ActionPrimitive::Go {
+                intensity: 0.5,
+                duration_ms: 500,
+            })
+            .unwrap()
+        )
+    );
+    let substitution = tick
+        .brain_events
+        .iter()
+        .find(|event| event.kind == "actuator.command.safe_substitution")
+        .expect("the safe stop command is a distinct accepted substitution");
+    assert_eq!(substitution.disposition, EventDisposition::Accepted);
+    let payload = match &substitution.payload {
+        BrainEventPayload::Inline { data, .. } => data,
+        payload => panic!("expected inline substitution payload, got {payload:?}"),
+    };
+    assert_eq!(payload["issued_motor_command"], serde_json::json!(MotorCommand::stop()));
+    assert_eq!(payload["transformed_by_safety"], true);
+    assert!(!tick
+        .brain_events
+        .iter()
+        .any(|event| event.kind == "actuator.command.accepted_by_runtime"));
 }

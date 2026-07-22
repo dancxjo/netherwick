@@ -1017,23 +1017,61 @@ fn synthetic_slow_manual_tick(
     gate.authority = AuthoritySignificance::Gate;
     brain_events.push(gate);
     if let Some(action) = action.as_ref() {
+        if block_reason_for_events.is_some() {
+            let mut vetoed = BrainEvent::historical(
+                BrainEventId::from_domain("actuator-command-request", frame_id),
+                BrainEventType::Command,
+                ProducerIdentity::new(Brain::Motherbrain, "cockpit.manual_command"),
+                EventTimes::observed(frame.t_ms, frame.t_ms),
+            );
+            vetoed.kind = "actuator.command.vetoed_by_safety".to_string();
+            vetoed.references.frame_id = Some(frame_id.to_string());
+            vetoed.references.command_ids.push(frame_id.to_string());
+            vetoed
+                .links
+                .parents
+                .push(TypedEventRef::new(gate_id.clone(), BrainEventType::GateDecision));
+            vetoed.disposition = EventDisposition::Vetoed;
+            vetoed.payload = BrainEventPayload::inline(serde_json::json!({
+                "requested_action": action,
+                "requested_motor_command": desired_motor,
+                "reason": block_reason_for_events,
+                "manual_hardware_gate": true,
+            }));
+            vetoed.authority = AuthoritySignificance::Command;
+            brain_events.push(vetoed);
+        }
         let mut command = BrainEvent::historical(
             BrainEventId::from_domain("actuator-command", frame_id),
             BrainEventType::Command,
             ProducerIdentity::new(Brain::Motherbrain, "cockpit.manual_command"),
             EventTimes::observed(frame.t_ms, frame.t_ms),
         );
-        command.kind = "actuator.command.accepted_by_runtime".to_string();
+        command.kind = if block_reason_for_events.is_some() {
+            "actuator.command.safe_substitution"
+        } else {
+            "actuator.command.accepted_by_runtime"
+        }
+        .to_string();
         command.references.frame_id = Some(frame_id.to_string());
         command.references.command_ids.push(frame_id.to_string());
         command
             .links
             .parents
             .push(TypedEventRef::new(gate_id, BrainEventType::GateDecision));
+        if block_reason_for_events.is_some() {
+            command.links.parents.push(TypedEventRef::new(
+                BrainEventId::from_domain("actuator-command-request", frame_id),
+                BrainEventType::Command,
+            ));
+        }
         command.disposition = EventDisposition::Accepted;
         command.payload = BrainEventPayload::inline(serde_json::json!({
-            "action": action,
-            "final_motor": final_motor,
+            "requested_action": action,
+            "requested_motor_command": desired_motor,
+            "issued_motor_command": final_motor,
+            "transformed_by_safety": block_reason_for_events.is_some(),
+            "reason": block_reason_for_events,
             "manual_hardware_gate": true,
         }));
         command.authority = AuthoritySignificance::Command;

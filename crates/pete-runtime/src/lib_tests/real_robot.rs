@@ -24,7 +24,7 @@ async fn real_robot_read_only_runner_never_applies_motor() {
     let outcome = tick
         .brain_events
         .iter()
-        .find(|event| event.kind == "actuator.outcome")
+        .find(|event| event.kind == "actuator.dispatch_outcome")
         .expect("read-only boundary is explicitly observable");
     assert_eq!(outcome.producer.brain, Brain::Brainstem);
     assert_eq!(outcome.disposition, EventDisposition::Unavailable);
@@ -36,6 +36,144 @@ async fn real_robot_read_only_runner_never_applies_motor() {
             .and_then(|value| value.as_bool()),
         Some(true)
     );
+}
+
+#[tokio::test]
+async fn real_robot_motion_response_correlates_dispatch_with_odometry_and_imu() {
+    let mut runner = RealRobotRunner::new(
+        RobotMode::Slow,
+        Box::new(SimCockpit::new()),
+        Vec::new(),
+        StubRuntime,
+    );
+    let body_before = BodySense {
+        last_update_ms: 100,
+        ..BodySense::default()
+    };
+    let imu_before = ImuSense {
+        captured_at_ms: 100,
+        acceleration: vec![0.0, 0.0, 1.0],
+        ..ImuSense::default()
+    };
+    let mut dispatched = runner
+        .runtime
+        .tick(
+            Now::blank(100, body_before.clone()),
+            ExperienceLatent::default(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let command_frame_id = dispatched.frame.id;
+    append_actuator_dispatch_outcome(
+        &mut dispatched,
+        Brain::Brainstem,
+        "cockpit.brainstem",
+        100,
+        serde_json::json!({"brainstem_acknowledged": true}),
+        EventDisposition::Accepted,
+    );
+    runner.remember_motion_dispatch(
+        &dispatched,
+        100,
+        MotorCommand {
+            forward: 0.2,
+            turn: 0.0,
+        },
+        &body_before,
+        &imu_before,
+    );
+
+    let mut body_after = body_before.clone();
+    body_after.last_update_ms = 200;
+    body_after.odometry.x_m = 0.02;
+    let imu_after = ImuSense {
+        captured_at_ms: 200,
+        acceleration: vec![0.1, 0.0, 1.0],
+        orientation_source: Some("brainstem_board_imu@1:mpu6050".to_string()),
+        ..ImuSense::default()
+    };
+    let mut observed = runner
+        .runtime
+        .tick(
+            Now::blank(200, body_after.clone()),
+            ExperienceLatent::default(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    runner.append_ready_motion_responses(&mut observed, 200, &body_after, &imu_after);
+
+    let response = observed
+        .brain_events
+        .iter()
+        .find(|event| event.kind == "motion.response")
+        .expect("next physical observation verifies the dispatched command");
+    assert_eq!(response.disposition, EventDisposition::Accepted);
+    let command_frame = command_frame_id.to_string();
+    assert_eq!(response.references.frame_id.as_deref(), Some(command_frame.as_str()));
+    assert_eq!(
+        response.links.parents[0].event_id,
+        BrainEventId::from_domain("actuator-dispatch-outcome", command_frame_id)
+    );
+    let payload = match &response.payload {
+        BrainEventPayload::Inline { data, .. } => data,
+        payload => panic!("expected inline motion evidence, got {payload:?}"),
+    };
+    assert_eq!(payload["condition"], "measured_motion_response");
+    assert_eq!(payload["brainstem_acknowledged"], true);
+    let linear_delta_m = payload["encoder_odometry"]["linear_delta_m"]
+        .as_f64()
+        .unwrap();
+    assert!((linear_delta_m - 0.02).abs() < 1.0e-6);
+    assert_eq!(payload["imu"]["source"], "brainstem_board_imu");
+
+    let timeout_frame_id = observed.frame.id;
+    append_actuator_dispatch_outcome(
+        &mut observed,
+        Brain::Brainstem,
+        "cockpit.brainstem",
+        200,
+        serde_json::json!({"brainstem_acknowledged": true}),
+        EventDisposition::Accepted,
+    );
+    runner.remember_motion_dispatch(
+        &observed,
+        200,
+        MotorCommand {
+            forward: 0.2,
+            turn: 0.0,
+        },
+        &body_after,
+        &imu_after,
+    );
+    let mut timeout_body = body_after.clone();
+    timeout_body.last_update_ms = 800;
+    let mut timed_out = runner
+        .runtime
+        .tick(
+            Now::blank(800, timeout_body.clone()),
+            ExperienceLatent::default(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    runner.append_ready_motion_responses(&mut timed_out, 800, &timeout_body, &imu_after);
+    let timeout = timed_out
+        .brain_events
+        .iter()
+        .find(|event| event.kind == "motion.response")
+        .expect("lack of measured response produces an explicit timeout outcome");
+    assert_eq!(timeout.disposition, EventDisposition::Unavailable);
+    assert_eq!(
+        timeout.links.parents[0].event_id,
+        BrainEventId::from_domain("actuator-dispatch-outcome", timeout_frame_id)
+    );
+    let timeout_payload = match &timeout.payload {
+        BrainEventPayload::Inline { data, .. } => data,
+        payload => panic!("expected inline timeout evidence, got {payload:?}"),
+    };
+    assert_eq!(timeout_payload["condition"], "insufficient_response_timeout");
 }
 
 struct LiveDepthFixture;

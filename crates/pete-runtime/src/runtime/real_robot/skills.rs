@@ -102,6 +102,16 @@ pub struct RealRobotRunner<R, C> {
     imu_arbiter: ImuArbiter,
     last_imu_selection: ImuSelection,
     last_ups_trend_sample: Option<UpsTelemetry>,
+    pending_motion_evidence: VecDeque<PendingMotionEvidence>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingMotionEvidence {
+    command_frame_id: Uuid,
+    issued_at_ms: TimeMs,
+    issued_motor: MotorCommand,
+    body_before: BodySense,
+    imu_before: ImuSense,
 }
 
 #[derive(Clone, Debug, Default)]

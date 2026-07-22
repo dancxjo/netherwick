@@ -68,7 +68,8 @@ fn forebrain_ingress_event(now: &Now, frame_id: Uuid) -> BrainEvent {
     event
 }
 
-fn higher_brain_request_event(frame_id: Uuid, snapshot_ref: &str, t_ms: TimeMs) -> BrainEvent {
+fn higher_brain_request_event(frame_id: Uuid, t_ms: TimeMs) -> BrainEvent {
+    let snapshot_ref = frame_id.to_string();
     let mut event = BrainEvent::historical(
         BrainEventId::from_domain("higher-brain-request", frame_id),
         BrainEventType::Proposal,
@@ -264,40 +265,76 @@ fn safety_boundary_event(
     event
 }
 
-fn accepted_runtime_command_event(
+fn runtime_command_events(
     frame_id: Uuid,
     t_ms: TimeMs,
     action: &ActionPrimitive,
+    requested_motor: MotorCommand,
     decision: &pete_autonomic::SafetyDecision,
-) -> BrainEvent {
+) -> Vec<BrainEvent> {
+    let gate_ref = TypedEventRef::new(
+        BrainEventId::from_domain("safety-decision", frame_id),
+        BrainEventType::GateDecision,
+    );
+    let mut events = Vec::with_capacity(if decision.vetoed { 2 } else { 1 });
+    if decision.vetoed {
+        let mut vetoed = BrainEvent::historical(
+            BrainEventId::from_domain("actuator-command-request", frame_id),
+            BrainEventType::Command,
+            ProducerIdentity::new(Brain::Motherbrain, "actuator.command"),
+            EventTimes::observed(t_ms, t_ms),
+        );
+        vetoed.kind = "actuator.command.vetoed_by_safety".to_string();
+        vetoed.references.frame_id = Some(frame_id.to_string());
+        vetoed.references.command_ids.push(frame_id.to_string());
+        vetoed.links.parents.push(gate_ref.clone());
+        vetoed.disposition = EventDisposition::Vetoed;
+        vetoed.payload = BrainEventPayload::inline(serde_json::json!({
+            "requested_action": action,
+            "requested_motor_command": requested_motor,
+            "safety_reason": decision.reason,
+        }));
+        vetoed.authority = AuthoritySignificance::Command;
+        events.push(vetoed);
+    }
+
     let mut event = BrainEvent::historical(
         BrainEventId::from_domain("actuator-command", frame_id),
         BrainEventType::Command,
         ProducerIdentity::new(Brain::Motherbrain, "actuator.command"),
         EventTimes::observed(t_ms, t_ms),
     );
-    event.kind = "actuator.command.accepted_by_runtime".to_string();
+    event.kind = if decision.vetoed {
+        "actuator.command.safe_substitution"
+    } else {
+        "actuator.command.accepted_by_runtime"
+    }
+    .to_string();
     event.references.frame_id = Some(frame_id.to_string());
     event.references.command_ids.push(frame_id.to_string());
-    event.links.parents.push(TypedEventRef::new(
-        BrainEventId::from_domain("safety-decision", frame_id),
-        BrainEventType::GateDecision,
-    ));
+    event.links.parents.push(gate_ref);
+    if decision.vetoed {
+        event.links.parents.push(TypedEventRef::new(
+            BrainEventId::from_domain("actuator-command-request", frame_id),
+            BrainEventType::Command,
+        ));
+    }
     event.disposition = EventDisposition::Accepted;
     event.payload = BrainEventPayload::inline(serde_json::json!({
-        "action": action,
-        "final_motor": decision.command,
-        "safety_vetoed": decision.vetoed,
+        "requested_action": action,
+        "requested_motor_command": requested_motor,
+        "issued_motor_command": decision.command,
+        "transformed_by_safety": decision.vetoed,
         "safety_reason": decision.reason,
     }));
     event.authority = AuthoritySignificance::Command;
-    event
+    events.push(event);
+    events
 }
 
-/// Record what happened after a runtime-accepted command crossed the actual
-/// simulator or brainstem boundary. This must be called only after the result
-/// payload is final.
-pub fn append_actuator_outcome(
+/// Record whether a runtime-accepted command crossed the simulator or
+/// brainstem boundary. This is dispatch evidence, not proof of physical motion.
+pub fn append_actuator_dispatch_outcome(
     tick: &mut RuntimeTick,
     producer_brain: Brain,
     component: &str,
@@ -307,12 +344,12 @@ pub fn append_actuator_outcome(
 ) {
     let frame_id = tick.frame.id;
     let mut event = BrainEvent::historical(
-        BrainEventId::from_domain("actuator-outcome", frame_id),
+        BrainEventId::from_domain("actuator-dispatch-outcome", frame_id),
         BrainEventType::Outcome,
         ProducerIdentity::new(producer_brain, component),
         EventTimes::observed(tick.frame.t_ms, observed_at_ms),
     );
-    event.kind = "actuator.outcome".to_string();
+    event.kind = "actuator.dispatch_outcome".to_string();
     event.references.frame_id = Some(frame_id.to_string());
     event.references.command_ids.push(frame_id.to_string());
     event.links.parents.push(TypedEventRef::new(
@@ -323,26 +360,74 @@ pub fn append_actuator_outcome(
     event.payload = bounded_runtime_payload(
         &event.event_id,
         payload,
-        format!("frame://{frame_id}/actuator-outcome"),
+        format!("frame://{frame_id}/actuator-dispatch-outcome"),
     );
     event.authority = AuthoritySignificance::Outcome;
     tick.brain_events.push(event);
 }
 
-fn append_real_robot_outcome(
+/// Record measured response after a dispatched command. Callers must include
+/// the correlated odometry/IMU evidence or an explicit timeout condition.
+pub fn append_motion_response(
+    tick: &mut RuntimeTick,
+    producer_brain: Brain,
+    component: &str,
+    command_frame_id: Uuid,
+    times: EventTimes,
+    payload: serde_json::Value,
+    disposition: EventDisposition,
+) {
+    let mut event = BrainEvent::historical(
+        BrainEventId::from_domain("motion-response", command_frame_id),
+        BrainEventType::Outcome,
+        ProducerIdentity::new(producer_brain, component),
+        times,
+    );
+    event.kind = "motion.response".to_string();
+    event.references.frame_id = Some(command_frame_id.to_string());
+    event
+        .references
+        .command_ids
+        .push(command_frame_id.to_string());
+    event.links.parents.push(TypedEventRef::new(
+        BrainEventId::from_domain("actuator-dispatch-outcome", command_frame_id),
+        BrainEventType::Outcome,
+    ));
+    event.disposition = disposition;
+    event.payload = bounded_runtime_payload(
+        &event.event_id,
+        payload,
+        format!("frame://{command_frame_id}/motion-response"),
+    );
+    event.authority = AuthoritySignificance::Outcome;
+    tick.brain_events.push(event);
+}
+
+fn append_real_robot_dispatch_outcome(
     tick: &mut RuntimeTick,
     snapshot: &WorldSnapshot,
     disposition: EventDisposition,
 ) {
-    append_actuator_outcome(
+    let mut payload = snapshot
+        .action_debug
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({"outcome": "not reported"}));
+    if !payload.is_object() {
+        payload = serde_json::json!({"detail": payload});
+    }
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("outcome_stage".to_string(), serde_json::json!("dispatch"));
+        object.insert(
+            "brainstem_acknowledged".to_string(),
+            serde_json::json!(disposition == EventDisposition::Accepted),
+        );
+    }
+    append_actuator_dispatch_outcome(
         tick,
         Brain::Brainstem,
         "cockpit.brainstem",
         snapshot.body.last_update_ms,
-        snapshot
-            .action_debug
-            .clone()
-            .unwrap_or_else(|| serde_json::json!({"outcome": "not reported"})),
+        payload,
         disposition,
     );
 }
