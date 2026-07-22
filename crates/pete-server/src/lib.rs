@@ -24,7 +24,7 @@ use pete_cockpit::{MotionCommand, MotorCommand};
 use pete_core::TimeMs;
 use pete_events::{
     AuthoritySignificance, Brain, BrainEvent, BrainEventId, BrainEventPayload, BrainEventType,
-    EventDisposition, EventTimes, LossPolicy, ProducerIdentity, TrustState,
+    EventDisposition, EventTimes, LossPolicy, PayloadReference, ProducerIdentity, TrustState,
 };
 use pete_experience::EmbodiedContext;
 use pete_map::{
@@ -62,6 +62,7 @@ include!("server/retina.rs");
 include!("server/scene.rs");
 include!("server/reign.rs");
 include!("server/observatory.rs");
+include!("server/observatory_source.rs");
 
 const REIGN_PAGE: &str = include_str!("web/reign.html");
 const COGNITIVE_VIEW_PAGE: &str = include_str!("web/cognitive.html");
