@@ -10,5 +10,5 @@ anyhow.workspace = true
 cpal.workspace = true
 serde.workspace = true
 speaking = { path = "../../../tongues/crates/speaking" }
-tongues-tts = { path = "../../../tongues/crates/tongues-tts", default-features = false, features = ["piper-onnx"] }
+tongues-tts = { path = "../../../tongues/crates/tongues-tts", default-features = false, features = ["onnx-tts"] }
 tracing.workspace = true

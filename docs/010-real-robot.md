@@ -25,7 +25,7 @@ just setup-kinect-from-source
 
 The robot runner annotates the first real-robot `Now` with `robot.initialization` metadata: mode, cockpit source, battery, requested/active sensors, ledger path, tick rate, dashboard, and capture destination. `EventExtractor` turns that first-tick annotation into a `RobotInitialized` event. The runtime then runs the replaceable `event_robot_initialized` behavior node, which can emit a bring-up `Song`, `Chirp`, and spoken status sequence.
 
-The robot process owns rendering. It creates a queued Piper/CPAL mouth from:
+The robot process owns rendering. It creates a queued ONNX/CPAL mouth from:
 
 ```bash
 just setup-tts
@@ -33,13 +33,14 @@ just setup-tts
 just setup
 ```
 
-The default voice is downloaded to the Tongues Piper model directory and autoloaded at startup. Piper ONNX execution uses the Tongues `piper-onnx` backend with the self-contained Rust `ort` package, prepared by `just setup-ort`.
+The default voice is downloaded to the Tongues voice model directory and autoloaded at startup. Tongues ONNX speech execution uses the Tongues `onnx-tts` backend with the self-contained Rust `ort` package, prepared by `just setup-ort`.
 
 To override the voice, set:
 
 ```bash
-PETE_TTS_PIPER_VOICE=/path/to/en_US-ryan-medium.onnx
-PETE_TTS_PIPER_CONFIG=/path/to/en_US-ryan-medium.onnx.json
+PETE_TTS_VOICE=/path/to/en_US-ryan-medium.onnx
+PETE_TTS_CONFIG=/path/to/en_US-ryan-medium.onnx.json
+PETE_TTS_SPEAKER=p225
 PETE_TTS_OUTPUT_DEVICE=
 ```
 
@@ -52,6 +53,6 @@ PETE_WHISPER_MODEL=/path/to/ggml-tiny.en.bin
 PETE_ASR_COMMAND=target/debug/pete whisper-transcribe
 ```
 
-When configured, spoken bring-up lines are enqueued immediately and played sequentially on a background thread using Tongues Piper streaming plus CPAL output. `Song` and `Chirp` actions are rendered through Cockpit feedback/song verbs when the backend supports them. Later spoken actions emitted by event scripts are appended to the mouth queue. If the Piper voice or output device is unavailable, the robot should report the mouth as disabled and continue the robot run rather than blocking cockpit/sensor startup.
+When configured, spoken bring-up lines are enqueued immediately and played sequentially on a background thread using Tongues ONNX speech streaming plus CPAL output. `Song` and `Chirp` actions are rendered through Cockpit feedback/song verbs when the backend supports them. Later spoken actions emitted by event scripts are appended to the mouth queue. If the voice model or output device is unavailable, the robot should report the mouth as disabled and continue the robot run rather than blocking cockpit/sensor startup.
 
 Mouth and body-audio actions do not command motors. `Speak` is rendered through the mouth gate; `Chirp` and `Song` use the body-audio gate; motion primitives remain separate and still pass the real-robot mode and safety gates.

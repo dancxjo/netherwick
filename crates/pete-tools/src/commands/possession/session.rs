@@ -757,16 +757,16 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         Err(error) => return Err(error),
     };
 
-    let mut mouth = match QueuedPiperCpalMouth::from_env() {
+    let mut mouth = match QueuedOnnxCpalMouth::from_env() {
         Ok(Some(mouth)) => Some(mouth),
         Ok(None) => {
             println!(
-                "robot mouth disabled: no Piper voice found; set PETE_TTS_PIPER_VOICE and PETE_TTS_PIPER_CONFIG"
+                "robot mouth disabled: no voice model found; set PETE_TTS_VOICE and PETE_TTS_CONFIG"
             );
             None
         }
         Err(error) => {
-            println!("robot mouth disabled: could not load Piper voice: {error}");
+            println!("robot mouth disabled: could not load voice model: {error}");
             None
         }
     };

@@ -56,6 +56,6 @@ initialization. Ordinary event responders may add sensations, impressions,
 memory notes, teaching, or drive impulses; they do not select goals or ordinary
 actions. Explicit event-script capabilities remain typed replaceable behaviors.
 
-Event scripts are replaceable behaviors, not one-off side effects. A script can emit `Say`, `Chirp`, `Song`, or motion-oriented script actions. Motion primitives still pass through autonomic safety and SafeCockpit. Spoken `Say` output passes through the robot mouth gate and is rendered by the queued Piper/CPAL mouth when available. `Chirp` and `Song` are non-motion Cockpit feedback/song requests.
+Event scripts are replaceable behaviors, not one-off side effects. A script can emit `Say`, `Chirp`, `Song`, or motion-oriented script actions. Motion primitives still pass through autonomic safety and SafeCockpit. Spoken `Say` output passes through the robot mouth gate and is rendered by the queued ONNX/CPAL mouth when available. `Chirp` and `Song` are non-motion Cockpit feedback/song requests.
 
 The current TypeScript script path uses `tsrun` as an embedded, no-Node runtime for compact event behaviors. A TypeScript script receives structured event input and returns JSON-like script actions. This is useful for expressive startup/status/mouth behaviors, but it is still a teacher implementation behind `ReplaceableBehavior`; learned models must be able to shadow it, compare against it, and eventually replace it under the normal behavior promotion rules.

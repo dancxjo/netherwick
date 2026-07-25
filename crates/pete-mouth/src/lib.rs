@@ -14,7 +14,7 @@ use speaking::{
     phonemicizer_for_variety, EvidenceProvenance, EvidenceSource, PhonemicizeOutput,
     PhonemicizeRequest, UtteranceId, UtterancePlan, VarietyId,
 };
-use tongues_tts::{PiperAudioChunk, PiperOnnxBackend, PiperVoiceConfig};
+use tongues_tts::{AudioChunk, OnnxSpeechBackend, SpeakerSelection, SynthesisOptions, VoiceConfig};
 
 const DEFAULT_TTS_VARIETY: &str = "en-US";
 
@@ -49,7 +49,7 @@ impl Mouth for NoopMouth {
 }
 
 pub fn mouth_from_env() -> Box<dyn Mouth + Send> {
-    match PiperCpalMouth::from_env() {
+    match OnnxCpalMouth::from_env() {
         Ok(Some(mouth)) => Box::new(mouth),
         Ok(None) => Box::<NoopMouth>::default(),
         Err(error) => {
@@ -59,7 +59,7 @@ pub fn mouth_from_env() -> Box<dyn Mouth + Send> {
     }
 }
 
-pub struct QueuedPiperCpalMouth {
+pub struct QueuedOnnxCpalMouth {
     tx: Option<mpsc::Sender<MouthQueueItem>>,
     worker: Option<JoinHandle<()>>,
 }
@@ -69,27 +69,27 @@ struct MouthQueueItem {
     outcome_tx: Option<mpsc::Sender<std::result::Result<SpeechOutcome, String>>>,
 }
 
-impl QueuedPiperCpalMouth {
+impl QueuedOnnxCpalMouth {
     pub fn from_env() -> Result<Option<Self>> {
-        PiperConfig::from_env()?.map(Self::new).transpose()
+        SpeechConfig::from_env()?.map(Self::new).transpose()
     }
 
-    pub fn new(config: PiperConfig) -> Result<Self> {
+    pub fn new(config: SpeechConfig) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<MouthQueueItem>();
         let worker = std::thread::Builder::new()
-            .name("pete-piper-mouth".to_string())
+            .name("pete-speech-mouth".to_string())
             .spawn(move || {
                 println!(
-                    "robot mouth loading Piper voice: {}",
+                    "robot mouth loading voice model: {}",
                     config.model_path.display()
                 );
-                let mut mouth = match PiperCpalMouth::new(config) {
+                let mut mouth = match OnnxCpalMouth::new(config) {
                     Ok(mouth) => mouth,
                     Err(error) => {
                         let message =
-                            format!("queued Piper mouth failed to load voice: {error:#}");
+                            format!("queued speech mouth failed to load voice: {error:#}");
                         println!("robot mouth failed: {message}");
-                        tracing::warn!(error = %error, "queued Piper mouth failed to load voice");
+                        tracing::warn!(error = %error, "queued speech mouth failed to load voice");
                         for item in rx {
                             if let Some(outcome_tx) = item.outcome_tx {
                                 let _ = outcome_tx.send(Err(message.clone()));
@@ -98,7 +98,7 @@ impl QueuedPiperCpalMouth {
                         return;
                     }
                 };
-                println!("robot mouth Piper voice ready");
+                println!("robot mouth voice model ready");
                 while let Ok(item) = rx.recv() {
                     match mouth.speak(&item.text) {
                         Ok(outcome) => {
@@ -117,7 +117,7 @@ impl QueuedPiperCpalMouth {
                                 "robot mouth failed: {message}; disabling mouth worker; text {:?}",
                                 item.text
                             );
-                            tracing::warn!(error = %message, text = %item.text, "queued Piper mouth failed");
+                            tracing::warn!(error = %message, text = %item.text, "queued speech mouth failed");
                             if let Some(outcome_tx) = item.outcome_tx {
                                 let _ = outcome_tx.send(Err(message.clone()));
                             }
@@ -131,7 +131,7 @@ impl QueuedPiperCpalMouth {
                     }
                 }
             })
-            .context("failed to spawn queued Piper mouth thread")?;
+            .context("failed to spawn queued speech mouth thread")?;
         Ok(Self {
             tx: Some(tx),
             worker: Some(worker),
@@ -162,7 +162,7 @@ impl QueuedPiperCpalMouth {
         if text.trim().is_empty() {
             return Ok(SpeechOutcome {
                 spoken: false,
-                backend: "queued-piper-cpal".to_string(),
+                backend: "queued-onnx-cpal".to_string(),
                 ..SpeechOutcome::default()
             });
         }
@@ -172,12 +172,12 @@ impl QueuedPiperCpalMouth {
             outcome_tx: Some(outcome_tx),
         })?;
         let result = match timeout {
-            Some(timeout) => outcome_rx
-                .recv_timeout(timeout)
-                .with_context(|| format!("queued Piper mouth did not finish within {timeout:?}"))?,
+            Some(timeout) => outcome_rx.recv_timeout(timeout).with_context(|| {
+                format!("queued speech mouth did not finish within {timeout:?}")
+            })?,
             None => outcome_rx
                 .recv()
-                .context("queued Piper mouth worker did not report outcome")?,
+                .context("queued speech mouth worker did not report outcome")?,
         };
         match result {
             Ok(outcome) => Ok(outcome),
@@ -188,13 +188,13 @@ impl QueuedPiperCpalMouth {
     fn send_item(&self, item: MouthQueueItem) -> Result<()> {
         self.tx
             .as_ref()
-            .context("queued Piper mouth is already closed")?
+            .context("queued speech mouth is already closed")?
             .send(item)
-            .context("queued Piper mouth worker is not running")
+            .context("queued speech mouth worker is not running")
     }
 }
 
-impl Drop for QueuedPiperCpalMouth {
+impl Drop for QueuedOnnxCpalMouth {
     fn drop(&mut self) {
         drop(self.tx.take());
         if let Some(worker) = self.worker.take() {
@@ -207,46 +207,54 @@ impl Drop for QueuedPiperCpalMouth {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PiperConfig {
+pub struct SpeechConfig {
     pub model_path: PathBuf,
     pub config_path: PathBuf,
     pub variety: String,
+    pub speaker: Option<String>,
     pub output_device_name: Option<String>,
 }
 
-impl PiperConfig {
+impl SpeechConfig {
     pub fn new(model_path: impl Into<PathBuf>, config_path: impl Into<PathBuf>) -> Self {
         Self {
             model_path: model_path.into(),
             config_path: config_path.into(),
             variety: DEFAULT_TTS_VARIETY.to_string(),
+            speaker: None,
             output_device_name: None,
         }
     }
 
     pub fn from_env() -> Result<Option<Self>> {
-        let (model_path, config_path) = match env_path("PETE_TTS_PIPER_VOICE") {
-            Some(model_path) => {
-                let config_path = env_path("PETE_TTS_PIPER_CONFIG")
-                    .unwrap_or_else(|| tongues_tts::piper_voice_config_path(&model_path));
-                (model_path, config_path)
-            }
-            None => {
-                let default_voice = tongues_tts::default_piper_voice();
-                let model_path = tongues_tts::default_voice_model_path(default_voice.clone());
-                let config_path = tongues_tts::default_voice_config_path(default_voice);
-                if !model_path.is_file() || !config_path.is_file() {
-                    return Ok(None);
+        let (model_path, config_path) =
+            match env_path_with_deprecated("PETE_TTS_VOICE", "PETE_TTS_PIPER_VOICE") {
+                Some(model_path) => {
+                    let config_path =
+                        env_path_with_deprecated("PETE_TTS_CONFIG", "PETE_TTS_PIPER_CONFIG")
+                            .unwrap_or_else(|| tongues_tts::voice_config_path(&model_path));
+                    (model_path, config_path)
                 }
-                (model_path, config_path)
-            }
-        };
+                None => {
+                    let default_voice = tongues_tts::default_voice_model();
+                    let model_path = tongues_tts::default_voice_model_path(default_voice.clone());
+                    let config_path = tongues_tts::default_voice_config_path(default_voice);
+                    if !model_path.is_file() || !config_path.is_file() {
+                        return Ok(None);
+                    }
+                    (model_path, config_path)
+                }
+            };
         let mut config = Self::new(model_path, config_path);
         config.variety = std::env::var("PETE_TTS_VARIETY")
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| DEFAULT_TTS_VARIETY.to_string());
+        config.speaker = std::env::var("PETE_TTS_SPEAKER")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         config.output_device_name = std::env::var("PETE_TTS_OUTPUT_DEVICE")
             .ok()
             .map(|value| value.trim().to_string())
@@ -263,32 +271,54 @@ fn env_path(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-pub struct PiperCpalMouth {
-    config: PiperConfig,
-    speech: PiperOnnxBackend,
+fn env_path_with_deprecated(name: &str, deprecated_name: &str) -> Option<PathBuf> {
+    if let Some(path) = env_path(name) {
+        if env_path(deprecated_name).is_some() {
+            tracing::warn!(
+                old = deprecated_name,
+                new = name,
+                "deprecated speech environment variable ignored because neutral variable is set"
+            );
+        }
+        return Some(path);
+    }
+    let path = env_path(deprecated_name);
+    if path.is_some() {
+        tracing::warn!(
+            old = deprecated_name,
+            new = name,
+            "deprecated speech environment variable is still supported temporarily"
+        );
+    }
+    path
 }
 
-impl PiperCpalMouth {
-    pub fn new(config: PiperConfig) -> Result<Self> {
-        let voice_config = PiperVoiceConfig::from_json_file(&config.config_path)
+pub struct OnnxCpalMouth {
+    config: SpeechConfig,
+    speech: OnnxSpeechBackend,
+}
+
+impl OnnxCpalMouth {
+    pub fn new(config: SpeechConfig) -> Result<Self> {
+        let voice_config = VoiceConfig::from_json_file(&config.config_path)
             .with_context(|| format!("failed to read {}", config.config_path.display()))?;
-        let speech = PiperOnnxBackend::load(&config.model_path, voice_config)
-            .context("failed to load Piper ONNX speech backend")?;
+        let speech = OnnxSpeechBackend::load(&config.model_path, voice_config)
+            .context("failed to load ONNX speech backend")?;
         Ok(Self { config, speech })
     }
 
     pub fn from_env() -> Result<Option<Self>> {
-        PiperConfig::from_env()?.map(Self::new).transpose()
+        SpeechConfig::from_env()?.map(Self::new).transpose()
     }
 }
 
-impl Mouth for PiperCpalMouth {
+impl Mouth for OnnxCpalMouth {
     fn speak(&mut self, text: &str) -> Result<SpeechOutcome> {
         let text = text.trim();
         if text.is_empty() {
             return Ok(SpeechOutcome {
                 spoken: false,
-                backend: "piper-cpal".to_string(),
+                backend: "onnx-cpal".to_string(),
                 ..SpeechOutcome::default()
             });
         }
@@ -299,15 +329,17 @@ impl Mouth for PiperCpalMouth {
             &plan,
             text.len(),
             self.config.output_device_name.as_deref(),
+            self.config.speaker.as_deref(),
         )
     }
 }
 
 fn play_tongues_streaming(
-    speech: &mut PiperOnnxBackend,
+    speech: &mut OnnxSpeechBackend,
     plan: &UtterancePlan,
     text_len: usize,
     output_device_name: Option<&str>,
+    speaker: Option<&str>,
 ) -> Result<SpeechOutcome> {
     let host = cpal::default_host();
     let device = select_output_device(&host, output_device_name)?;
@@ -333,28 +365,36 @@ fn play_tongues_streaming(
     let source_sample_rate_hz = speech.sample_rate_hz();
     let source_channels = 1u16;
     let mut queued_samples = 0usize;
+    let synthesis_options = SynthesisOptions {
+        speaker: speaker.map(|name| SpeakerSelection::Name(name.to_string())),
+        ..SynthesisOptions::default()
+    };
     println!("robot mouth synthesizing speech");
     speech
-        .synthesize_plan_streaming(plan, &mut |audio: PiperAudioChunk| {
-            anyhow::ensure!(
-                audio.sample_rate_hz > 0,
-                "speech sample rate must be positive"
-            );
-            let converted = convert_interleaved_f32(
-                &audio.pcm_mono_f32,
-                audio.sample_rate_hz,
-                1,
-                output_config.sample_rate_hz,
-                output_config.channels,
-            );
-            queued_samples += converted.len();
-            buffer
-                .lock()
-                .expect("speech output buffer poisoned")
-                .extend(converted);
-            Ok(())
-        })
-        .context("Tongues Piper ONNX streaming synthesis failed")?;
+        .synthesize_plan_streaming_with_options(
+            plan,
+            &synthesis_options,
+            &mut |audio: AudioChunk| {
+                anyhow::ensure!(
+                    audio.sample_rate_hz > 0,
+                    "speech sample rate must be positive"
+                );
+                let converted = convert_interleaved_f32(
+                    &audio.pcm_mono_f32,
+                    audio.sample_rate_hz,
+                    1,
+                    output_config.sample_rate_hz,
+                    output_config.channels,
+                );
+                queued_samples += converted.len();
+                buffer
+                    .lock()
+                    .expect("speech output buffer poisoned")
+                    .extend(converted);
+                Ok(())
+            },
+        )
+        .context("Tongues ONNX speech streaming synthesis failed")?;
 
     anyhow::ensure!(queued_samples > 0, "speech synthesis produced no audio");
     println!("robot mouth draining {queued_samples} output samples");
@@ -372,7 +412,7 @@ fn play_tongues_streaming(
     );
     Ok(SpeechOutcome {
         spoken: true,
-        backend: "tongues-piper-onnx-cpal".to_string(),
+        backend: "tongues-onnx-cpal".to_string(),
         text_len,
         sample_rate_hz: Some(source_sample_rate_hz),
         channels: Some(source_channels),
@@ -392,7 +432,7 @@ fn utterance_plan_from_text(text: &str, variety: &str) -> Result<UtterancePlan> 
             variety,
             style: None,
         })
-        .context("failed to phonemicize text into a Piper speech plan")?;
+        .context("failed to phonemicize text into a speech plan")?;
     Ok(utterance_plan_from_phonemicized(&phonemicized))
 }
 
@@ -412,7 +452,7 @@ fn utterance_plan_from_phonemicized(output: &PhonemicizeOutput) -> UtterancePlan
         style: None,
         provenance: EvidenceProvenance {
             source: EvidenceSource::TtsPlan,
-            method: "pete mouth phonemicized Piper plan".into(),
+            method: "pete mouth phonemicized speech plan".into(),
             version: Some("0.1".into()),
         },
     }
@@ -638,6 +678,9 @@ fn playback_duration(total_samples: usize, sample_rate: u32, channels: u16) -> D
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
 
     #[test]
     fn noop_mouth_reports_quiet_outcome() {
@@ -655,5 +698,54 @@ mod tests {
             converted,
             vec![0.25, 0.25, 0.25, 0.25, -0.25, -0.25, -0.25, -0.25]
         );
+    }
+
+    #[test]
+    fn neutral_tts_env_wins_over_deprecated_voice_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_tts_env();
+        std::env::set_var("PETE_TTS_VOICE", "/tmp/neutral.onnx");
+        std::env::set_var("PETE_TTS_CONFIG", "/tmp/neutral.onnx.json");
+        std::env::set_var("PETE_TTS_PIPER_VOICE", "/tmp/deprecated.onnx");
+        std::env::set_var("PETE_TTS_PIPER_CONFIG", "/tmp/deprecated.onnx.json");
+        std::env::set_var("PETE_TTS_SPEAKER", "p225");
+
+        let config = SpeechConfig::from_env().unwrap().unwrap();
+
+        assert_eq!(config.model_path, PathBuf::from("/tmp/neutral.onnx"));
+        assert_eq!(config.config_path, PathBuf::from("/tmp/neutral.onnx.json"));
+        assert_eq!(config.speaker.as_deref(), Some("p225"));
+        clear_tts_env();
+    }
+
+    #[test]
+    fn deprecated_tts_env_bridge_still_loads() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_tts_env();
+        std::env::set_var("PETE_TTS_PIPER_VOICE", "/tmp/deprecated.onnx");
+        std::env::set_var("PETE_TTS_PIPER_CONFIG", "/tmp/deprecated.onnx.json");
+
+        let config = SpeechConfig::from_env().unwrap().unwrap();
+
+        assert_eq!(config.model_path, PathBuf::from("/tmp/deprecated.onnx"));
+        assert_eq!(
+            config.config_path,
+            PathBuf::from("/tmp/deprecated.onnx.json")
+        );
+        clear_tts_env();
+    }
+
+    fn clear_tts_env() {
+        for name in [
+            "PETE_TTS_VOICE",
+            "PETE_TTS_CONFIG",
+            "PETE_TTS_PIPER_VOICE",
+            "PETE_TTS_PIPER_CONFIG",
+            "PETE_TTS_SPEAKER",
+            "PETE_TTS_VARIETY",
+            "PETE_TTS_OUTPUT_DEVICE",
+        ] {
+            std::env::remove_var(name);
+        }
     }
 }

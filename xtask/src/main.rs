@@ -22,10 +22,10 @@ use std::{
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 const DEFAULT_POSSESSION_TICK_MS: &str = "20";
-const DEFAULT_TTS_PIPER_MODEL: &str = "tongues/models/piper/en_US-ljspeech-high.onnx";
-const DEFAULT_TTS_PIPER_CONFIG: &str = "tongues/models/piper/en_US-ljspeech-high.onnx.json";
-const DEFAULT_TTS_PIPER_MODEL_URL: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ljspeech/high/en_US-ljspeech-high.onnx";
-const DEFAULT_TTS_PIPER_CONFIG_URL: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ljspeech/high/en_US-ljspeech-high.onnx.json";
+const DEFAULT_TTS_VOICE_MODEL: &str = "tongues/models/voices/en_US-ljspeech-high.onnx";
+const DEFAULT_TTS_VOICE_CONFIG: &str = "tongues/models/voices/en_US-ljspeech-high.onnx.json";
+const DEFAULT_TTS_VOICE_MODEL_URL: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ljspeech/high/en_US-ljspeech-high.onnx";
+const DEFAULT_TTS_VOICE_CONFIG_URL: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ljspeech/high/en_US-ljspeech-high.onnx.json";
 
 include!("tasks/cli.rs");
 include!("tasks/process.rs");

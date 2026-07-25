@@ -1,7 +1,7 @@
 fn run_mouth(args: MouthArgs) -> Result<()> {
-    let Some(mouth) = QueuedPiperCpalMouth::from_env()? else {
+    let Some(mouth) = QueuedOnnxCpalMouth::from_env()? else {
         anyhow::bail!(
-            "robot mouth disabled: no Piper voice found; set PETE_TTS_PIPER_VOICE and PETE_TTS_PIPER_CONFIG"
+            "robot mouth disabled: no voice model found; set PETE_TTS_VOICE and PETE_TTS_CONFIG"
         );
     };
     let outcome = mouth.enqueue_and_wait_timeout(args.text, Some(Duration::from_secs(60)))?;
@@ -218,7 +218,7 @@ fn brainstem_firmware_identity(cockpit: &mut dyn Cockpit) -> Option<serde_json::
 }
 
 fn enqueue_default_bringup_outputs(
-    mouth: &Option<QueuedPiperCpalMouth>,
+    mouth: &Option<QueuedOnnxCpalMouth>,
     cockpit: &mut dyn Cockpit,
     initialization: &serde_json::Value,
 ) {
@@ -255,7 +255,7 @@ fn enqueue_default_bringup_outputs(
     }
 }
 
-fn speak_robot_mouth_text_before_status(mouth: &QueuedPiperCpalMouth, text: &str) -> bool {
+fn speak_robot_mouth_text_before_status(mouth: &QueuedOnnxCpalMouth, text: &str) -> bool {
     println!("robot mouth speaking before body status: {text:?}");
     match mouth.enqueue_and_wait_timeout(text.to_string(), Some(Duration::from_secs(20))) {
         Ok(outcome) => {
@@ -276,7 +276,7 @@ fn speak_robot_mouth_text_before_status(mouth: &QueuedPiperCpalMouth, text: &str
 }
 
 fn play_event_script_outputs(
-    mouth: &Option<QueuedPiperCpalMouth>,
+    mouth: &Option<QueuedOnnxCpalMouth>,
     cockpit: &mut dyn Cockpit,
     tick: &RuntimeTick,
 ) {
@@ -307,7 +307,7 @@ fn play_event_script_outputs(
 }
 
 fn play_reign_audio_action(
-    mouth: &Option<QueuedPiperCpalMouth>,
+    mouth: &Option<QueuedOnnxCpalMouth>,
     cockpit: &mut dyn Cockpit,
     tick: &RuntimeTick,
     played: &mut HashSet<String>,
@@ -348,7 +348,7 @@ fn play_reign_audio_action(
 }
 
 fn play_lua_skill_audio(
-    mouth: &Option<QueuedPiperCpalMouth>,
+    mouth: &Option<QueuedOnnxCpalMouth>,
     tick: &RuntimeTick,
     played: &mut HashSet<String>,
 ) {
@@ -398,7 +398,7 @@ fn lua_skill_speech_intents(record: &serde_json::Value) -> Vec<(String, String)>
     intents
 }
 
-fn enqueue_robot_mouth_text(mouth: &QueuedPiperCpalMouth, text: &str) {
+fn enqueue_robot_mouth_text(mouth: &QueuedOnnxCpalMouth, text: &str) {
     match mouth.enqueue(text.to_string()) {
         Ok(()) => println!("robot mouth queued: {text:?}"),
         Err(error) => println!("robot mouth queue failed: {error}; text {text:?}"),

@@ -147,6 +147,12 @@ All notable changes are grouped by date.
 
 ### Fixed
 
+- Ready: Migrate queued robot mouth synthesis to the Tongues `onnx-tts` backend API
+  and neutral `PETE_TTS_*` configuration (`PETE_TTS_VOICE`, `PETE_TTS_CONFIG`),
+  with compatibility handling for deprecated `PETE_TTS_PIPER_*` names, new
+  optional speaker selection via `PETE_TTS_SPEAKER`, and updated setup output
+  layout under `tongues/models/voices`.
+
 - Align the default robot mouth setup with Tongues' Coqui-like LJSpeech voice by
   downloading and loading the Piper `en_US-ljspeech-high` ONNX voice on fresh
   installs while preserving explicit `PETE_TTS_PIPER_VOICE` overrides.
