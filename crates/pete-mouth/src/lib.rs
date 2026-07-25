@@ -628,7 +628,8 @@ fn cuda_probe_failure_reason() -> Option<String> {
     panic::set_hook(Box::new(|_| {}));
     let result = panic::catch_unwind(|| {
         let device = CudaDevice::default();
-        let _tensor = Tensor::<Cuda<f32, i32>, 1>::from_floats([1.0, 2.0, 3.0], &device);
+        let tensor = Tensor::<Cuda<f32, i32>, 1>::from_floats([1.0, 2.0, 3.0], &device);
+        let _ = tensor.into_data();
     });
     panic::set_hook(default_hook);
 
