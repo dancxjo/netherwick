@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 burn.workspace = true
+burn-cuda.workspace = true
 cpal.workspace = true
 serde.workspace = true
 speaking = { path = "../../../tongues/crates/speaking" }

@@ -1,3 +1,5 @@
+use std::any::Any;
+use std::panic;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -8,6 +10,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use burn::backend::ndarray::{NdArray, NdArrayDevice};
+use burn::tensor::backend::Backend;
+use burn::tensor::Tensor;
+use burn_cuda::{Cuda, CudaDevice};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SizedSample};
 use serde::{Deserialize, Serialize};
@@ -214,9 +219,36 @@ impl Drop for QueuedSpeechMouth {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpeechConfig {
     pub backend: SpeechBackendConfig,
+    pub compute: SpeechCompute,
     pub variety: String,
     pub speaker: Option<String>,
     pub output_device_name: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SpeechCompute {
+    #[default]
+    Auto,
+    Cpu,
+    Cuda,
+}
+
+impl SpeechCompute {
+    fn from_env() -> Result<Self> {
+        let Some(value) = std::env::var("PETE_TTS_COMPUTE")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(Self::Auto);
+        };
+        match value.as_str() {
+            "auto" => Ok(Self::Auto),
+            "cpu" => Ok(Self::Cpu),
+            "cuda" => Ok(Self::Cuda),
+            _ => anyhow::bail!("PETE_TTS_COMPUTE must be one of auto, cpu, or cuda; got {value:?}"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -270,6 +302,7 @@ impl SpeechConfig {
                 vocoder_model_path: vocoder_model_path.into(),
                 vocoder_config_path: vocoder_config_path.into(),
             },
+            compute: SpeechCompute::Auto,
             variety: DEFAULT_TTS_VARIETY.to_string(),
             speaker: None,
             output_device_name: None,
@@ -285,6 +318,7 @@ impl SpeechConfig {
                 model_path: model_path.into(),
                 config_path: config_path.into(),
             },
+            compute: SpeechCompute::Auto,
             variety: DEFAULT_TTS_VARIETY.to_string(),
             speaker: None,
             output_device_name: None,
@@ -302,6 +336,7 @@ impl SpeechConfig {
                 config_path: config_path.into(),
                 speaker_map_path: speaker_map_path.into(),
             },
+            compute: SpeechCompute::Auto,
             variety: DEFAULT_TTS_VARIETY.to_string(),
             speaker: None,
             output_device_name: None,
@@ -318,8 +353,8 @@ impl SpeechConfig {
         .iter()
         .any(|name| env_path(name).is_some());
         let mut config = if let Some(model_path) = env_path("PETE_TTS_MODEL") {
-            let config_path = env_path("PETE_TTS_CONFIG")
-                .unwrap_or_else(|| sibling_config_path(&model_path));
+            let config_path =
+                env_path("PETE_TTS_CONFIG").unwrap_or_else(|| sibling_config_path(&model_path));
             let speaker_map_path = env_path("PETE_TTS_SPEAKERS").unwrap_or_else(|| {
                 model_path
                     .parent()
@@ -359,6 +394,7 @@ impl SpeechConfig {
             };
             Self::onnx_compatibility(model_path, config_path)
         };
+        config.compute = SpeechCompute::from_env()?;
         config.variety = std::env::var("PETE_TTS_VARIETY")
             .ok()
             .map(|value| value.trim().to_string())
@@ -444,30 +480,40 @@ fn env_path_with_deprecated(name: &str, deprecated_name: &str) -> Option<PathBuf
     path
 }
 
-type BurnSpeech = SpeechPipeline<
+type CpuBurnSpeech = SpeechPipeline<
     BurnSpeedySpeechAcoustic<NdArray<f32>>,
     VocoderDecoder<BurnHifiganVocoder<NdArray<f32>>>,
 >;
+type CudaBurnSpeech = SpeechPipeline<
+    BurnSpeedySpeechAcoustic<Cuda<f32, i32>>,
+    VocoderDecoder<BurnHifiganVocoder<Cuda<f32, i32>>>,
+>;
 
 enum SpeechBackend {
-    Burn(Box<BurnSpeech>),
-    Vits(Box<BurnVitsSpeech<NdArray<f32>>>),
+    BurnCpu(Box<CpuBurnSpeech>),
+    BurnCuda(Box<CudaBurnSpeech>),
+    VitsCpu(Box<BurnVitsSpeech<NdArray<f32>>>),
+    VitsCuda(Box<BurnVitsSpeech<Cuda<f32, i32>>>),
     OnnxCompatibility(Box<OnnxSpeechBackend>),
 }
 
 impl SpeechBackend {
     fn engine_mut(&mut self) -> &mut dyn SpeechSynthesisEngine {
         match self {
-            Self::Burn(speech) => speech.as_mut(),
-            Self::Vits(speech) => speech.as_mut(),
+            Self::BurnCpu(speech) => speech.as_mut(),
+            Self::BurnCuda(speech) => speech.as_mut(),
+            Self::VitsCpu(speech) => speech.as_mut(),
+            Self::VitsCuda(speech) => speech.as_mut(),
             Self::OnnxCompatibility(speech) => speech.as_mut(),
         }
     }
 
     fn label(&self) -> &'static str {
         match self {
-            Self::Burn(_) => "tongues-burn-cpal",
-            Self::Vits(_) => "tongues-vits-burn-cpal",
+            Self::BurnCpu(_) => "tongues-burn-cpu-cpal",
+            Self::BurnCuda(_) => "tongues-burn-cuda-cpal",
+            Self::VitsCpu(_) => "tongues-vits-burn-cpu-cpal",
+            Self::VitsCuda(_) => "tongues-vits-burn-cuda-cpal",
             Self::OnnxCompatibility(_) => "tongues-onnx-compatibility-cpal",
         }
     }
@@ -486,35 +532,50 @@ impl CpalSpeechMouth {
                 acoustic_config_path,
                 vocoder_model_path,
                 vocoder_config_path,
-            } => {
-                let device = NdArrayDevice::Cpu;
-                let acoustic = BurnSpeedySpeechAcoustic::load(
-                    acoustic_config_path,
-                    acoustic_model_path,
-                    device,
-                )
-                .context("failed to load Burn acoustic model")?;
-                let vocoder =
-                    BurnHifiganVocoder::load(vocoder_config_path, vocoder_model_path, device)
-                        .context("failed to load Burn neural vocoder")?;
-                let pipeline = SpeechPipeline::new(acoustic, VocoderDecoder::new(vocoder))
-                    .context("Burn speech components are incompatible")?;
-                SpeechBackend::Burn(Box::new(pipeline))
-            }
+            } => match resolve_burn_compute(config.compute)? {
+                ResolvedSpeechCompute::Cpu => {
+                    SpeechBackend::BurnCpu(Box::new(load_burn_pipeline::<NdArray<f32>>(
+                        acoustic_config_path,
+                        acoustic_model_path,
+                        vocoder_config_path,
+                        vocoder_model_path,
+                        NdArrayDevice::Cpu,
+                    )?))
+                }
+                ResolvedSpeechCompute::Cuda => {
+                    SpeechBackend::BurnCuda(Box::new(load_burn_pipeline::<Cuda<f32, i32>>(
+                        acoustic_config_path,
+                        acoustic_model_path,
+                        vocoder_config_path,
+                        vocoder_model_path,
+                        CudaDevice::default(),
+                    )?))
+                }
+            },
             SpeechBackendConfig::Vits {
                 model_path,
                 config_path,
                 speaker_map_path,
-            } => {
-                let speech = BurnVitsSpeech::load(
-                    config_path,
-                    model_path,
-                    speaker_map_path,
-                    NdArrayDevice::Cpu,
-                )
-                .context("failed to load Burn VITS speech model")?;
-                SpeechBackend::Vits(Box::new(speech))
-            }
+            } => match resolve_burn_compute(config.compute)? {
+                ResolvedSpeechCompute::Cpu => SpeechBackend::VitsCpu(Box::new(
+                    BurnVitsSpeech::load(
+                        config_path,
+                        model_path,
+                        speaker_map_path,
+                        NdArrayDevice::Cpu,
+                    )
+                    .context("failed to load Burn VITS speech model on CPU")?,
+                )),
+                ResolvedSpeechCompute::Cuda => SpeechBackend::VitsCuda(Box::new(
+                    BurnVitsSpeech::load(
+                        config_path,
+                        model_path,
+                        speaker_map_path,
+                        CudaDevice::default(),
+                    )
+                    .context("failed to load Burn VITS speech model on CUDA")?,
+                )),
+            },
             SpeechBackendConfig::OnnxCompatibility {
                 model_path,
                 config_path,
@@ -532,6 +593,78 @@ impl CpalSpeechMouth {
     pub fn from_env() -> Result<Option<Self>> {
         SpeechConfig::from_env()?.map(Self::new).transpose()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolvedSpeechCompute {
+    Cpu,
+    Cuda,
+}
+
+fn resolve_burn_compute(requested: SpeechCompute) -> Result<ResolvedSpeechCompute> {
+    match requested {
+        SpeechCompute::Cpu => Ok(ResolvedSpeechCompute::Cpu),
+        SpeechCompute::Cuda => {
+            if let Some(reason) = cuda_probe_failure_reason() {
+                anyhow::bail!("CUDA speech compute was requested but is unavailable: {reason}");
+            }
+            Ok(ResolvedSpeechCompute::Cuda)
+        }
+        SpeechCompute::Auto => match cuda_probe_failure_reason() {
+            None => {
+                tracing::info!("using CUDA for Burn speech inference");
+                Ok(ResolvedSpeechCompute::Cuda)
+            }
+            Some(reason) => {
+                tracing::info!(reason = %reason, "CUDA unavailable; using CPU for Burn speech inference");
+                Ok(ResolvedSpeechCompute::Cpu)
+            }
+        },
+    }
+}
+
+fn cuda_probe_failure_reason() -> Option<String> {
+    let default_hook = panic::take_hook();
+    panic::set_hook(Box::new(|_| {}));
+    let result = panic::catch_unwind(|| {
+        let device = CudaDevice::default();
+        let _tensor = Tensor::<Cuda<f32, i32>, 1>::from_floats([1.0, 2.0, 3.0], &device);
+    });
+    panic::set_hook(default_hook);
+
+    match result {
+        Ok(_) => None,
+        Err(payload) => Some(format_panic_payload(payload.as_ref())),
+    }
+}
+
+fn format_panic_payload(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown CUDA initialization failure".to_string()
+    }
+}
+
+fn load_burn_pipeline<B: Backend>(
+    acoustic_config_path: &std::path::Path,
+    acoustic_model_path: &std::path::Path,
+    vocoder_config_path: &std::path::Path,
+    vocoder_model_path: &std::path::Path,
+    device: B::Device,
+) -> Result<SpeechPipeline<BurnSpeedySpeechAcoustic<B>, VocoderDecoder<BurnHifiganVocoder<B>>>>
+where
+    B::Device: Clone,
+{
+    let acoustic =
+        BurnSpeedySpeechAcoustic::load(acoustic_config_path, acoustic_model_path, device.clone())
+            .context("failed to load Burn acoustic model")?;
+    let vocoder = BurnHifiganVocoder::load(vocoder_config_path, vocoder_model_path, device)
+        .context("failed to load Burn neural vocoder")?;
+    SpeechPipeline::new(acoustic, VocoderDecoder::new(vocoder))
+        .context("Burn speech components are incompatible")
 }
 
 impl Mouth for CpalSpeechMouth {
@@ -838,21 +971,19 @@ where
         .build_output_stream(
             config,
             move |output: &mut [T], _| {
+                let samples = samples.lock().expect("speech output buffer poisoned");
+                let mut idx = cursor.load(Ordering::Relaxed);
                 for out in output.iter_mut() {
-                    let idx = cursor.load(Ordering::Relaxed);
-                    let sample = samples
-                        .lock()
-                        .expect("speech output buffer poisoned")
-                        .get(idx)
-                        .copied();
+                    let sample = samples.get(idx).copied();
                     if let Some(sample) = sample {
-                        cursor.store(idx + 1, Ordering::Relaxed);
+                        idx += 1;
                         *out = T::from_sample(sample);
                     } else {
                         let _done = finished.load(Ordering::Relaxed);
                         *out = T::from_sample(0.0);
                     }
                 }
+                cursor.store(idx, Ordering::Release);
             },
             err_fn,
             None,
@@ -995,6 +1126,7 @@ mod tests {
         clear_tts_env();
         std::env::set_var("PETE_TTS_MODEL", "/tmp/vits/model_file.pth");
         std::env::set_var("PETE_TTS_SPEAKER", "p226");
+        std::env::set_var("PETE_TTS_COMPUTE", "cuda");
 
         let config = SpeechConfig::from_env().unwrap().unwrap();
 
@@ -1007,6 +1139,22 @@ mod tests {
             }
         );
         assert_eq!(config.speaker.as_deref(), Some("p226"));
+        assert_eq!(config.compute, SpeechCompute::Cuda);
+        clear_tts_env();
+    }
+
+    #[test]
+    fn speech_compute_defaults_to_auto_and_rejects_unknown_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_tts_env();
+        std::env::set_var("PETE_TTS_MODEL", "/tmp/vits/model_file.pth");
+
+        let config = SpeechConfig::from_env().unwrap().unwrap();
+        assert_eq!(config.compute, SpeechCompute::Auto);
+
+        std::env::set_var("PETE_TTS_COMPUTE", "metal");
+        let error = SpeechConfig::from_env().expect_err("unknown compute runtime");
+        assert!(error.to_string().contains("auto, cpu, or cuda"));
         clear_tts_env();
     }
 
@@ -1023,6 +1171,7 @@ mod tests {
             "PETE_TTS_PIPER_VOICE",
             "PETE_TTS_PIPER_CONFIG",
             "PETE_TTS_SPEAKER",
+            "PETE_TTS_COMPUTE",
             "PETE_TTS_VARIETY",
             "PETE_TTS_OUTPUT_DEVICE",
             "MORTAR_SEA_HOME",
