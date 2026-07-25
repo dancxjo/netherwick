@@ -40,7 +40,7 @@ use pete_memory::{
     PlaceRecognitionKind,
 };
 use pete_models::MODEL_REGISTRY;
-use pete_mouth::QueuedOnnxCpalMouth;
+use pete_mouth::QueuedSpeechMouth;
 use pete_neat::{
     evaluate_locomotion_promotion, verify_locomotion_promotion_artifacts, CandidateEvaluation,
     CurriculumStage, EpisodeMetrics as NeatEpisodeMetrics, FitnessTraits, Genome, GenomeState,

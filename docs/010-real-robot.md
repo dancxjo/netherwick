@@ -38,9 +38,10 @@ The default voice is downloaded to the Tongues voice model directory and autoloa
 To override the voice, set:
 
 ```bash
-PETE_TTS_VOICE=/path/to/en_US-ryan-medium.onnx
-PETE_TTS_CONFIG=/path/to/en_US-ryan-medium.onnx.json
-PETE_TTS_SPEAKER=p225
+PETE_TTS_ACOUSTIC_MODEL=/path/to/speedy-speech/model_file.pth
+PETE_TTS_ACOUSTIC_CONFIG=/path/to/speedy-speech/config.json
+PETE_TTS_VOCODER_MODEL=/path/to/hifigan-v2/model_file.pth
+PETE_TTS_VOCODER_CONFIG=/path/to/hifigan-v2/config.json
 PETE_TTS_OUTPUT_DEVICE=
 ```
 

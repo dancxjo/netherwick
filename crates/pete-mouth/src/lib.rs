@@ -7,6 +7,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use burn::backend::ndarray::{NdArray, NdArrayDevice};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SizedSample};
 use serde::{Deserialize, Serialize};
@@ -14,7 +15,10 @@ use speaking::{
     phonemicizer_for_variety, EvidenceProvenance, EvidenceSource, PhonemicizeOutput,
     PhonemicizeRequest, SpeakerId, UtteranceId, UtterancePlan, VarietyId,
 };
-use tongues_tts::{AudioChunk, OnnxSpeechBackend, SynthesisOptions, VoiceConfig};
+use tongues_tts::{
+    AudioChunk, BurnHifiganVocoder, BurnSpeedySpeechAcoustic, OnnxSpeechBackend, SpeechPipeline,
+    SpeechSynthesisEngine, SpeechSynthesisRequest, SynthesisOptions, VocoderDecoder, VoiceConfig,
+};
 
 const DEFAULT_TTS_VARIETY: &str = "en-US";
 
@@ -49,7 +53,7 @@ impl Mouth for NoopMouth {
 }
 
 pub fn mouth_from_env() -> Box<dyn Mouth + Send> {
-    match OnnxCpalMouth::from_env() {
+    match CpalSpeechMouth::from_env() {
         Ok(Some(mouth)) => Box::new(mouth),
         Ok(None) => Box::<NoopMouth>::default(),
         Err(error) => {
@@ -59,7 +63,7 @@ pub fn mouth_from_env() -> Box<dyn Mouth + Send> {
     }
 }
 
-pub struct QueuedOnnxCpalMouth {
+pub struct QueuedSpeechMouth {
     tx: Option<mpsc::Sender<MouthQueueItem>>,
     worker: Option<JoinHandle<()>>,
 }
@@ -69,7 +73,7 @@ struct MouthQueueItem {
     outcome_tx: Option<mpsc::Sender<std::result::Result<SpeechOutcome, String>>>,
 }
 
-impl QueuedOnnxCpalMouth {
+impl QueuedSpeechMouth {
     pub fn from_env() -> Result<Option<Self>> {
         SpeechConfig::from_env()?.map(Self::new).transpose()
     }
@@ -80,10 +84,10 @@ impl QueuedOnnxCpalMouth {
             .name("pete-speech-mouth".to_string())
             .spawn(move || {
                 println!(
-                    "robot mouth loading voice model: {}",
-                    config.model_path.display()
+                    "robot mouth loading speech components: {}",
+                    config.backend.description()
                 );
-                let mut mouth = match OnnxCpalMouth::new(config) {
+                let mut mouth = match CpalSpeechMouth::new(config) {
                     Ok(mouth) => mouth,
                     Err(error) => {
                         let message =
@@ -162,7 +166,7 @@ impl QueuedOnnxCpalMouth {
         if text.trim().is_empty() {
             return Ok(SpeechOutcome {
                 spoken: false,
-                backend: "queued-onnx-cpal".to_string(),
+                backend: "queued-speech".to_string(),
                 ..SpeechOutcome::default()
             });
         }
@@ -194,7 +198,7 @@ impl QueuedOnnxCpalMouth {
     }
 }
 
-impl Drop for QueuedOnnxCpalMouth {
+impl Drop for QueuedSpeechMouth {
     fn drop(&mut self) {
         drop(self.tx.take());
         if let Some(worker) = self.worker.take() {
@@ -208,18 +212,72 @@ impl Drop for QueuedOnnxCpalMouth {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpeechConfig {
-    pub model_path: PathBuf,
-    pub config_path: PathBuf,
+    pub backend: SpeechBackendConfig,
     pub variety: String,
     pub speaker: Option<String>,
     pub output_device_name: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpeechBackendConfig {
+    Burn {
+        acoustic_model_path: PathBuf,
+        acoustic_config_path: PathBuf,
+        vocoder_model_path: PathBuf,
+        vocoder_config_path: PathBuf,
+    },
+    OnnxCompatibility {
+        model_path: PathBuf,
+        config_path: PathBuf,
+    },
+}
+
+impl SpeechBackendConfig {
+    fn description(&self) -> String {
+        match self {
+            Self::Burn {
+                acoustic_model_path,
+                vocoder_model_path,
+                ..
+            } => format!(
+                "{} + {}",
+                acoustic_model_path.display(),
+                vocoder_model_path.display()
+            ),
+            Self::OnnxCompatibility { model_path, .. } => model_path.display().to_string(),
+        }
+    }
+}
+
 impl SpeechConfig {
-    pub fn new(model_path: impl Into<PathBuf>, config_path: impl Into<PathBuf>) -> Self {
+    pub fn burn(
+        acoustic_model_path: impl Into<PathBuf>,
+        acoustic_config_path: impl Into<PathBuf>,
+        vocoder_model_path: impl Into<PathBuf>,
+        vocoder_config_path: impl Into<PathBuf>,
+    ) -> Self {
         Self {
-            model_path: model_path.into(),
-            config_path: config_path.into(),
+            backend: SpeechBackendConfig::Burn {
+                acoustic_model_path: acoustic_model_path.into(),
+                acoustic_config_path: acoustic_config_path.into(),
+                vocoder_model_path: vocoder_model_path.into(),
+                vocoder_config_path: vocoder_config_path.into(),
+            },
+            variety: DEFAULT_TTS_VARIETY.to_string(),
+            speaker: None,
+            output_device_name: None,
+        }
+    }
+
+    pub fn onnx_compatibility(
+        model_path: impl Into<PathBuf>,
+        config_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            backend: SpeechBackendConfig::OnnxCompatibility {
+                model_path: model_path.into(),
+                config_path: config_path.into(),
+            },
             variety: DEFAULT_TTS_VARIETY.to_string(),
             speaker: None,
             output_device_name: None,
@@ -227,25 +285,46 @@ impl SpeechConfig {
     }
 
     pub fn from_env() -> Result<Option<Self>> {
-        let (model_path, config_path) =
-            match env_path_with_deprecated("PETE_TTS_VOICE", "PETE_TTS_PIPER_VOICE") {
-                Some(model_path) => {
-                    let config_path =
-                        env_path_with_deprecated("PETE_TTS_CONFIG", "PETE_TTS_PIPER_CONFIG")
-                            .unwrap_or_else(|| tongues_tts::voice_config_path(&model_path));
-                    (model_path, config_path)
-                }
-                None => {
-                    let default_voice = tongues_tts::default_voice_model();
-                    let model_path = tongues_tts::default_voice_model_path(default_voice.clone());
-                    let config_path = tongues_tts::default_voice_config_path(default_voice);
-                    if !model_path.is_file() || !config_path.is_file() {
-                        return Ok(None);
-                    }
-                    (model_path, config_path)
-                }
+        let burn_env_requested = [
+            "PETE_TTS_ACOUSTIC_MODEL",
+            "PETE_TTS_ACOUSTIC_CONFIG",
+            "PETE_TTS_VOCODER_MODEL",
+            "PETE_TTS_VOCODER_CONFIG",
+        ]
+        .iter()
+        .any(|name| env_path(name).is_some());
+        let mut config = if burn_env_requested {
+            let acoustic_model_path = env_path("PETE_TTS_ACOUSTIC_MODEL")
+                .context("PETE_TTS_ACOUSTIC_MODEL is required for a Burn speech backend")?;
+            let acoustic_config_path = env_path("PETE_TTS_ACOUSTIC_CONFIG")
+                .unwrap_or_else(|| sibling_config_path(&acoustic_model_path));
+            let vocoder_model_path = env_path("PETE_TTS_VOCODER_MODEL")
+                .context("PETE_TTS_VOCODER_MODEL is required with PETE_TTS_ACOUSTIC_MODEL")?;
+            let vocoder_config_path = env_path("PETE_TTS_VOCODER_CONFIG")
+                .unwrap_or_else(|| sibling_config_path(&vocoder_model_path));
+            Self::burn(
+                acoustic_model_path,
+                acoustic_config_path,
+                vocoder_model_path,
+                vocoder_config_path,
+            )
+        } else if let Some(model_path) =
+            env_path_with_deprecated("PETE_TTS_VOICE", "PETE_TTS_PIPER_VOICE")
+        {
+            let config_path = env_path_with_deprecated("PETE_TTS_CONFIG", "PETE_TTS_PIPER_CONFIG")
+                .unwrap_or_else(|| tongues_tts::voice_config_path(&model_path));
+            Self::onnx_compatibility(model_path, config_path)
+        } else if let Some(config) = burn_config_from_model_home() {
+            config
+        } else {
+            let default_voice = tongues_tts::default_voice_model();
+            let model_path = tongues_tts::default_voice_model_path(default_voice.clone());
+            let config_path = tongues_tts::default_voice_config_path(default_voice);
+            if !model_path.is_file() || !config_path.is_file() {
+                return Ok(None);
             };
-        let mut config = Self::new(model_path, config_path);
+            Self::onnx_compatibility(model_path, config_path)
+        };
         config.variety = std::env::var("PETE_TTS_VARIETY")
             .ok()
             .map(|value| value.trim().to_string())
@@ -260,6 +339,44 @@ impl SpeechConfig {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         Ok(Some(config))
+    }
+}
+
+fn sibling_config_path(model_path: &std::path::Path) -> PathBuf {
+    model_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("config.json")
+}
+
+fn burn_config_from_model_home() -> Option<SpeechConfig> {
+    let home = env_path("MORTAR_SEA_HOME")?;
+    let acoustic_dir = home.join("models/speech/coqui/en/ljspeech/speedy-speech");
+    let vocoder_dir = home.join("models/speech/coqui/en/ljspeech/hifigan-v2");
+    let config = SpeechConfig::burn(
+        acoustic_dir.join("model_file.pth"),
+        acoustic_dir.join("config.json"),
+        vocoder_dir.join("model_file.pth"),
+        vocoder_dir.join("config.json"),
+    );
+    match &config.backend {
+        SpeechBackendConfig::Burn {
+            acoustic_model_path,
+            acoustic_config_path,
+            vocoder_model_path,
+            vocoder_config_path,
+        } if [
+            acoustic_model_path,
+            acoustic_config_path,
+            vocoder_model_path,
+            vocoder_config_path,
+        ]
+        .iter()
+        .all(|path| path.is_file()) =>
+        {
+            Some(config)
+        }
+        _ => None,
     }
 }
 
@@ -293,17 +410,71 @@ fn env_path_with_deprecated(name: &str, deprecated_name: &str) -> Option<PathBuf
     path
 }
 
-pub struct OnnxCpalMouth {
-    config: SpeechConfig,
-    speech: OnnxSpeechBackend,
+type BurnSpeech = SpeechPipeline<
+    BurnSpeedySpeechAcoustic<NdArray<f32>>,
+    VocoderDecoder<BurnHifiganVocoder<NdArray<f32>>>,
+>;
+
+enum SpeechBackend {
+    Burn(Box<BurnSpeech>),
+    OnnxCompatibility(Box<OnnxSpeechBackend>),
 }
 
-impl OnnxCpalMouth {
+impl SpeechBackend {
+    fn engine_mut(&mut self) -> &mut dyn SpeechSynthesisEngine {
+        match self {
+            Self::Burn(speech) => speech.as_mut(),
+            Self::OnnxCompatibility(speech) => speech.as_mut(),
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Burn(_) => "tongues-burn-cpal",
+            Self::OnnxCompatibility(_) => "tongues-onnx-compatibility-cpal",
+        }
+    }
+}
+
+pub struct CpalSpeechMouth {
+    config: SpeechConfig,
+    speech: SpeechBackend,
+}
+
+impl CpalSpeechMouth {
     pub fn new(config: SpeechConfig) -> Result<Self> {
-        let voice_config = VoiceConfig::from_json_file(&config.config_path)
-            .with_context(|| format!("failed to read {}", config.config_path.display()))?;
-        let speech = OnnxSpeechBackend::load(&config.model_path, voice_config)
-            .context("failed to load ONNX speech backend")?;
+        let speech = match &config.backend {
+            SpeechBackendConfig::Burn {
+                acoustic_model_path,
+                acoustic_config_path,
+                vocoder_model_path,
+                vocoder_config_path,
+            } => {
+                let device = NdArrayDevice::Cpu;
+                let acoustic = BurnSpeedySpeechAcoustic::load(
+                    acoustic_config_path,
+                    acoustic_model_path,
+                    device,
+                )
+                .context("failed to load Burn acoustic model")?;
+                let vocoder =
+                    BurnHifiganVocoder::load(vocoder_config_path, vocoder_model_path, device)
+                        .context("failed to load Burn neural vocoder")?;
+                let pipeline = SpeechPipeline::new(acoustic, VocoderDecoder::new(vocoder))
+                    .context("Burn speech components are incompatible")?;
+                SpeechBackend::Burn(Box::new(pipeline))
+            }
+            SpeechBackendConfig::OnnxCompatibility {
+                model_path,
+                config_path,
+            } => {
+                let voice_config = VoiceConfig::from_json_file(config_path)
+                    .with_context(|| format!("failed to read {}", config_path.display()))?;
+                let speech = OnnxSpeechBackend::load(model_path, voice_config)
+                    .context("failed to load ONNX compatibility speech backend")?;
+                SpeechBackend::OnnxCompatibility(Box::new(speech))
+            }
+        };
         Ok(Self { config, speech })
     }
 
@@ -312,34 +483,37 @@ impl OnnxCpalMouth {
     }
 }
 
-impl Mouth for OnnxCpalMouth {
+impl Mouth for CpalSpeechMouth {
     fn speak(&mut self, text: &str) -> Result<SpeechOutcome> {
         let text = text.trim();
         if text.is_empty() {
             return Ok(SpeechOutcome {
                 spoken: false,
-                backend: "onnx-cpal".to_string(),
+                backend: self.speech.label().to_string(),
                 ..SpeechOutcome::default()
             });
         }
 
         let plan = utterance_plan_from_text(text, &self.config.variety)?;
+        let backend_label = self.speech.label();
         play_tongues_streaming(
-            &mut self.speech,
+            self.speech.engine_mut(),
             &plan,
             text.len(),
             self.config.output_device_name.as_deref(),
             self.config.speaker.as_deref(),
+            backend_label,
         )
     }
 }
 
 fn play_tongues_streaming(
-    speech: &mut OnnxSpeechBackend,
+    speech: &mut dyn SpeechSynthesisEngine,
     plan: &UtterancePlan,
     text_len: usize,
     output_device_name: Option<&str>,
     speaker: Option<&str>,
+    backend_label: &str,
 ) -> Result<SpeechOutcome> {
     let host = cpal::default_host();
     let device = select_output_device(&host, output_device_name)?;
@@ -369,9 +543,11 @@ fn play_tongues_streaming(
     plan.speaker = speaker.map(|name| SpeakerId(name.to_string()));
     println!("robot mouth synthesizing speech");
     speech
-        .synthesize_plan_streaming_with_options(
-            &plan,
-            &SynthesisOptions::default(),
+        .synthesize_plan_streaming(
+            &SpeechSynthesisRequest {
+                plan,
+                options: SynthesisOptions::default(),
+            },
             &mut |audio: AudioChunk| {
                 anyhow::ensure!(
                     audio.sample_rate_hz > 0,
@@ -392,7 +568,7 @@ fn play_tongues_streaming(
                 Ok(())
             },
         )
-        .context("Tongues ONNX speech streaming synthesis failed")?;
+        .context("Tongues speech synthesis failed")?;
 
     anyhow::ensure!(queued_samples > 0, "speech synthesis produced no audio");
     println!("robot mouth draining {queued_samples} output samples");
@@ -410,7 +586,7 @@ fn play_tongues_streaming(
     );
     Ok(SpeechOutcome {
         spoken: true,
-        backend: "tongues-onnx-cpal".to_string(),
+        backend: backend_label.to_string(),
         text_len,
         sample_rate_hz: Some(source_sample_rate_hz),
         channels: Some(source_channels),
@@ -711,8 +887,13 @@ mod tests {
 
         let config = SpeechConfig::from_env().unwrap().unwrap();
 
-        assert_eq!(config.model_path, PathBuf::from("/tmp/neutral.onnx"));
-        assert_eq!(config.config_path, PathBuf::from("/tmp/neutral.onnx.json"));
+        assert_eq!(
+            config.backend,
+            SpeechBackendConfig::OnnxCompatibility {
+                model_path: PathBuf::from("/tmp/neutral.onnx"),
+                config_path: PathBuf::from("/tmp/neutral.onnx.json"),
+            }
+        );
         assert_eq!(config.speaker.as_deref(), Some("p225"));
         clear_tts_env();
     }
@@ -726,16 +907,43 @@ mod tests {
 
         let config = SpeechConfig::from_env().unwrap().unwrap();
 
-        assert_eq!(config.model_path, PathBuf::from("/tmp/deprecated.onnx"));
         assert_eq!(
-            config.config_path,
-            PathBuf::from("/tmp/deprecated.onnx.json")
+            config.backend,
+            SpeechBackendConfig::OnnxCompatibility {
+                model_path: PathBuf::from("/tmp/deprecated.onnx"),
+                config_path: PathBuf::from("/tmp/deprecated.onnx.json"),
+            }
+        );
+        clear_tts_env();
+    }
+
+    #[test]
+    fn burn_component_env_selects_native_pipeline() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_tts_env();
+        std::env::set_var("PETE_TTS_ACOUSTIC_MODEL", "/tmp/acoustic/model_file.pth");
+        std::env::set_var("PETE_TTS_VOCODER_MODEL", "/tmp/vocoder/model_file.pth");
+
+        let config = SpeechConfig::from_env().unwrap().unwrap();
+
+        assert_eq!(
+            config.backend,
+            SpeechBackendConfig::Burn {
+                acoustic_model_path: PathBuf::from("/tmp/acoustic/model_file.pth"),
+                acoustic_config_path: PathBuf::from("/tmp/acoustic/config.json"),
+                vocoder_model_path: PathBuf::from("/tmp/vocoder/model_file.pth"),
+                vocoder_config_path: PathBuf::from("/tmp/vocoder/config.json"),
+            }
         );
         clear_tts_env();
     }
 
     fn clear_tts_env() {
         for name in [
+            "PETE_TTS_ACOUSTIC_MODEL",
+            "PETE_TTS_ACOUSTIC_CONFIG",
+            "PETE_TTS_VOCODER_MODEL",
+            "PETE_TTS_VOCODER_CONFIG",
             "PETE_TTS_VOICE",
             "PETE_TTS_CONFIG",
             "PETE_TTS_PIPER_VOICE",
@@ -743,6 +951,7 @@ mod tests {
             "PETE_TTS_SPEAKER",
             "PETE_TTS_VARIETY",
             "PETE_TTS_OUTPUT_DEVICE",
+            "MORTAR_SEA_HOME",
         ] {
             std::env::remove_var(name);
         }

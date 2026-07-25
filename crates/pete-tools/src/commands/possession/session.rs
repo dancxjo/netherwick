@@ -757,11 +757,11 @@ async fn run_robot(args: RobotArgs) -> Result<()> {
         Err(error) => return Err(error),
     };
 
-    let mut mouth = match QueuedOnnxCpalMouth::from_env() {
+    let mut mouth = match QueuedSpeechMouth::from_env() {
         Ok(Some(mouth)) => Some(mouth),
         Ok(None) => {
             println!(
-                "robot mouth disabled: no voice model found; set PETE_TTS_VOICE and PETE_TTS_CONFIG"
+                "robot mouth disabled: no speech components found; set PETE_TTS_ACOUSTIC_MODEL and PETE_TTS_VOCODER_MODEL"
             );
             None
         }

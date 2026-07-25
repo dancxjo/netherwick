@@ -6247,6 +6247,7 @@ name = "pete-mouth"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "burn",
  "cpal",
  "serde",
  "speaking",
