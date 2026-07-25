@@ -12,9 +12,9 @@ use cpal::{FromSample, Sample, SizedSample};
 use serde::{Deserialize, Serialize};
 use speaking::{
     phonemicizer_for_variety, EvidenceProvenance, EvidenceSource, PhonemicizeOutput,
-    PhonemicizeRequest, UtteranceId, UtterancePlan, VarietyId,
+    PhonemicizeRequest, SpeakerId, UtteranceId, UtterancePlan, VarietyId,
 };
-use tongues_tts::{AudioChunk, OnnxSpeechBackend, SpeakerSelection, SynthesisOptions, VoiceConfig};
+use tongues_tts::{AudioChunk, OnnxSpeechBackend, SynthesisOptions, VoiceConfig};
 
 const DEFAULT_TTS_VARIETY: &str = "en-US";
 
@@ -365,15 +365,13 @@ fn play_tongues_streaming(
     let source_sample_rate_hz = speech.sample_rate_hz();
     let source_channels = 1u16;
     let mut queued_samples = 0usize;
-    let synthesis_options = SynthesisOptions {
-        speaker: speaker.map(|name| SpeakerSelection::Name(name.to_string())),
-        ..SynthesisOptions::default()
-    };
+    let mut plan = plan.clone();
+    plan.speaker = speaker.map(|name| SpeakerId(name.to_string()));
     println!("robot mouth synthesizing speech");
     speech
         .synthesize_plan_streaming_with_options(
-            plan,
-            &synthesis_options,
+            &plan,
+            &SynthesisOptions::default(),
             &mut |audio: AudioChunk| {
                 anyhow::ensure!(
                     audio.sample_rate_hz > 0,
@@ -449,6 +447,7 @@ fn utterance_plan_from_phonemicized(output: &PhonemicizeOutput) -> UtterancePlan
         boundaries: output.boundaries.clone(),
         target_prosody: output.prosody.clone(),
         target_acoustics: Vec::new(),
+        speaker_reference: None,
         style: None,
         provenance: EvidenceProvenance {
             source: EvidenceSource::TtsPlan,
