@@ -33,7 +33,7 @@ just setup-tts
 just setup
 ```
 
-The default voice is downloaded to the Tongues voice model directory and autoloaded at startup. Native Burn component and VITS models use CUDA automatically when it is available, including Burn graph fusion and kernel autotuning, and otherwise fall back to CPU. Set `PETE_TTS_COMPUTE=cpu` to force CPU or `PETE_TTS_COMPUTE=cuda` to require CUDA. The ONNX compatibility backend uses the self-contained Rust `ort` package prepared by `just setup-ort`.
+The default voice is downloaded to the Tongues voice model directory and autoloaded at startup. Native Burn component and VITS models use CUDA automatically when it is available, including Burn graph fusion, and otherwise fall back to CPU. Runtime kernel autotuning is intentionally disabled because speech tensor shapes vary per utterance and tuning them delays streaming output. Set `PETE_TTS_COMPUTE=cpu` to force CPU or `PETE_TTS_COMPUTE=cuda` to require CUDA. The ONNX compatibility backend uses the self-contained Rust `ort` package prepared by `just setup-ort`.
 
 To use a multi-speaker VITS model, set:
 
