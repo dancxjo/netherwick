@@ -150,6 +150,8 @@ All notable changes are grouped by date.
 - Align the default robot mouth setup with Tongues' Coqui-like LJSpeech voice by
   downloading and loading the Piper `en_US-ljspeech-high` ONNX voice on fresh
   installs while preserving explicit `PETE_TTS_PIPER_VOICE` overrides.
+- Refresh lockfile metadata for the local Tongues speech crates required by the
+  robot mouth path.
 - Ready: Ensure real-robot possession always attempts STOP/exorcize and capture finalization through a unified exit path even when the control loop exits with an error, and report combined shutdown/capture/control failures instead of silently dropping finalization work.
 - Ready: Extend physical possession capture coverage with a regression test that uses runtime frame timing, writes raw RGB/depth/audio assets, and validates captured asset timestamps, IDs, and file outputs in snapshot metadata.
 - Ready: Preserve RGB/depth/audio capture asset export in real-robot snapshot recording while enriching exported asset metadata with capture timing, frame identifiers, device timestamps, and source/coordinate provenance.
