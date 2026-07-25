@@ -16,8 +16,9 @@ use speaking::{
     PhonemicizeRequest, SpeakerId, UtteranceId, UtterancePlan, VarietyId,
 };
 use tongues_tts::{
-    AudioChunk, BurnHifiganVocoder, BurnSpeedySpeechAcoustic, OnnxSpeechBackend, SpeechPipeline,
-    SpeechSynthesisEngine, SpeechSynthesisRequest, SynthesisOptions, VocoderDecoder, VoiceConfig,
+    AudioChunk, BurnHifiganVocoder, BurnSpeedySpeechAcoustic, BurnVitsSpeech, OnnxSpeechBackend,
+    SpeechPipeline, SpeechSynthesisEngine, SpeechSynthesisRequest, SynthesisOptions,
+    VocoderDecoder, VoiceConfig,
 };
 
 const DEFAULT_TTS_VARIETY: &str = "en-US";
@@ -226,6 +227,11 @@ pub enum SpeechBackendConfig {
         vocoder_model_path: PathBuf,
         vocoder_config_path: PathBuf,
     },
+    Vits {
+        model_path: PathBuf,
+        config_path: PathBuf,
+        speaker_map_path: PathBuf,
+    },
     OnnxCompatibility {
         model_path: PathBuf,
         config_path: PathBuf,
@@ -244,6 +250,7 @@ impl SpeechBackendConfig {
                 acoustic_model_path.display(),
                 vocoder_model_path.display()
             ),
+            Self::Vits { model_path, .. } => model_path.display().to_string(),
             Self::OnnxCompatibility { model_path, .. } => model_path.display().to_string(),
         }
     }
@@ -284,6 +291,23 @@ impl SpeechConfig {
         }
     }
 
+    pub fn vits(
+        model_path: impl Into<PathBuf>,
+        config_path: impl Into<PathBuf>,
+        speaker_map_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            backend: SpeechBackendConfig::Vits {
+                model_path: model_path.into(),
+                config_path: config_path.into(),
+                speaker_map_path: speaker_map_path.into(),
+            },
+            variety: DEFAULT_TTS_VARIETY.to_string(),
+            speaker: None,
+            output_device_name: None,
+        }
+    }
+
     pub fn from_env() -> Result<Option<Self>> {
         let burn_env_requested = [
             "PETE_TTS_ACOUSTIC_MODEL",
@@ -293,7 +317,17 @@ impl SpeechConfig {
         ]
         .iter()
         .any(|name| env_path(name).is_some());
-        let mut config = if burn_env_requested {
+        let mut config = if let Some(model_path) = env_path("PETE_TTS_MODEL") {
+            let config_path = env_path("PETE_TTS_CONFIG")
+                .unwrap_or_else(|| sibling_config_path(&model_path));
+            let speaker_map_path = env_path("PETE_TTS_SPEAKERS").unwrap_or_else(|| {
+                model_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join("speaker_ids.json")
+            });
+            Self::vits(model_path, config_path, speaker_map_path)
+        } else if burn_env_requested {
             let acoustic_model_path = env_path("PETE_TTS_ACOUSTIC_MODEL")
                 .context("PETE_TTS_ACOUSTIC_MODEL is required for a Burn speech backend")?;
             let acoustic_config_path = env_path("PETE_TTS_ACOUSTIC_CONFIG")
@@ -417,6 +451,7 @@ type BurnSpeech = SpeechPipeline<
 
 enum SpeechBackend {
     Burn(Box<BurnSpeech>),
+    Vits(Box<BurnVitsSpeech<NdArray<f32>>>),
     OnnxCompatibility(Box<OnnxSpeechBackend>),
 }
 
@@ -424,6 +459,7 @@ impl SpeechBackend {
     fn engine_mut(&mut self) -> &mut dyn SpeechSynthesisEngine {
         match self {
             Self::Burn(speech) => speech.as_mut(),
+            Self::Vits(speech) => speech.as_mut(),
             Self::OnnxCompatibility(speech) => speech.as_mut(),
         }
     }
@@ -431,6 +467,7 @@ impl SpeechBackend {
     fn label(&self) -> &'static str {
         match self {
             Self::Burn(_) => "tongues-burn-cpal",
+            Self::Vits(_) => "tongues-vits-burn-cpal",
             Self::OnnxCompatibility(_) => "tongues-onnx-compatibility-cpal",
         }
     }
@@ -463,6 +500,20 @@ impl CpalSpeechMouth {
                 let pipeline = SpeechPipeline::new(acoustic, VocoderDecoder::new(vocoder))
                     .context("Burn speech components are incompatible")?;
                 SpeechBackend::Burn(Box::new(pipeline))
+            }
+            SpeechBackendConfig::Vits {
+                model_path,
+                config_path,
+                speaker_map_path,
+            } => {
+                let speech = BurnVitsSpeech::load(
+                    config_path,
+                    model_path,
+                    speaker_map_path,
+                    NdArrayDevice::Cpu,
+                )
+                .context("failed to load Burn VITS speech model")?;
+                SpeechBackend::Vits(Box::new(speech))
             }
             SpeechBackendConfig::OnnxCompatibility {
                 model_path,
@@ -938,8 +989,31 @@ mod tests {
         clear_tts_env();
     }
 
+    #[test]
+    fn end_to_end_model_env_preserves_named_speaker() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_tts_env();
+        std::env::set_var("PETE_TTS_MODEL", "/tmp/vits/model_file.pth");
+        std::env::set_var("PETE_TTS_SPEAKER", "p226");
+
+        let config = SpeechConfig::from_env().unwrap().unwrap();
+
+        assert_eq!(
+            config.backend,
+            SpeechBackendConfig::Vits {
+                model_path: PathBuf::from("/tmp/vits/model_file.pth"),
+                config_path: PathBuf::from("/tmp/vits/config.json"),
+                speaker_map_path: PathBuf::from("/tmp/vits/speaker_ids.json"),
+            }
+        );
+        assert_eq!(config.speaker.as_deref(), Some("p226"));
+        clear_tts_env();
+    }
+
     fn clear_tts_env() {
         for name in [
+            "PETE_TTS_MODEL",
+            "PETE_TTS_SPEAKERS",
             "PETE_TTS_ACOUSTIC_MODEL",
             "PETE_TTS_ACOUSTIC_CONFIG",
             "PETE_TTS_VOCODER_MODEL",
