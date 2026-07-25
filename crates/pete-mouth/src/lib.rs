@@ -14,7 +14,7 @@ use speaking::{
     phonemicizer_for_variety, EvidenceProvenance, EvidenceSource, PhonemicizeOutput,
     PhonemicizeRequest, UtteranceId, UtterancePlan, VarietyId,
 };
-use tongues_tts::{PiperAudioChunk, PiperOnnxBackend, PiperVoice, PiperVoiceConfig};
+use tongues_tts::{PiperAudioChunk, PiperOnnxBackend, PiperVoiceConfig};
 
 const DEFAULT_TTS_VARIETY: &str = "en-US";
 
@@ -232,8 +232,9 @@ impl PiperConfig {
                 (model_path, config_path)
             }
             None => {
-                let model_path = tongues_tts::default_voice_model_path(PiperVoice::RyanMedium);
-                let config_path = tongues_tts::default_voice_config_path(PiperVoice::RyanMedium);
+                let default_voice = tongues_tts::default_piper_voice();
+                let model_path = tongues_tts::default_voice_model_path(default_voice.clone());
+                let config_path = tongues_tts::default_voice_config_path(default_voice);
                 if !model_path.is_file() || !config_path.is_file() {
                     return Ok(None);
                 }

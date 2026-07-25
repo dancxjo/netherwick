@@ -200,11 +200,11 @@ fn run(command: Command) -> Result<()> {
         }
         Command::SetupKinectFromSource => setup_kinect_from_source(),
         Command::SetupTts => fetch_asset(
-            &data_home().join("tongues/models/piper/en_US-ryan-medium.onnx"),
-            "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/medium/en_US-ryan-medium.onnx",
+            &data_home().join(DEFAULT_TTS_PIPER_MODEL),
+            DEFAULT_TTS_PIPER_MODEL_URL,
         ).and_then(|_| fetch_asset(
-            &data_home().join("tongues/models/piper/en_US-ryan-medium.onnx.json"),
-            "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/medium/en_US-ryan-medium.onnx.json",
+            &data_home().join(DEFAULT_TTS_PIPER_CONFIG),
+            DEFAULT_TTS_PIPER_CONFIG_URL,
         )),
         Command::SetupWhisper => fetch_asset(
             &data_home().join("pete/models/whisper/ggml-tiny.en.bin"),
