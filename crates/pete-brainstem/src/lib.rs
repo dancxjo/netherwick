@@ -6,6 +6,7 @@ mod body;
 mod build_identity;
 mod capabilities;
 mod commands;
+pub mod conduit_network;
 #[cfg(any(feature = "pico-w", test))]
 mod dhcp;
 #[cfg(any(feature = "pico-w", test))]

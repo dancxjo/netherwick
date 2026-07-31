@@ -412,7 +412,7 @@ pub enum RuntimeActionCode {
 #[derive(Clone, Copy)]
 #[repr(u8)]
 #[allow(dead_code)]
-enum WifiState {
+pub(crate) enum WifiState {
     Off = 0,
     Starting = 1,
     ApStarted = 2,

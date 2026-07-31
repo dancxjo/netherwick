@@ -810,6 +810,10 @@ pub fn mark_wifi_services_started() {
     request_led_blinks(3);
 }
 
+pub(crate) fn network_services_ready() -> bool {
+    WIFI_STATE.load(Ordering::Acquire) == WifiState::ServicesStarted as u8
+}
+
 #[cfg(feature = "pico-w")]
 #[allow(dead_code)]
 pub fn mark_wifi_error() {

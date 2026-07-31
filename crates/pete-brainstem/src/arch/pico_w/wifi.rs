@@ -56,9 +56,15 @@ async fn wifi_task(
         spawner.spawn(mdns_task(stack).expect("spawn mdns task"));
         spawner.spawn(dhcp_task(stack).expect("spawn dhcp task"));
         status::mark_wifi_services_started();
+        crate::conduit_network::observe_initialized(
+            BRAINSTEM_INSTANCE_ID.load(Ordering::Acquire),
+            BRAINSTEM_BOOT_ID.load(Ordering::Acquire),
+            Instant::now().as_millis() as u32,
+        );
         onboard_led_loop(&mut control).await;
     }
 
+    crate::conduit_network::observe_lost();
     status::mark_wifi_error();
     loop {
         Timer::after_secs(LED_HEARTBEAT_INTERVAL_SECS).await;
