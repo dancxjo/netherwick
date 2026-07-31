@@ -7,6 +7,7 @@ mod build_identity;
 mod capabilities;
 mod commands;
 pub mod conduit_network;
+pub mod conduit_robotics;
 #[cfg(any(feature = "pico-w", test))]
 mod dhcp;
 #[cfg(any(feature = "pico-w", test))]
