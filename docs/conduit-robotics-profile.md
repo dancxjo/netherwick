@@ -1,43 +1,66 @@
-# Conduit describe-only robotics profile
+# Conduit audited describe-only robotics profile
 
-`pete_brainstem::conduit_robotics::describe_only()` is the auditable current
-inventory for the installed Create Open Interface brainstem build. It returns
-compiled descriptors only: it does not open Create UART, sensors, CYW43,
-network sockets, cockpit transports, a higher-brain provider, or a possession
-lease, and it cannot arm or actuate the robot.
+`pete_brainstem::conduit_robotics` publishes the current Pete robotics profile
+through two real, effect-free implementations:
 
-The artifact names nine distinct boundaries: compiled brainstem/body
-description; Create observations; bounded motion commands; acknowledgements
-and safe outcomes; sensor observations; possession leases; network
-observations; higher-brain providers; and cockpit sessions. Each descriptor
-declares its units, frame, monotonic clock, uncertainty, freshness, authority,
-effect, host requirement, and exact source surface. They remain descriptions,
-not claims that any provider is live or authorized.
+- `netherwick/implementation/pete-linux-robotics-describe`
+- `netherwick/implementation/pete-pico-robotics-describe`
 
-In particular, a possession lease is neither a motor grant nor a safety
-override; network attachment is neither enrollment nor possession; command
-acceptance is not a safe outcome; and a status observation is never a command.
-Actual host reports must be created from fresh initialized host state and
-selected with a separate exact plan. Hardware equivalence and actuation remain
-outside this profile.
+Both implement the same `conduit.robotics/profile` contract and carry the same
+canonical profile identity. Their implementation, artifact, provider bundle,
+host profile, target, source build, and compiled-capability facts are distinct.
+These are ordinary Conduit implementation facts; there is no Netherwick-only
+registry, resolver, runtime, or event model.
 
-The inventory is intentionally small and allocator-free so both Pico W and
-Linux candidates can describe the same domain vocabulary while preserving their
-different build, device, driver, resource, and current-observation facts.
+The public `linux_report()`, `pico_w_report()`, and `describe_only()` calls only
+assemble compile-time and source-owned data. They do not open Create UART, USB,
+sensors, CYW43, sockets, cockpit transports, or higher-brain services. They do
+not observe a boot, initialize a provider, discover or admit a carrier path,
+enroll an entity, acquire possession or authority, promote Katra, load or
+promote an Organism Runtime checkpoint, activate a plan, or actuate.
 
-## Source and test evidence
+## Semantic separation
 
-| Boundary | Current source | Deterministic check |
-| --- | --- | --- |
-| body/brainstem description | `capabilities.rs`, `body.rs` | `conduit_robotics::describe_only_inventory_is_effect_free_and_complete` |
-| Create observation and command | `runtime/lifecycle.rs`, `runtime/motion.rs` | brainstem runtime/safety vectors |
-| safe outcome | `runtime/execution.rs`, `events.rs` | brainstem runtime/safety vectors |
-| sensor observation | `runtime/sensors.rs`, `drivers/imu.rs` | brainstem status and IMU vectors |
-| possession | `pete-cockpit/src/cockpit/possession` | cockpit possession/session vectors |
-| isolated network | `conduit_network.rs` | `conduit_network` unit vectors |
-| higher brain | `pete-higher-brain/src/capability.rs` | higher-brain capability vectors |
-| cockpit | `pete-cockpit` protocol/session modules | cockpit contract/session vectors |
+The report carries independent exact identities for observation, command,
+acknowledgement, safe outcome, possession, terminal, and fault values. An
+observation cannot be supplied as a command. Acknowledgement does not claim a
+safe physical outcome. Terminal and fault remain separate.
 
-`conduit_robotics::observation_command_and_safe_outcome_are_not_one_boundary`
-and `conduit_robotics::no_boundary_turns_network_or_possession_into_motion_authority`
-enforce the two critical separation invariants directly.
+Each physical quantity has its own units, frame, brainstem monotonic clock,
+uncertainty bound, and maximum age. The finite motion envelope separately pins
+command TTL, linear and angular velocity, queue capacity, possession, motion
+authority, stop, emergency stop, not-charging state, charging interlock, clear
+safety inhibit, and exact motion capability requirements.
+
+Stable `motherbrain-to-brainstem` and `brainstem-to-body` logical
+relationships list possible carrier kinds. They are not current paths. A
+describe-only report always has an empty `current_path_observations` array, and
+every carrier candidate has `admitted: false`.
+
+Entity, boot, role, possession, and authority are separate fields. The report
+publishes the stable entity and Katra role descriptors while leaving boot,
+possession, and authority absent. It names the Organism Runtime continuation
+descriptor with `loaded: false` and `promoted: false`.
+
+Compiled and initialized provider states are also separate. USB, CYW43,
+network, and Create-control candidates say either `compiled` or `unsupported`;
+their `initialized_observation` remains absent. Live networking continues to
+be owned by `conduit_network::runnable(now_ms)`, which obtains its own fresh
+firmware observation after actual initialization.
+
+## Redaction and evidence
+
+Reports contain no raw device handles, credentials, bearer tokens, private
+endpoints, or sensitive topology. `DescribeEffectAudit` contains separate
+counts for device opens, network joins, relays, possession, role promotion,
+plan activation, and actuation; all are zero.
+
+`SOURCE_EVIDENCE` maps body/build, observation, command, outcome, sensors,
+possession, networking, Linux control, higher-brain role, and cockpit session
+facts to their current source and focused tests. The exact cross-repository
+profile and host hashes are asserted in both Netherwick's
+`conduit_robotics::tests` and Conduit's `conduit-robotics` conformance tests.
+
+Physical equivalence, live provider observations, execution, carrier
+switching, role promotion, checkpoint loading, and actuation remain outside
+this describe-only profile.
